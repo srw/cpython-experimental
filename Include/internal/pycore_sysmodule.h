@@ -35,6 +35,7 @@ extern PyObject *_PySys_DispatchMapArray(
     int is_explicit);
 
 extern PyObject *_PyMap_MaterializeList(PyObject *map_obj);
+extern PyObject *_PyFilter_MaterializeList(PyObject *filter_obj);
 
 #ifdef __cplusplus
 }

@@ -3395,6 +3395,50 @@ copy_code(PyInterpreterState *interp, _Py_CODEUNIT *dst, PyCodeObject *co)
         dst[i] = deopt_code_unit(co, i);
     }
     _PyCode_Quicken(dst, code_len, interp->opt_config.specialization_enabled, co->co_flags);
+#ifdef Py_GIL_DISABLED
+    if (interp->opt_config.specialization_enabled && !co->_co_instrumentation_version) {
+        _Py_CODEUNIT *src = _PyCode_CODE(co);
+        for (int i = 0; i < code_len;) {
+            uint8_t base_op = dst[i].op.code;
+            int caches = _PyOpcode_Caches[base_op];
+            if (caches > 0 &&
+                base_op != JUMP_BACKWARD &&
+                base_op != RESUME &&
+                base_op != POP_JUMP_IF_FALSE &&
+                base_op != POP_JUMP_IF_TRUE &&
+                base_op != POP_JUMP_IF_NONE &&
+                base_op != POP_JUMP_IF_NOT_NONE)
+            {
+                _Py_CODEUNIT src_inst = {
+                    .cache = FT_ATOMIC_LOAD_UINT16_RELAXED(*(uint16_t *)&src[i])
+                };
+                _Py_atomic_fence_acquire();
+                if (src_inst.op.code < MIN_INSTRUMENTED_OPCODE &&
+                    src_inst.op.code != base_op &&
+                    src_inst.op.code != ENTER_EXECUTOR &&
+                    _PyOpcode_Deopt[src_inst.op.code] == base_op)
+                {
+                    for (int c = 1; c <= caches; c++) {
+                        dst[i + c].cache = FT_ATOMIC_LOAD_UINT16_RELAXED(*(uint16_t *)&src[i + c]);
+                    }
+                    _Py_atomic_fence_acquire();
+                    _Py_CODEUNIT src_inst2 = {
+                        .cache = FT_ATOMIC_LOAD_UINT16_RELAXED(*(uint16_t *)&src[i])
+                    };
+                    if (src_inst2.cache == src_inst.cache) {
+                        dst[i] = src_inst;
+                        dst[i + 1].counter = adaptive_counter_cooldown();
+                    }
+                    else {
+                        memset(&dst[i + 1], 0, (size_t)caches * sizeof(_Py_CODEUNIT));
+                        dst[i + 1].counter = adaptive_counter_warmup();
+                    }
+                }
+            }
+            i += 1 + caches;
+        }
+    }
+#endif
 }
 
 static Py_ssize_t

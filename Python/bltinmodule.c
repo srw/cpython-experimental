@@ -754,6 +754,136 @@ PyTypeObject PyFilter_Type = {
     .tp_vectorcall = filter_vectorcall
 };
 
+PyObject *
+_PyFilter_MaterializeList(PyObject *filter_obj)
+{
+#ifdef Py_GIL_DISABLED
+    assert(Py_IS_TYPE(filter_obj, &PyFilter_Type));
+    filterobject *lz = _filterobject_CAST(filter_obj);
+    if (lz->func == Py_None || lz->func == (PyObject *)&PyBool_Type) {
+        return NULL;
+    }
+    if (!PyFunction_Check(lz->func) &&
+        !(PyMethod_Check(lz->func) && PyFunction_Check(PyMethod_GET_FUNCTION(lz->func))))
+    {
+        return NULL;
+    }
+    PyObject *it = lz->it;
+    if (Py_IS_TYPE(it, &PyListIter_Type)) {
+        _PyListIterObject *lit = (_PyListIterObject *)it;
+        PyListObject *seq = lit->it_seq;
+        if (seq == NULL) {
+            return PyList_New(0);
+        }
+        Py_ssize_t idx = lit->it_index;
+        Py_ssize_t n = PyList_GET_SIZE(seq);
+        if (idx < 0 || idx >= n) {
+            lit->it_seq = NULL;
+            Py_DECREF(seq);
+            return PyList_New(0);
+        }
+        if (n - idx < 2) {
+            return NULL;
+        }
+        Py_ssize_t count = n - idx;
+        PyObject **items = PyMem_Malloc(count * sizeof(PyObject *));
+        if (items == NULL) {
+            return PyErr_NoMemory();
+        }
+        Py_BEGIN_CRITICAL_SECTION(seq);
+        Py_ssize_t cur_n = PyList_GET_SIZE(seq);
+        if (cur_n < n) {
+            count = (cur_n > idx) ? (cur_n - idx) : 0;
+        }
+        for (Py_ssize_t i = 0; i < count; i++) {
+            items[i] = Py_NewRef(PyList_GET_ITEM(seq, idx + i));
+        }
+        Py_END_CRITICAL_SECTION();
+        lit->it_seq = NULL;
+        lit->it_index = -1;
+        Py_DECREF(seq);
+        PyObject *preds = _PySys_DispatchMapArray(lz->func, items, count, 0, 0);
+        if (preds == NULL) {
+            for (Py_ssize_t i = 0; i < count; i++) {
+                Py_DECREF(items[i]);
+            }
+            PyMem_Free(items);
+            return NULL;
+        }
+        PyObject *res = PyList_New(0);
+        if (res != NULL) {
+            for (Py_ssize_t i = 0; i < count; i++) {
+                int ok = PyObject_IsTrue(PyList_GET_ITEM(preds, i));
+                if (ok < 0) {
+                    Py_CLEAR(res);
+                    break;
+                }
+                if (ok > 0) {
+                    if (PyList_Append(res, items[i]) < 0) {
+                        Py_CLEAR(res);
+                        break;
+                    }
+                }
+            }
+        }
+        Py_DECREF(preds);
+        for (Py_ssize_t i = 0; i < count; i++) {
+            Py_DECREF(items[i]);
+        }
+        PyMem_Free(items);
+        return res;
+    }
+    if (Py_IS_TYPE(it, &PyTupleIter_Type)) {
+        _PyTupleIterObject *tit = (_PyTupleIterObject *)it;
+        PyTupleObject *seq = tit->it_seq;
+        if (seq == NULL) {
+            return PyList_New(0);
+        }
+        Py_ssize_t idx = tit->it_index;
+        Py_ssize_t n = PyTuple_GET_SIZE(seq);
+        if (idx < 0 || idx >= n) {
+            tit->it_seq = NULL;
+            Py_DECREF(seq);
+            return PyList_New(0);
+        }
+        if (n - idx < 2) {
+            return NULL;
+        }
+        Py_ssize_t count = n - idx;
+        PyObject *const *items = _PyTuple_ITEMS(seq) + idx;
+        tit->it_seq = NULL;
+        tit->it_index = -1;
+        PyObject *preds = _PySys_DispatchMapArray(lz->func, items, count, 0, 0);
+        if (preds == NULL) {
+            Py_DECREF(seq);
+            return NULL;
+        }
+        PyObject *res = PyList_New(0);
+        if (res != NULL) {
+            for (Py_ssize_t i = 0; i < count; i++) {
+                int ok = PyObject_IsTrue(PyList_GET_ITEM(preds, i));
+                if (ok < 0) {
+                    Py_CLEAR(res);
+                    break;
+                }
+                if (ok > 0) {
+                    if (PyList_Append(res, items[i]) < 0) {
+                        Py_CLEAR(res);
+                        break;
+                    }
+                }
+            }
+        }
+        Py_DECREF(preds);
+        Py_DECREF(seq);
+        return res;
+    }
+#else
+    (void)filter_obj;
+#endif
+    return NULL;
+}
+
 
 /*[clinic input]
 format as builtin_format

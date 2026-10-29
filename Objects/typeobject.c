@@ -2497,8 +2497,8 @@ _PyType_AllocNoTrack(PyTypeObject *type, Py_ssize_t nitems)
         assert(type->tp_itemsize == 0);
         PyDictKeysObject *keys = ((PyHeapTypeObject *)type)->ht_cached_keys;
         assert(keys != NULL);
-        inline_values_usable = FT_ATOMIC_LOAD_SSIZE_ACQUIRE(keys->dk_usable);
-        Py_ssize_t dk_nentries = FT_ATOMIC_LOAD_SSIZE_ACQUIRE(keys->dk_nentries);
+        inline_values_usable = FT_ATOMIC_LOAD_SSIZE_RELAXED(keys->dk_usable);
+        Py_ssize_t dk_nentries = FT_ATOMIC_LOAD_SSIZE_RELAXED(keys->dk_nentries);
         inline_values_len = (size_t)(dk_nentries + inline_values_usable);
         size_t prefix_size = _Py_SIZE_ROUND_UP(inline_values_len, sizeof(PyObject *));
         assert(prefix_size < 256);

@@ -2646,6 +2646,35 @@ class TestSysConcurrentDispatch(unittest.TestCase):
         self.assertEqual(list(m), expected[1:])
         self.assertEqual(list(m), [])
 
+    def test_transparent_sort_and_filter(self):
+        def heavy_key(n):
+            acc = 0
+            for i in range(200):
+                acc += ((n * 17 + i) ^ (n + i * 3)) & 0xFFFF
+            return -acc
+
+        def heavy_pred(n):
+            return (heavy_key(n) & 1) == 0
+
+        inputs = list(range(40))
+        expected_sorted = sorted(inputs, key=lambda x: heavy_key(x))
+        self.assertEqual(sorted(inputs, key=heavy_key), expected_sorted)
+
+        lst = list(inputs)
+        lst.sort(key=heavy_key)
+        self.assertEqual(lst, expected_sorted)
+
+        expected_filtered = [x for x in inputs if heavy_pred(x)]
+        self.assertEqual(list(filter(heavy_pred, inputs)), expected_filtered)
+        self.assertEqual(tuple(filter(heavy_pred, tuple(inputs))), tuple(expected_filtered))
+
+        # Partially consumed filter iterator must only materialize remaining items
+        f = filter(heavy_pred, inputs)
+        first_match = next(f)
+        self.assertEqual(first_match, expected_filtered[0])
+        self.assertEqual(list(f), expected_filtered[1:])
+        self.assertEqual(list(f), [])
+
 
 if __name__ == "__main__":
     unittest.main()

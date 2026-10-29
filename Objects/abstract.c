@@ -2022,8 +2022,10 @@ PySequence_Tuple(PyObject *v)
     }
     if (PyList_CheckExact(v))
         return PyList_AsTuple(v);
-    if (Py_IS_TYPE(v, &PyMap_Type)) {
-        PyObject *mapped = _PyMap_MaterializeList(v);
+    if (Py_IS_TYPE(v, &PyMap_Type) || Py_IS_TYPE(v, &PyFilter_Type)) {
+        PyObject *mapped = Py_IS_TYPE(v, &PyMap_Type)
+            ? _PyMap_MaterializeList(v)
+            : _PyFilter_MaterializeList(v);
         if (mapped != NULL) {
             PyObject *res = PyList_AsTuple(mapped);
             Py_DECREF(mapped);

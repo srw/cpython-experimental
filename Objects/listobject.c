@@ -1613,8 +1613,10 @@ _list_extend(PyListObject *self, PyObject *iterable)
         res = list_extend_dictitems(self, dict);
         Py_END_CRITICAL_SECTION2();
     }
-    else if (Py_IS_TYPE(iterable, &PyMap_Type)) {
-        PyObject *mapped = _PyMap_MaterializeList(iterable);
+    else if (Py_IS_TYPE(iterable, &PyMap_Type) || Py_IS_TYPE(iterable, &PyFilter_Type)) {
+        PyObject *mapped = Py_IS_TYPE(iterable, &PyMap_Type)
+            ? _PyMap_MaterializeList(iterable)
+            : _PyFilter_MaterializeList(iterable);
         if (mapped != NULL) {
             Py_BEGIN_CRITICAL_SECTION(self);
             res = list_extend_lock_held(self, mapped);
@@ -3134,6 +3136,27 @@ list_sort_impl(PyListObject *self, PyObject *keyfunc, int reverse)
             }
         }
 
+#ifdef Py_GIL_DISABLED
+        if (saved_ob_size >= 2 &&
+            (PyFunction_Check(keyfunc) ||
+             (PyMethod_Check(keyfunc) && PyFunction_Check(PyMethod_GET_FUNCTION(keyfunc)))))
+        {
+            PyObject *key_list = _PySys_DispatchMapArray(
+                keyfunc, saved_ob_item, saved_ob_size, 0, 0);
+            if (key_list == NULL) {
+                if (saved_ob_size >= MERGESTATE_TEMP_SIZE/2) {
+                    PyMem_Free(keys);
+                }
+                goto keyfunc_fail;
+            }
+            for (i = 0; i < saved_ob_size; i++) {
+                keys[i] = PyList_GET_ITEM(key_list, i);
+            }
+            Py_SET_SIZE(key_list, 0);
+            Py_DECREF(key_list);
+        }
+        else
+#endif
         for (i = 0; i < saved_ob_size ; i++) {
             keys[i] = PyObject_CallOneArg(keyfunc, saved_ob_item[i]);
             if (keys[i] == NULL) {

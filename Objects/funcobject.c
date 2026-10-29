@@ -225,10 +225,13 @@ PyFunction_NewWithQualName(PyObject *code, PyObject *globals, PyObject *qualname
     op->vectorcall = _PyFunction_Vectorcall;
     op->func_version = FUNC_VERSION_UNSET;
     if (((code_obj->co_flags & CO_NESTED) == 0) ||
-        (code_obj->co_flags & CO_METHOD) ||
-        code_obj->co_nfreevars == 0) {
-        // Use deferred reference counting for top-level functions, methods,
-        // and non-capturing nested functions/lambdas.
+        (code_obj->co_flags & CO_METHOD)) {
+        // Use deferred reference counting for top-level functions, but not
+        // nested functions because they are more likely to capture variables,
+        // which makes prompt deallocation more important.
+        //
+        // Nested methods (functions defined in class scope) are also deferred,
+        // since they will likely be cleaned up by GC anyway.
         _PyObject_SetDeferredRefcount((PyObject *)op);
     }
     _PyObject_GC_TRACK(op);
