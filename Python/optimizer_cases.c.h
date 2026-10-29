@@ -1191,14 +1191,31 @@
             JitOptRef r;
             right = stack_pointer[-1];
             left = stack_pointer[-2];
-            res = sym_new_type(ctx, &PyUnicode_Type);
+            if (sym_is_const(ctx, left) && sym_is_const(ctx, right)) {
+                assert(PyUnicode_CheckExact(sym_get_const(ctx, left)));
+                assert(PyUnicode_CheckExact(sym_get_const(ctx, right)));
+                PyObject *temp = PyUnicode_Concat(sym_get_const(ctx, left), sym_get_const(ctx, right));
+                if (temp == NULL) {
+                    goto error;
+                }
+                res = sym_new_const(ctx, temp);
+                CHECK_STACK_BOUNDS(-1);
+                stack_pointer[-2] = res;
+                stack_pointer += -1;
+                ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                Py_DECREF(temp);
+            }
+            else {
+                res = sym_new_type(ctx, &PyUnicode_Type);
+                stack_pointer += -1;
+            }
             l = left;
             r = right;
-            CHECK_STACK_BOUNDS(1);
-            stack_pointer[-2] = res;
-            stack_pointer[-1] = l;
-            stack_pointer[0] = r;
-            stack_pointer += 1;
+            CHECK_STACK_BOUNDS(2);
+            stack_pointer[-1] = res;
+            stack_pointer[0] = l;
+            stack_pointer[1] = r;
+            stack_pointer += 2;
             ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
             break;
         }
@@ -1404,7 +1421,7 @@
             JitOptRef ss;
             sub_st = stack_pointer[-1];
             list_st = stack_pointer[-2];
-            res = sym_new_type(ctx, &PyList_Type);
+            res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyList_Type));
             ls = list_st;
             ss = sub_st;
             CHECK_STACK_BOUNDS(1);
@@ -1518,6 +1535,14 @@
                 else {
                     assert(index < tuple_length);
                     res = sym_tuple_getitem(ctx, tuple_st, index);
+                    if (sym_is_const(ctx, res)) {
+                        PyObject *temp = sym_get_const(ctx, res);
+                        if (_Py_IsImmortal(temp)) {
+                            ADD_OP(_LOAD_CONST_INLINE_BORROW, 0, (uintptr_t)temp);
+                            ADD_OP(_RROT_3, 0, 0);
+                            res = PyJitRef_Borrow(res);
+                        }
+                    }
                 }
             }
             else {
@@ -2524,7 +2549,7 @@
 
         case _BUILD_SET: {
             JitOptRef set;
-            set = sym_new_type(ctx, &PySet_Type);
+            set = PyJitRef_MakeUnique(sym_new_type(ctx, &PySet_Type));
             CHECK_STACK_BOUNDS(1 - oparg);
             stack_pointer[-oparg] = set;
             stack_pointer += 1 - oparg;

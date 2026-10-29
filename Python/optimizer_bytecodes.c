@@ -520,7 +520,19 @@ dummy_func(void) {
     }
 
     op(_BINARY_OP_ADD_UNICODE, (left, right -- res, l, r)) {
-        res = sym_new_type(ctx, &PyUnicode_Type);
+        if (sym_is_const(ctx, left) && sym_is_const(ctx, right)) {
+            assert(PyUnicode_CheckExact(sym_get_const(ctx, left)));
+            assert(PyUnicode_CheckExact(sym_get_const(ctx, right)));
+            PyObject *temp = PyUnicode_Concat(sym_get_const(ctx, left), sym_get_const(ctx, right));
+            if (temp == NULL) {
+                goto error;
+            }
+            res = sym_new_const(ctx, temp);
+            Py_DECREF(temp);
+        }
+        else {
+            res = sym_new_type(ctx, &PyUnicode_Type);
+        }
         l = left;
         r = right;
     }
@@ -696,6 +708,14 @@ dummy_func(void) {
             else {
                 assert(index < tuple_length);
                 res = sym_tuple_getitem(ctx, tuple_st, index);
+                if (sym_is_const(ctx, res)) {
+                    PyObject *temp = sym_get_const(ctx, res);
+                    if (_Py_IsImmortal(temp)) {
+                        ADD_OP(_LOAD_CONST_INLINE_BORROW, 0, (uintptr_t)temp);
+                        ADD_OP(_RROT_3, 0, 0);
+                        res = PyJitRef_Borrow(res);
+                    }
+                }
             }
         }
         else {
@@ -721,7 +741,7 @@ dummy_func(void) {
     }
 
     op(_BINARY_OP_SUBSCR_LIST_SLICE, (list_st, sub_st -- res, ls, ss)) {
-        res = sym_new_type(ctx, &PyList_Type);
+        res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyList_Type));
         ls = list_st;
         ss = sub_st;
     }
@@ -2245,7 +2265,7 @@ dummy_func(void) {
     }
 
     op(_BUILD_SET, (values[oparg] -- set)) {
-        set = sym_new_type(ctx, &PySet_Type);
+        set = PyJitRef_MakeUnique(sym_new_type(ctx, &PySet_Type));
     }
 
     op(_SET_UPDATE, (set, unused[oparg-1], iterable -- set, unused[oparg-1], i)) {
