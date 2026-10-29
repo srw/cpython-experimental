@@ -751,6 +751,7 @@ _PyCode_New(struct _PyCodeConstructor *con)
 
 #ifdef Py_GIL_DISABLED
     co->_co_unique_id = _PyObject_AssignUniqueId((PyObject *)co);
+    _PyObject_SetDeferredRefcount((PyObject *)co);
     _PyObject_GC_TRACK(co);
 #endif
     Py_XDECREF(replacement_locations);

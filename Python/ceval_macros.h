@@ -1008,8 +1008,8 @@ _PyEval_FrameClearAndPopFast(PyThreadState *tstate, _PyInterpreterFrame *dying)
             sp--;
             PyStackRef_XCLOSE(*sp);
         }
-        PyStackRef_CLEAR(dying->f_funcobj);
-        PyStackRef_CLEAR(dying->f_executable);
+        PyStackRef_CLOSE(dying->f_funcobj);
+        PyStackRef_CLOSE(dying->f_executable);
         assert(tstate->datastack_top >= (PyObject **)dying);
         tstate->datastack_top = (PyObject **)dying;
         return;
