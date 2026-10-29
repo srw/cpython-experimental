@@ -617,6 +617,42 @@ PyList_Append(PyObject *op, PyObject *newitem)
     return -1;
 }
 
+static int
+list_extend_from_array_take_ref_lock_held(PyListObject *self, PyObject **src, Py_ssize_t n)
+{
+    if (n <= 0) {
+        return 0;
+    }
+    Py_ssize_t len = Py_SIZE(self);
+    if (list_resize(self, len + n) < 0) {
+        for (Py_ssize_t i = 0; i < n; i++) {
+            Py_DECREF(src[i]);
+        }
+        return -1;
+    }
+    PyObject **dest = self->ob_item + len;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        FT_ATOMIC_STORE_PTR_RELEASE(dest[i], src[i]);
+    }
+    return 0;
+}
+
+int
+_PyList_ExtendFromArrayTakeRef(PyListObject *self, PyObject **src, Py_ssize_t n)
+{
+    assert(PyList_CheckExact(self));
+#ifdef Py_GIL_DISABLED
+    if (_PyObject_IsUnsharedLocal((PyObject *)self)) {
+        return list_extend_from_array_take_ref_lock_held(self, src, n);
+    }
+#endif
+    int ret;
+    Py_BEGIN_CRITICAL_SECTION(self);
+    ret = list_extend_from_array_take_ref_lock_held(self, src, n);
+    Py_END_CRITICAL_SECTION();
+    return ret;
+}
+
 /* Methods */
 
 static void

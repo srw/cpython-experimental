@@ -161,6 +161,11 @@ extern PyObject *_PyDict_LoadBuiltinsFromGlobals(PyObject *globals);
 /* Consumes references to key and value */
 PyAPI_FUNC(int) _PyDict_SetItem_Take2(PyDictObject *op, PyObject *key, PyObject *value);
 PyAPI_FUNC(int) _PyDict_SetItem_Take2_KnownHash(PyDictObject *op, PyObject *key, PyObject *value, Py_hash_t hash);
+#if defined(__APPLE__) && defined(__MACH__)
+PyAPI_FUNC(int) _PyDict_SetItemsTakeRef(PyDictObject *mp, PyObject **items, Py_ssize_t n_pairs) __attribute__((weak_import));
+#else
+PyAPI_FUNC(int) _PyDict_SetItemsTakeRef(PyDictObject *mp, PyObject **items, Py_ssize_t n_pairs);
+#endif
 // Exported for external JIT support
 PyAPI_FUNC(int) _PyDict_SetItem_LockHeld(PyDictObject *dict, PyObject *name, PyObject *value);
 // Export for '_asyncio' shared extension

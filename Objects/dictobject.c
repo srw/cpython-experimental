@@ -1370,7 +1370,7 @@ _Py_dict_lookup(PyDictObject *mp, PyObject *key, Py_hash_t hash, PyObject **valu
     DictKeysKind kind;
     Py_ssize_t ix;
 
-    _Py_CRITICAL_SECTION_ASSERT_OBJECT_LOCKED(mp);
+    ASSERT_DICT_LOCKED(mp);
 start:
     dk = mp->ma_keys;
     kind = dk->dk_kind;
@@ -2953,13 +2953,87 @@ int
 _PyDict_SetItem_Take2(PyDictObject *mp, PyObject *key, PyObject *value)
 {
 #ifdef Py_GIL_DISABLED
-    if (_PyObject_IsUniquelyReferenced((PyObject *)mp) &&
-        PyUnicode_CheckExact(key) &&
-        DK_IS_UNICODE(mp->ma_keys) &&
-        mp->ma_values == NULL)
-    {
-        Py_hash_t hash = ((PyASCIIObject *)key)->hash;
-        if (hash != -1 && mp->ma_keys != Py_EMPTY_KEYS) {
+    if (_PyObject_IsUniquelyReferenced((PyObject *)mp) && mp->ma_values == NULL) {
+        if (PyUnicode_CheckExact(key) && DK_IS_UNICODE(mp->ma_keys)) {
+            Py_hash_t hash = ((PyASCIIObject *)key)->hash;
+            if (hash != -1 && mp->ma_keys != Py_EMPTY_KEYS) {
+                Py_ssize_t ix = unicodekeys_lookup_unicode(mp->ma_keys, key, hash);
+                if (ix >= 0) {
+                    PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(mp->ma_keys)[ix];
+                    PyObject *old_value = ep->me_value;
+                    assert(old_value != NULL);
+                    if (old_value != value) {
+                        _PyDict_NotifyEvent(PyDict_EVENT_MODIFIED, mp, key, value);
+                        ep->me_value = value;
+                    }
+                    Py_DECREF(old_value);
+                    Py_DECREF(key);
+                    ASSERT_CONSISTENT(mp);
+                    return 0;
+                }
+                if (insert_combined_dict(mp, hash, key, value) < 0) {
+                    Py_DECREF(value);
+                    Py_DECREF(key);
+                    return -1;
+                }
+                STORE_USED(mp, mp->ma_used + 1);
+                ASSERT_CONSISTENT(mp);
+                return 0;
+            }
+            return setitem_take2_lock_held(mp, key, value);
+        }
+        if (PyLong_CheckExact(key)) {
+            return setitem_take2_lock_held(mp, key, value);
+        }
+    }
+#endif
+    int res;
+    Py_BEGIN_CRITICAL_SECTION(mp);
+    res = setitem_take2_lock_held(mp, key, value);
+    Py_END_CRITICAL_SECTION();
+    return res;
+}
+
+static int
+setitems_take2_lock_held(PyDictObject *mp, PyObject **items, Py_ssize_t n_pairs, int all_unicode)
+{
+    assert(PyDict_CheckExact(mp));
+    assert(can_modify_dict(mp));
+
+    if (mp->ma_keys == Py_EMPTY_KEYS && n_pairs > USABLE_FRACTION(PyDict_MINSIZE)) {
+        if (dictresize(mp, estimate_log2_keysize(n_pairs), all_unicode) < 0) {
+            for (Py_ssize_t i = 0; i < 2 * n_pairs; i++) {
+                Py_DECREF(items[i]);
+            }
+            return -1;
+        }
+    }
+
+    for (Py_ssize_t i = 0; i < n_pairs; i++) {
+        PyObject *key = items[2 * i];
+        PyObject *value = items[2 * i + 1];
+        if (PyUnicode_CheckExact(key) && DK_IS_UNICODE(mp->ma_keys) && mp->ma_values == NULL) {
+            Py_hash_t hash = ((PyASCIIObject *)key)->hash;
+            if (hash == -1) {
+                hash = PyObject_Hash(key);
+                if (hash == -1) {
+                    Py_DECREF(key);
+                    Py_DECREF(value);
+                    for (Py_ssize_t j = 2 * (i + 1); j < 2 * n_pairs; j++) {
+                        Py_DECREF(items[j]);
+                    }
+                    return -1;
+                }
+            }
+            if (mp->ma_keys == Py_EMPTY_KEYS) {
+                if (insert_to_emptydict(mp, key, hash, value) < 0) {
+                    for (Py_ssize_t j = 2 * (i + 1); j < 2 * n_pairs; j++) {
+                        Py_DECREF(items[j]);
+                    }
+                    return -1;
+                }
+                continue;
+            }
             Py_ssize_t ix = unicodekeys_lookup_unicode(mp->ma_keys, key, hash);
             if (ix >= 0) {
                 PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(mp->ma_keys)[ix];
@@ -2967,21 +3041,58 @@ _PyDict_SetItem_Take2(PyDictObject *mp, PyObject *key, PyObject *value)
                 assert(old_value != NULL);
                 if (old_value != value) {
                     _PyDict_NotifyEvent(PyDict_EVENT_MODIFIED, mp, key, value);
-                    ep->me_value = value;
+                    STORE_VALUE(ep, value);
                 }
                 Py_DECREF(old_value);
                 Py_DECREF(key);
                 ASSERT_CONSISTENT(mp);
-                return 0;
+                continue;
             }
-            return setitem_take2_lock_held_known_hash(mp, key, value, hash);
+            if (insert_combined_dict(mp, hash, key, value) < 0) {
+                Py_DECREF(key);
+                Py_DECREF(value);
+                for (Py_ssize_t j = 2 * (i + 1); j < 2 * n_pairs; j++) {
+                    Py_DECREF(items[j]);
+                }
+                return -1;
+            }
+            STORE_USED(mp, mp->ma_used + 1);
+            ASSERT_CONSISTENT(mp);
+            continue;
         }
-        return setitem_take2_lock_held(mp, key, value);
+        if (setitem_take2_lock_held(mp, key, value) < 0) {
+            for (Py_ssize_t j = 2 * (i + 1); j < 2 * n_pairs; j++) {
+                Py_DECREF(items[j]);
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int
+_PyDict_SetItemsTakeRef(PyDictObject *mp, PyObject **items, Py_ssize_t n_pairs)
+{
+    if (n_pairs <= 0) {
+        return 0;
+    }
+    int all_unicode = 1;
+    for (Py_ssize_t i = 0; i < n_pairs; i++) {
+        if (!PyUnicode_CheckExact(items[2 * i])) {
+            all_unicode = 0;
+            break;
+        }
+    }
+#ifdef Py_GIL_DISABLED
+    if (_PyObject_IsUniquelyReferenced((PyObject *)mp) ||
+        (_PyObject_IsUnsharedLocal((PyObject *)mp) && all_unicode && mp->ma_used == 0))
+    {
+        return setitems_take2_lock_held(mp, items, n_pairs, all_unicode);
     }
 #endif
     int res;
     Py_BEGIN_CRITICAL_SECTION(mp);
-    res = setitem_take2_lock_held(mp, key, value);
+    res = setitems_take2_lock_held(mp, items, n_pairs, all_unicode);
     Py_END_CRITICAL_SECTION();
     return res;
 }
@@ -3202,6 +3313,15 @@ _PyDict_DelItem_KnownHash_LockHeld(PyObject *op, PyObject *key, Py_hash_t hash)
 int
 _PyDict_DelItem_KnownHash(PyObject *op, PyObject *key, Py_hash_t hash)
 {
+#ifdef Py_GIL_DISABLED
+    if (PyDict_CheckExact(op) && _PyObject_IsUniquelyReferenced(op) &&
+        ((PyUnicode_CheckExact(key) && DK_IS_UNICODE(((PyDictObject *)op)->ma_keys)) ||
+         PyLong_CheckExact(key)) &&
+        ((PyDictObject *)op)->ma_values == NULL)
+    {
+        return _PyDict_DelItem_KnownHash_LockHeld(op, key, hash);
+    }
+#endif
     int res;
     Py_BEGIN_CRITICAL_SECTION(op);
     res = _PyDict_DelItem_KnownHash_LockHeld(op, key, hash);

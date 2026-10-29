@@ -232,6 +232,7 @@ class JSONEncoder(object):
                 markers, self.default, _encoder, indent,
                 self.key_separator, self.item_separator, self.sort_keys,
                 self.skipkeys, self.allow_nan)
+            markers = None
         else:
             def floatstr(o, allow_nan=self.allow_nan,
                     _repr=float.__repr__, _inf=INFINITY, _neginf=-INFINITY):

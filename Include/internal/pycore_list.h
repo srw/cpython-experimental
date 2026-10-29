@@ -32,6 +32,14 @@ PyAPI_FUNC(int) _PyList_GetItemRefNoLock(PyListObject *, Py_ssize_t, _PyStackRef
 PyAPI_FUNC(int)
 _PyList_AppendTakeRefListResize(PyListObject *self, PyObject *newitem);
 
+#if defined(__APPLE__) && defined(__MACH__)
+PyAPI_FUNC(int)
+_PyList_ExtendFromArrayTakeRef(PyListObject *self, PyObject **src, Py_ssize_t n) __attribute__((weak_import));
+#else
+PyAPI_FUNC(int)
+_PyList_ExtendFromArrayTakeRef(PyListObject *self, PyObject **src, Py_ssize_t n);
+#endif
+
 // In free-threaded build: self should be locked by the caller, if it should be thread-safe.
 static inline Py_ALWAYS_INLINE int
 _PyList_AppendTakeRef(PyListObject *self, PyObject *newitem)

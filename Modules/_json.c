@@ -13,6 +13,7 @@
 #include "pycore_critical_section.h" // Py_BEGIN_CRITICAL_SECTION_SEQUENCE_FAST()
 #include "pycore_dict.h"          // _PyDict_SetItem_Take2()
 #include "pycore_list.h"          // _PyList_AppendTakeRef()
+#include "pycore_object.h"        // _PyObject_IsUnsharedLocal()
 #include "pycore_global_strings.h" // _Py_ID()
 #include "pycore_pyerrors.h"      // _PyErr_FormatNote
 #include "pycore_runtime.h"       // _PyRuntime
@@ -1070,13 +1071,35 @@ _match_number_unicode(PyScannerObject *s, PyObject *pystr, Py_ssize_t start, Py_
         if (numstr == NULL)
             return NULL;
         rval = PyObject_CallOneArg(custom_func, numstr);
+        Py_DECREF(numstr);
     }
     else {
         Py_ssize_t i, n;
+        char stack_buf[64];
         char *buf;
         /* Straight conversion to ASCII, to avoid costly conversion of
            decimal unicode digits (which cannot appear here) */
         n = idx - start;
+        if (n < (Py_ssize_t)sizeof(stack_buf)) {
+            if (kind == PyUnicode_1BYTE_KIND) {
+                memcpy(stack_buf, (const char *)str + start, n);
+            }
+            else {
+                for (i = 0; i < n; i++) {
+                    stack_buf[i] = (char) PyUnicode_READ(kind, str, i + start);
+                }
+            }
+            stack_buf[n] = '\0';
+            *next_idx_ptr = idx;
+            if (is_float) {
+                double d = PyOS_string_to_double(stack_buf, NULL, NULL);
+                if (d == -1.0 && PyErr_Occurred()) {
+                    return NULL;
+                }
+                return PyFloat_FromDouble(d);
+            }
+            return PyLong_FromString(stack_buf, NULL, 10);
+        }
         numstr = PyBytes_FromStringAndSize(NULL, n);
         if (numstr == NULL)
             return NULL;
@@ -1088,8 +1111,8 @@ _match_number_unicode(PyScannerObject *s, PyObject *pystr, Py_ssize_t start, Py_
             rval = PyFloat_FromString(numstr);
         else
             rval = PyLong_FromString(buf, NULL, 10);
+        Py_DECREF(numstr);
     }
-    Py_DECREF(numstr);
     *next_idx_ptr = idx;
     return rval;
 }
@@ -1533,6 +1556,40 @@ encoder_encode_float(PyEncoderObject *s, PyObject *obj)
 }
 
 static int
+encoder_write_float(PyEncoderObject *s, PyUnicodeWriter *writer, PyObject *obj)
+{
+    /* Write the JSON representation of a PyFloat directly to writer. */
+    double i = PyFloat_AS_DOUBLE(obj);
+    if (!isfinite(i)) {
+        if (!s->allow_nan) {
+            PyErr_Format(
+                    PyExc_ValueError,
+                    "Out of range float values are not JSON compliant: %R",
+                    obj
+                    );
+            return -1;
+        }
+        if (i > 0) {
+            return PyUnicodeWriter_WriteASCII(writer, "Infinity", 8);
+        }
+        else if (i < 0) {
+            return PyUnicodeWriter_WriteASCII(writer, "-Infinity", 9);
+        }
+        else {
+            return PyUnicodeWriter_WriteASCII(writer, "NaN", 3);
+        }
+    }
+    char *buf = PyOS_double_to_string(i, 'r', 0, Py_DTSF_ADD_DOT_0, NULL);
+    if (buf == NULL) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    int res = PyUnicodeWriter_WriteASCII(writer, buf, strlen(buf));
+    PyMem_Free(buf);
+    return res;
+}
+
+static int
 encoder_write_string(PyEncoderObject *s, PyUnicodeWriter *writer, PyObject *obj)
 {
     /* Return the JSON representation of a string */
@@ -1596,10 +1653,7 @@ encoder_listencode_obj(PyEncoderObject *s, PyUnicodeWriter *writer,
         return _steal_accumulate(writer, encoded);
     }
     else if (PyFloat_Check(obj)) {
-        PyObject *encoded = encoder_encode_float(s, obj);
-        if (encoded == NULL)
-            return -1;
-        return _steal_accumulate(writer, encoded);
+        return encoder_write_float(s, writer, obj);
     }
     else if (PyList_Check(obj) || PyTuple_Check(obj)) {
         if (_Py_EnterRecursiveCall(" while encoding a JSON object"))
@@ -1675,51 +1729,66 @@ encoder_encode_key_value(PyEncoderObject *s, PyUnicodeWriter *writer, bool *firs
     int rv;
 
     if (PyUnicode_Check(key)) {
-        keystr = Py_NewRef(key);
-    }
-    else if (PyFloat_Check(key)) {
-        keystr = encoder_encode_float(s, key);
-    }
-    else if (key == Py_True || key == Py_False || key == Py_None) {
-                    /* This must come before the PyLong_Check because
-                       True and False are also 1 and 0.*/
-        keystr = _encoded_const(key);
-    }
-    else if (PyLong_Check(key)) {
-        keystr = PyLong_Type.tp_repr(key);
-    }
-    else if (s->skipkeys) {
-        return 0;
+        if (*first) {
+            *first = false;
+            if (s->indent != Py_None) {
+                if (write_newline_indent(writer, indent_level, indent_cache) < 0) {
+                    return -1;
+                }
+            }
+        }
+        else {
+            if (PyUnicodeWriter_WriteStr(writer, item_separator) < 0) {
+                return -1;
+            }
+        }
+        rv = encoder_write_string(s, writer, key);
     }
     else {
-        PyErr_Format(PyExc_TypeError,
-                     "keys must be str, int, float, bool or None, "
-                     "not %.100s", Py_TYPE(key)->tp_name);
-        return -1;
-    }
+        if (PyFloat_Check(key)) {
+            keystr = encoder_encode_float(s, key);
+        }
+        else if (key == Py_True || key == Py_False || key == Py_None) {
+                        /* This must come before the PyLong_Check because
+                           True and False are also 1 and 0.*/
+            keystr = _encoded_const(key);
+        }
+        else if (PyLong_Check(key)) {
+            keystr = PyLong_Type.tp_repr(key);
+        }
+        else if (s->skipkeys) {
+            return 0;
+        }
+        else {
+            PyErr_Format(PyExc_TypeError,
+                         "keys must be str, int, float, bool or None, "
+                         "not %.100s", Py_TYPE(key)->tp_name);
+            return -1;
+        }
 
-    if (keystr == NULL) {
-        return -1;
-    }
+        if (keystr == NULL) {
+            return -1;
+        }
 
-    if (*first) {
-        *first = false;
-        if (s->indent != Py_None) {
-            if (write_newline_indent(writer, indent_level, indent_cache) < 0) {
+        if (*first) {
+            *first = false;
+            if (s->indent != Py_None) {
+                if (write_newline_indent(writer, indent_level, indent_cache) < 0) {
+                    Py_DECREF(keystr);
+                    return -1;
+                }
+            }
+        }
+        else {
+            if (PyUnicodeWriter_WriteStr(writer, item_separator) < 0) {
                 Py_DECREF(keystr);
                 return -1;
             }
         }
-    }
-    else {
-        if (PyUnicodeWriter_WriteStr(writer, item_separator) < 0) {
-            Py_DECREF(keystr);
-            return -1;
-        }
-    }
 
-    rv = encoder_write_string(s, writer, keystr);
-    Py_DECREF(keystr);
+        rv = encoder_write_string(s, writer, keystr);
+        Py_DECREF(keystr);
+    }
 
     if (rv < 0) {
         return -1;
@@ -1772,7 +1841,12 @@ _encoder_iterate_dict_lock_held(PyEncoderObject *s, PyUnicodeWriter *writer,
                          bool *first, PyObject *dct, Py_ssize_t indent_level,
                          PyObject *indent_cache, PyObject *separator)
 {
-    _Py_CRITICAL_SECTION_ASSERT_OBJECT_LOCKED(dct);
+#ifdef Py_GIL_DISABLED
+    if (!_PyObject_IsUnsharedLocal(dct))
+#endif
+    {
+        _Py_CRITICAL_SECTION_ASSERT_OBJECT_LOCKED(dct);
+    }
     PyObject *key, *value;
     Py_ssize_t pos = 0;
     while (PyDict_Next(dct, &pos, &key, &value)) {
@@ -1812,13 +1886,10 @@ encoder_listencode_dict(PyEncoderObject *s, PyUnicodeWriter *writer,
         ident = PyLong_FromVoidPtr(dct);
         if (ident == NULL)
             goto bail;
-        has_key = PyDict_Contains(s->markers, ident);
+        has_key = PyDict_SetDefaultRef(s->markers, ident, dct, NULL);
         if (has_key) {
-            if (has_key != -1)
+            if (has_key > 0)
                 PyErr_SetString(PyExc_ValueError, "Circular reference detected");
-            goto bail;
-        }
-        if (PyDict_SetItem(s->markers, ident, dct)) {
             goto bail;
         }
     }
@@ -1854,10 +1925,19 @@ encoder_listencode_dict(PyEncoderObject *s, PyUnicodeWriter *writer,
 
     } else {
         int result;
-        Py_BEGIN_CRITICAL_SECTION(dct);
-        result = _encoder_iterate_dict_lock_held(s, writer, &first, dct,
-                            indent_level, indent_cache, separator);
-        Py_END_CRITICAL_SECTION();
+#ifdef Py_GIL_DISABLED
+        if (_PyObject_IsUnsharedLocal(dct)) {
+            result = _encoder_iterate_dict_lock_held(s, writer, &first, dct,
+                                indent_level, indent_cache, separator);
+        }
+        else
+#endif
+        {
+            Py_BEGIN_CRITICAL_SECTION(dct);
+            result = _encoder_iterate_dict_lock_held(s, writer, &first, dct,
+                                indent_level, indent_cache, separator);
+            Py_END_CRITICAL_SECTION();
+        }
         if (result < 0) {
             goto bail;
         }
@@ -1932,13 +2012,10 @@ encoder_listencode_list(PyEncoderObject *s, PyUnicodeWriter *writer,
         ident = PyLong_FromVoidPtr(seq);
         if (ident == NULL)
             goto bail;
-        has_key = PyDict_Contains(s->markers, ident);
+        has_key = PyDict_SetDefaultRef(s->markers, ident, seq, NULL);
         if (has_key) {
-            if (has_key != -1)
+            if (has_key > 0)
                 PyErr_SetString(PyExc_ValueError, "Circular reference detected");
-            goto bail;
-        }
-        if (PyDict_SetItem(s->markers, ident, seq)) {
             goto bail;
         }
     }
@@ -1958,10 +2035,19 @@ encoder_listencode_list(PyEncoderObject *s, PyUnicodeWriter *writer,
         }
     }
     int result;
-    Py_BEGIN_CRITICAL_SECTION_SEQUENCE_FAST(seq);
-    result = _encoder_iterate_fast_seq_lock_held(s, writer, seq, s_fast,
-                     indent_level, indent_cache, separator);
-    Py_END_CRITICAL_SECTION_SEQUENCE_FAST();
+#ifdef Py_GIL_DISABLED
+    if (_PyObject_IsUnsharedLocal(seq)) {
+        result = _encoder_iterate_fast_seq_lock_held(s, writer, seq, s_fast,
+                         indent_level, indent_cache, separator);
+    }
+    else
+#endif
+    {
+        Py_BEGIN_CRITICAL_SECTION_SEQUENCE_FAST(seq);
+        result = _encoder_iterate_fast_seq_lock_held(s, writer, seq, s_fast,
+                         indent_level, indent_cache, separator);
+        Py_END_CRITICAL_SECTION_SEQUENCE_FAST();
+    }
     if (result < 0) {
         goto bail;
     }

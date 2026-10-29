@@ -13,6 +13,7 @@
 #include "pycore_ceval.h"         // _Py_EnterRecursiveCall()
 #include "pycore_critical_section.h" // Py_BEGIN_CRITICAL_SECTION()
 #include "pycore_dict.h"          // _PyDict_SetItem_Take2()
+#include "pycore_list.h"          // _PyList_ExtendFromArrayTakeRef()
 #include "pycore_long.h"          // _PyLong_AsByteArray()
 #include "pycore_moduleobject.h"  // _PyModule_GetState()
 #include "pycore_object.h"        // _PyNone_Type
@@ -3295,10 +3296,18 @@ batch_list_exact(PickleState *state, PicklerObject *self, PyObject *obj)
     total = 0;
     do {
         if (list_size - total == 1) {
-            item = PyList_GetItemRef(obj, total);
-            if (item == NULL) {
-                _PyErr_FormatNote("when serializing %T item %zd", obj, total);
-                return -1;
+#ifdef Py_GIL_DISABLED
+            if (_PyObject_IsUnsharedLocal(obj)) {
+                item = Py_NewRef(PyList_GET_ITEM(obj, total));
+            }
+            else
+#endif
+            {
+                item = PyList_GetItemRef(obj, total);
+                if (item == NULL) {
+                    _PyErr_FormatNote("when serializing %T item %zd", obj, total);
+                    return -1;
+                }
             }
             int err = save(state, self, item, 0);
             Py_DECREF(item);
@@ -3314,10 +3323,18 @@ batch_list_exact(PickleState *state, PicklerObject *self, PyObject *obj)
         if (_Pickler_Write(self, &mark_op, 1) < 0)
             return -1;
         while (total < PyList_GET_SIZE(obj)) {
-            item = PyList_GetItemRef(obj, total);
-            if (item == NULL) {
-                _PyErr_FormatNote("when serializing %T item %zd", obj, total);
-                return -1;
+#ifdef Py_GIL_DISABLED
+            if (_PyObject_IsUnsharedLocal(obj)) {
+                item = Py_NewRef(PyList_GET_ITEM(obj, total));
+            }
+            else
+#endif
+            {
+                item = PyList_GetItemRef(obj, total);
+                if (item == NULL) {
+                    _PyErr_FormatNote("when serializing %T item %zd", obj, total);
+                    return -1;
+                }
             }
             int err = save(state, self, item, 0);
             Py_DECREF(item);
@@ -3643,6 +3660,11 @@ error:
 static int
 batch_dict_exact(PickleState *state, PicklerObject *self, PyObject *obj)
 {
+#ifdef Py_GIL_DISABLED
+    if (_PyObject_IsUnsharedLocal(obj)) {
+        return batch_dict_exact_impl(state, self, obj);
+    }
+#endif
     int ret;
     Py_BEGIN_CRITICAL_SECTION(obj);
     ret = batch_dict_exact_impl(state, self, obj);
@@ -6340,15 +6362,29 @@ load_dict(PickleState *st, UnpicklerObject *self)
         return -1;
     }
 
-    for (k = i + 1; k < j; k += 2) {
-        key = self->stack->data[k - 1];
-        value = self->stack->data[k];
-        if (PyDict_SetItem(dict, key, value) < 0) {
+    Py_SET_SIZE(self->stack, i);
+    if (_PyDict_SetItemsTakeRef != NULL) {
+        if (_PyDict_SetItemsTakeRef((PyDictObject *)dict,
+                                    self->stack->data + i,
+                                    (j - i) >> 1) < 0)
+        {
             Py_DECREF(dict);
             return -1;
         }
     }
-    Pdata_clear(self->stack, i);
+    else {
+        for (k = i + 1; k < j; k += 2) {
+            key = self->stack->data[k - 1];
+            value = self->stack->data[k];
+            if (_PyDict_SetItem_Take2((PyDictObject *)dict, key, value) < 0) {
+                for (Py_ssize_t m = k + 1; m < j; m++) {
+                    Py_DECREF(self->stack->data[m]);
+                }
+                Py_DECREF(dict);
+                return -1;
+            }
+        }
+    }
     PDATA_PUSH(self->stack, dict, -1);
     return 0;
 }
@@ -6991,16 +7027,21 @@ do_append(PickleState *state, UnpicklerObject *self, Py_ssize_t x)
     list = self->stack->data[x - 1];
 
     if (PyList_CheckExact(list)) {
-        Py_ssize_t list_len;
-        int ret;
-
+        if (_PyList_ExtendFromArrayTakeRef != NULL) {
+            Py_SET_SIZE(self->stack, x);
+            return _PyList_ExtendFromArrayTakeRef((PyListObject *)list,
+                                                  self->stack->data + x,
+                                                  len - x);
+        }
         slice = Pdata_poplist(self->stack, x);
         if (!slice)
             return -1;
-        list_len = PyList_GET_SIZE(list);
-        ret = PyList_SetSlice(list, list_len, list_len, slice);
+        result = _PyList_Extend((PyListObject *)list, slice);
         Py_DECREF(slice);
-        return ret;
+        if (result == NULL)
+            return -1;
+        Py_DECREF(result);
+        return 0;
     }
     else {
         PyObject *extend_func;
@@ -7086,6 +7127,13 @@ do_setitems(PickleState *st, UnpicklerObject *self, Py_ssize_t x)
     /* Here, dict does not actually need to be a PyDict; it could be anything
        that supports the __setitem__ attribute. */
     dict = self->stack->data[x - 1];
+
+    if (PyDict_CheckExact(dict) && _PyDict_SetItemsTakeRef != NULL) {
+        Py_SET_SIZE(self->stack, x);
+        return _PyDict_SetItemsTakeRef((PyDictObject *)dict,
+                                       self->stack->data + x,
+                                       (len - x) >> 1);
+    }
 
     for (i = x + 1; i < len; i += 2) {
         key = self->stack->data[i - 1];
