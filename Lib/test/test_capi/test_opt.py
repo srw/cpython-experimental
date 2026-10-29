@@ -3612,7 +3612,7 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertIn("_CALL_METHOD_DESCRIPTOR_NOARGS_INLINE", uops)
         self.assertNotIn("_CALL_METHOD_DESCRIPTOR_NOARGS", uops)
         self.assertNotIn("_GUARD_CALLABLE_METHOD_DESCRIPTOR_NOARGS", uops)
-        self.assertGreaterEqual(count_ops(ex, "_POP_TOP"), 5)
+        self.assertIn("_POP_TOP_NOP", uops)
         self.assertGreaterEqual(count_ops(ex, "_POP_TOP"), 3)
 
     def test_call_method_descriptor_fast(self):
@@ -6164,7 +6164,7 @@ class TestUopsOptimization(unittest.TestCase):
         uops = get_opnames(ex)
 
         self.assertIn("_MATCH_CLASS", uops)
-        self.assertEqual(count_ops(ex, "_POP_TOP_NOP"), 5)
+        self.assertEqual(count_ops(ex, "_POP_TOP_NOP"), 6)
 
     def test_dict_update(self):
         def testfunc(n):
@@ -6665,6 +6665,62 @@ class TestUopsOptimization(unittest.TestCase):
 
         # A different iterator type must not link that executor to itself.
         exhaust(map(bool, values))
+
+    @unittest.skipUnless(sys.maxsize > 2**32, "64-bit compact int optimization")
+    def test_iter_next_range_compact_int(self):
+        def testfunc(n):
+            total = 0
+            for i in range(n):
+                x = i * 3 - 7
+                total += x
+            return total
+
+        res, ex = self._run_with_optimizer(testfunc, TIER2_THRESHOLD)
+        self.assertIsNotNone(ex)
+        uops = get_opnames(ex)
+        self.assertIn("_ITER_NEXT_RANGE", uops)
+        self.assertNotIn("_GUARD_NOS_OVERFLOWED", uops)
+        self.assertNotIn("_GUARD_TOS_OVERFLOWED", uops)
+
+    @unittest.skipUnless(sys.maxsize > 2**32, "64-bit compact int optimization")
+    def test_binary_op_extend_compact_int_guard_elimination(self):
+        def testfunc(n):
+            total = 0
+            for i in range(n):
+                q = i // 7
+                r = i % 7
+                total = q + r
+            return total
+
+        res, ex = self._run_with_optimizer(testfunc, TIER2_THRESHOLD)
+        self.assertIsNotNone(ex)
+        uops = get_opnames(ex)
+        self.assertIn("_BINARY_OP_EXTEND", uops)
+        self.assertNotIn("_GUARD_BINARY_OP_EXTEND", uops)
+        self.assertNotIn("_GUARD_NOS_OVERFLOWED", uops)
+        self.assertNotIn("_GUARD_TOS_OVERFLOWED", uops)
+
+    def test_unshared_local_object_init_guard_elimination(self):
+        class Point:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+        def testfunc(n):
+            total = 0
+            for i in range(n):
+                p = Point(i, i + 1)
+                total = p.x
+            return total
+
+        res, ex = self._run_with_optimizer(testfunc, TIER2_THRESHOLD)
+        self.assertEqual(res, TIER2_THRESHOLD - 1)
+        self.assertIsNotNone(ex)
+        uops = get_opnames(ex)
+        self.assertIn("_ALLOCATE_OBJECT", uops)
+        self.assertNotIn("_GUARD_DORV_NO_DICT", uops)
+        self.assertNotIn("_CHECK_MANAGED_OBJECT_HAS_VALUES", uops)
+        self.assertNotIn("_EXIT_INIT_CHECK", uops)
 
 def global_identity(x):
     return x

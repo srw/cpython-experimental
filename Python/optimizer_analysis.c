@@ -443,6 +443,9 @@ lookup_attr(JitOptContext *ctx, _PyBloomFilter *dependencies, _PyUOpInstruction 
                 watch_type(type, dependencies);
             }
             JitOptRef res = sym_new_const(ctx, lookup);
+            if (immortal) {
+                res = PyJitRef_Borrow(res);
+            }
             Py_DECREF(lookup);
             return res;
         }
@@ -525,7 +528,11 @@ lookup_super_attr(JitOptContext *ctx, _PyBloomFilter *dependencies,
         watch_type(su_type, dependencies);
         watch_type(obj_type, dependencies);
     }
-    return sym_new_const_steal(ctx, lookup);
+    JitOptRef res = sym_new_const_steal(ctx, lookup);
+    if (opcode == immortal) {
+        res = PyJitRef_Borrow(res);
+    }
+    return res;
 }
 
 static

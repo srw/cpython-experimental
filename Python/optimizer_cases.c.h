@@ -1281,6 +1281,28 @@
                     sym_set_type(left, d->lhs_type);
                 }
             }
+            else if (d != NULL && d->lhs_type != NULL && d->rhs_type != NULL) {
+                if (d->lhs_type == &PyLong_Type && d->rhs_type == &PyLong_Type) {
+                    if (sym_is_compact_int(left) && sym_is_compact_int(right) &&
+                        sym_is_const(ctx, right) &&
+                        !_PyLong_IsZero((PyLongObject *)sym_get_const(ctx, right)))
+                    {
+                        ADD_OP(_NOP, 0, 0);
+                    }
+                    sym_set_compact_int(left);
+                    sym_set_compact_int(right);
+                }
+                else {
+                    sym_set_type(left, d->lhs_type);
+                    sym_set_type(right, d->rhs_type);
+                    if (d->lhs_type == &PyLong_Type) {
+                        sym_set_compact_int(left);
+                    }
+                    if (d->rhs_type == &PyLong_Type) {
+                        sym_set_compact_int(right);
+                    }
+                }
+            }
             break;
         }
 
@@ -1295,7 +1317,19 @@
             PyObject *descr = (PyObject *)this_instr->operand0;
             _PyBinaryOpSpecializationDescr *d = (_PyBinaryOpSpecializationDescr *)descr;
             if (d != NULL && d->result_type != NULL) {
-                res = sym_new_type(ctx, d->result_type);
+                if (d->result_type == &PyLong_Type &&
+                    sym_is_compact_int(left) && sym_is_compact_int(right) &&
+                    (oparg == NB_AND || oparg == NB_OR || oparg == NB_XOR ||
+                        oparg == NB_RSHIFT || oparg == NB_FLOOR_DIVIDE || oparg == NB_REMAINDER ||
+                        oparg == NB_INPLACE_AND || oparg == NB_INPLACE_OR || oparg == NB_INPLACE_XOR ||
+                        oparg == NB_INPLACE_RSHIFT || oparg == NB_INPLACE_FLOOR_DIVIDE ||
+                        oparg == NB_INPLACE_REMAINDER))
+                {
+                    res = sym_new_compact_int(ctx);
+                }
+                else {
+                    res = sym_new_type(ctx, d->result_type);
+                }
                 if (d->result_unique) {
                     res = PyJitRef_MakeUnique(res);
                 }
@@ -1350,7 +1384,7 @@
             JitOptRef ss;
             sub_st = stack_pointer[-1];
             list_st = stack_pointer[-2];
-            res = sym_new_unknown(ctx);
+            res = sym_new_not_null(ctx);
             ls = list_st;
             ss = sub_st;
             CHECK_STACK_BOUNDS(1);
@@ -2613,7 +2647,7 @@
             JitOptRef *self_or_null;
             owner = stack_pointer[-1];
             self_or_null = &stack_pointer[0];
-            (void)owner;
+            sym_set_unshared_local(owner, false);
             attr = sym_new_not_null(ctx);
             if (oparg & 1) {
                 self_or_null[0] = sym_new_unknown(ctx);
@@ -2681,6 +2715,11 @@
         }
 
         case _CHECK_MANAGED_OBJECT_HAS_VALUES: {
+            JitOptRef owner;
+            owner = stack_pointer[-1];
+            if (sym_is_unshared_local(owner)) {
+                ADD_OP(_NOP, 0, 0);
+            }
             break;
         }
 
@@ -2866,6 +2905,11 @@
         }
 
         case _GUARD_DORV_NO_DICT: {
+            JitOptRef owner;
+            owner = stack_pointer[-1];
+            if (sym_is_unshared_local(owner)) {
+                ADD_OP(_NOP, 0, 0);
+            }
             break;
         }
 
@@ -2904,6 +2948,7 @@
             uint16_t hint = (uint16_t)this_instr->operand0;
             (void)hint;
             sym_set_unshared_local(value, false);
+            sym_set_unshared_local(owner, false);
             o = owner;
             CHECK_STACK_BOUNDS(-1);
             stack_pointer[-2] = o;
@@ -3883,7 +3928,11 @@
 
         case _ITER_NEXT_RANGE: {
             JitOptRef next;
-            next = sym_new_type(ctx, &PyLong_Type);
+            #if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+            next = PyJitRef_MakeUnique(sym_new_compact_int(ctx));
+            #else
+            next = PyJitRef_MakeUnique(sym_new_type(ctx, &PyLong_Type));
+            #endif
             CHECK_STACK_BOUNDS(1);
             stack_pointer[0] = next;
             stack_pointer += 1;
@@ -3952,6 +4001,9 @@
                         optimize_pop_top(ctx, this_instr, method_and_self[0]);
                         watch_type(type, dependencies);
                         method_and_self[0] = sym_new_const(ctx, descr);
+                        if (immortal) {
+                            method_and_self[0] = PyJitRef_Borrow(method_and_self[0]);
+                        }
                         optimized = true;
                     }
                 }
@@ -4524,6 +4576,11 @@
         }
 
         case _EXIT_INIT_CHECK: {
+            JitOptRef should_be_none;
+            should_be_none = stack_pointer[-1];
+            if (sym_get_const(ctx, should_be_none) == Py_None) {
+                ADD_OP(_POP_TOP_NOP, 0, 0);
+            }
             CHECK_STACK_BOUNDS(-1);
             stack_pointer += -1;
             ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
@@ -4797,7 +4854,7 @@
             sym_set_unshared_local(arg, false);
             c = callable;
             s = self;
-            none = sym_new_const(ctx, Py_None);
+            none = PyJitRef_Borrow(sym_new_const(ctx, Py_None));
             stack_pointer[-3] = none;
             stack_pointer[-2] = c;
             stack_pointer[-1] = s;

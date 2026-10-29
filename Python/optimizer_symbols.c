@@ -261,6 +261,17 @@ _Py_uop_sym_get_const_as_stackref(JitOptContext *ctx, JitOptRef sym)
     return PyStackRef_FromPyObjectBorrow(const_val);
 }
 
+static inline bool
+is_compact_int_value(PyObject *obj)
+{
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    return PyLong_CheckExact(obj) &&
+           ((PyLongObject *)obj)->long_value.lv_tag < (3 << _PyLong_NON_SIZE_BITS);
+#else
+    return _PyLong_CheckExactAndCompact(obj);
+#endif
+}
+
 /*
  Indicates whether the constant is safe to constant evaluate
  (without side effects).
@@ -272,7 +283,7 @@ _Py_uop_sym_is_safe_const(JitOptContext *ctx, JitOptRef sym)
     if (const_val == NULL) {
         return false;
     }
-    if (_PyLong_CheckExactAndCompact(const_val)) {
+    if (is_compact_int_value(const_val)) {
         return true;
     }
     PyTypeObject *typ = Py_TYPE(const_val);
@@ -571,7 +582,7 @@ _Py_uop_sym_set_const(JitOptContext *ctx, JitOptRef ref, PyObject *const_val)
             make_const(sym, const_val);
             return;
         case JIT_SYM_COMPACT_INT:
-            if (_PyLong_CheckExactAndCompact(const_val)) {
+            if (is_compact_int_value(const_val)) {
                 make_const(sym, const_val);
             }
             else {
@@ -1005,7 +1016,7 @@ _Py_uop_sym_is_compact_int(JitOptRef ref)
 {
     JitOptSymbol *sym = PyJitRef_Unwrap(ref);
     if (sym->tag == JIT_SYM_KNOWN_VALUE_TAG) {
-        return (bool)_PyLong_CheckExactAndCompact(sym->value.value);
+        return is_compact_int_value(sym->value.value);
     }
     return sym->tag == JIT_SYM_COMPACT_INT;
 }
@@ -1043,7 +1054,7 @@ _Py_uop_sym_set_compact_int(JitOptContext *ctx, JitOptRef ref)
             }
             return;
         case JIT_SYM_KNOWN_VALUE_TAG:
-            if (!_PyLong_CheckExactAndCompact(sym->value.value)) {
+            if (!is_compact_int_value(sym->value.value)) {
                 Py_CLEAR(sym->value.value);
                 sym_set_bottom(ctx, sym);
             }

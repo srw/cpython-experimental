@@ -173,6 +173,7 @@ dummy_func(void) {
     op(_STORE_ATTR_WITH_HINT, (hint/1, value, owner -- o)) {
         (void)hint;
         sym_set_unshared_local(value, false);
+        sym_set_unshared_local(owner, false);
         o = owner;
     }
 
@@ -532,12 +533,47 @@ dummy_func(void) {
                 sym_set_type(left, d->lhs_type);
             }
         }
+        else if (d != NULL && d->lhs_type != NULL && d->rhs_type != NULL) {
+            if (d->lhs_type == &PyLong_Type && d->rhs_type == &PyLong_Type) {
+                /* nonzero_compactlongs_guard */
+                if (sym_is_compact_int(left) && sym_is_compact_int(right) &&
+                    sym_is_const(ctx, right) &&
+                    !_PyLong_IsZero((PyLongObject *)sym_get_const(ctx, right)))
+                {
+                    ADD_OP(_NOP, 0, 0);
+                }
+                sym_set_compact_int(left);
+                sym_set_compact_int(right);
+            }
+            else {
+                sym_set_type(left, d->lhs_type);
+                sym_set_type(right, d->rhs_type);
+                if (d->lhs_type == &PyLong_Type) {
+                    sym_set_compact_int(left);
+                }
+                if (d->rhs_type == &PyLong_Type) {
+                    sym_set_compact_int(right);
+                }
+            }
+        }
     }
 
     op(_BINARY_OP_EXTEND, (descr/4, left, right -- res, l, r)) {
         _PyBinaryOpSpecializationDescr *d = (_PyBinaryOpSpecializationDescr *)descr;
         if (d != NULL && d->result_type != NULL) {
-            res = sym_new_type(ctx, d->result_type);
+            if (d->result_type == &PyLong_Type &&
+                sym_is_compact_int(left) && sym_is_compact_int(right) &&
+                (oparg == NB_AND || oparg == NB_OR || oparg == NB_XOR ||
+                 oparg == NB_RSHIFT || oparg == NB_FLOOR_DIVIDE || oparg == NB_REMAINDER ||
+                 oparg == NB_INPLACE_AND || oparg == NB_INPLACE_OR || oparg == NB_INPLACE_XOR ||
+                 oparg == NB_INPLACE_RSHIFT || oparg == NB_INPLACE_FLOOR_DIVIDE ||
+                 oparg == NB_INPLACE_REMAINDER))
+            {
+                res = sym_new_compact_int(ctx);
+            }
+            else {
+                res = sym_new_type(ctx, d->result_type);
+            }
             if (d->result_unique) {
                 res = PyJitRef_MakeUnique(res);
             }
@@ -1003,7 +1039,7 @@ dummy_func(void) {
     }
 
     op(_LOAD_ATTR, (owner -- attr, self_or_null[oparg&1])) {
-        (void)owner;
+        sym_set_unshared_local(owner, false);
         attr = sym_new_not_null(ctx);
         if (oparg & 1) {
             self_or_null[0] = sym_new_unknown(ctx);
@@ -1353,6 +1389,24 @@ dummy_func(void) {
         }
     }
 
+    op(_GUARD_DORV_NO_DICT, (owner -- owner)) {
+        if (sym_is_unshared_local(owner)) {
+            ADD_OP(_NOP, 0, 0);
+        }
+    }
+
+    op(_CHECK_MANAGED_OBJECT_HAS_VALUES, (owner -- owner)) {
+        if (sym_is_unshared_local(owner)) {
+            ADD_OP(_NOP, 0, 0);
+        }
+    }
+
+    op(_EXIT_INIT_CHECK, (should_be_none --)) {
+        if (sym_get_const(ctx, should_be_none) == Py_None) {
+            ADD_OP(_POP_TOP_NOP, 0, 0);
+        }
+    }
+
     op(_CREATE_INIT_FRAME, (init, self, args[oparg] -- init_frame)) {
         ctx->frame->stack_pointer = stack_pointer - oparg - 2;
         _Py_UOpsAbstractFrame *shim = frame_new(ctx, (PyCodeObject *)&_Py_InitCleanup, NULL, 0);
@@ -1645,7 +1699,11 @@ dummy_func(void) {
     }
 
     op(_ITER_NEXT_RANGE, (iter, null_or_index -- iter, null_or_index, next)) {
-       next = sym_new_type(ctx, &PyLong_Type);
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+        next = PyJitRef_MakeUnique(sym_new_compact_int(ctx));
+#else
+        next = PyJitRef_MakeUnique(sym_new_type(ctx, &PyLong_Type));
+#endif
     }
 
     op(_CALL_TYPE_1, (callable, null, arg -- res, a)) {
@@ -1705,7 +1763,7 @@ dummy_func(void) {
         sym_set_unshared_local(arg, false);
         c = callable;
         s = self;
-        none = sym_new_const(ctx, Py_None);
+        none = PyJitRef_Borrow(sym_new_const(ctx, Py_None));
     }
 
     op(_GUARD_CALLABLE_BUILTIN_CLASS, (callable, unused, unused[oparg] -- callable, unused, unused[oparg])) {
@@ -2101,6 +2159,9 @@ dummy_func(void) {
                     optimize_pop_top(ctx, this_instr, method_and_self[0]);
                     watch_type(type, dependencies);
                     method_and_self[0] = sym_new_const(ctx, descr);
+                    if (immortal) {
+                        method_and_self[0] = PyJitRef_Borrow(method_and_self[0]);
+                    }
                     optimized = true;
                 }
             }
@@ -2632,7 +2693,7 @@ dummy_func(void) {
     }
 
     op(_BINARY_OP_SUBSCR_LIST_INT, (list_st, sub_st -- res, ls, ss)) {
-        res = sym_new_unknown(ctx);
+        res = sym_new_not_null(ctx);
         ls = list_st;
         ss = sub_st;
     }

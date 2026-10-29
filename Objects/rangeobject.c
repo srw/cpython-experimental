@@ -1230,6 +1230,14 @@ PyTypeObject PyLongRangeIter_Type = {
         0,
 };
 
+#if SIZEOF_LONG >= 8 && PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+#  define RANGE_ITER_MAX ((1L << (2 * PyLong_SHIFT)) - 1)
+#  define RANGE_ITER_MIN (-RANGE_ITER_MAX)
+#else
+#  define RANGE_ITER_MAX LONG_MAX
+#  define RANGE_ITER_MIN LONG_MIN
+#endif
+
 static PyObject *
 range_iter(PyObject *seq)
 {
@@ -1254,35 +1262,38 @@ range_iter(PyObject *seq)
     }
 #endif
 
-    /* If all three fields and the length convert to long, use the int
-     * version */
+    /* If all three fields and the length convert to compact long range,
+     * use the int version */
     lstart = PyLong_AsLong(r->start);
-    if (lstart == -1 && PyErr_Occurred()) {
+    if ((lstart == -1 && PyErr_Occurred()) ||
+        lstart < RANGE_ITER_MIN || lstart > RANGE_ITER_MAX) {
         PyErr_Clear();
         goto long_range;
     }
     lstop = PyLong_AsLong(r->stop);
-    if (lstop == -1 && PyErr_Occurred()) {
+    if ((lstop == -1 && PyErr_Occurred()) ||
+        lstop < RANGE_ITER_MIN || lstop > RANGE_ITER_MAX) {
         PyErr_Clear();
         goto long_range;
     }
     lstep = PyLong_AsLong(r->step);
-    if (lstep == -1 && PyErr_Occurred()) {
+    if ((lstep == -1 && PyErr_Occurred()) ||
+        lstep < RANGE_ITER_MIN || lstep > RANGE_ITER_MAX) {
         PyErr_Clear();
         goto long_range;
     }
     ulen = get_len_of_range(lstart, lstop, lstep);
-    if (ulen > (unsigned long)LONG_MAX) {
+    if (ulen > (unsigned long)RANGE_ITER_MAX) {
         goto long_range;
     }
     /* check for potential overflow of lstart + ulen * lstep */
     if (ulen) {
         if (lstep > 0) {
-            if (lstop > LONG_MAX - (lstep - 1))
+            if (lstop > RANGE_ITER_MAX - (lstep - 1))
                 goto long_range;
         }
         else {
-            if (lstop < LONG_MIN + (-1 - lstep))
+            if (lstop < RANGE_ITER_MIN + (-1 - lstep))
                 goto long_range;
         }
     }
@@ -1321,17 +1332,20 @@ range_reverse(PyObject *seq, PyObject *Py_UNUSED(ignored))
        common cases and it makes the checks simple. */
 
     lstart = PyLong_AsLong(range->start);
-    if (lstart == -1 && PyErr_Occurred()) {
+    if ((lstart == -1 && PyErr_Occurred()) ||
+        lstart < RANGE_ITER_MIN || lstart > RANGE_ITER_MAX) {
         PyErr_Clear();
         goto long_range;
     }
     lstop = PyLong_AsLong(range->stop);
-    if (lstop == -1 && PyErr_Occurred()) {
+    if ((lstop == -1 && PyErr_Occurred()) ||
+        lstop < RANGE_ITER_MIN || lstop > RANGE_ITER_MAX) {
         PyErr_Clear();
         goto long_range;
     }
     lstep = PyLong_AsLong(range->step);
-    if (lstep == -1 && PyErr_Occurred()) {
+    if ((lstep == -1 && PyErr_Occurred()) ||
+        lstep < RANGE_ITER_MIN || lstep > RANGE_ITER_MAX) {
         PyErr_Clear();
         goto long_range;
     }
@@ -1341,28 +1355,28 @@ range_reverse(PyObject *seq, PyObject *Py_UNUSED(ignored))
 
     /* check for overflow of lstart - lstep:
 
-       for lstep > 0, need only check whether lstart - lstep < LONG_MIN.
-       for lstep < 0, need only check whether lstart - lstep > LONG_MAX
+       for lstep > 0, need only check whether lstart - lstep < RANGE_ITER_MIN.
+       for lstep < 0, need only check whether lstart - lstep > RANGE_ITER_MAX
 
        Rearrange these inequalities as:
 
-           lstart - LONG_MIN < lstep  (lstep > 0)
-           LONG_MAX - lstart < -lstep  (lstep < 0)
+           lstart - RANGE_ITER_MIN < lstep  (lstep > 0)
+           RANGE_ITER_MAX - lstart < -lstep  (lstep < 0)
 
        and compute both sides as unsigned longs, to avoid the
        possibility of undefined behaviour due to signed overflow. */
 
     if (lstep > 0) {
-         if ((unsigned long)lstart - LONG_MIN < (unsigned long)lstep)
+         if ((unsigned long)lstart - (unsigned long)RANGE_ITER_MIN < (unsigned long)lstep)
             goto long_range;
     }
     else {
-        if (LONG_MAX - (unsigned long)lstart < 0UL - lstep)
+        if ((unsigned long)RANGE_ITER_MAX - (unsigned long)lstart < 0UL - lstep)
             goto long_range;
     }
 
     ulen = get_len_of_range(lstart, lstop, lstep);
-    if (ulen > (unsigned long)LONG_MAX)
+    if (ulen > (unsigned long)RANGE_ITER_MAX)
         goto long_range;
 
     new_stop = lstart - lstep;
