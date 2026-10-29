@@ -2190,7 +2190,21 @@ clear_executors(PyCodeObject *co)
 void
 _PyCode_Clear_Executors(PyCodeObject *code)
 {
+#ifdef Py_GIL_DISABLED
+    Py_BEGIN_CRITICAL_SECTION(code);
+    if (code->co_executors != NULL) {
+        for (int i = 0; i < code->co_executors->size; i++) {
+            if (code->co_executors->executors[i]) {
+                _Py_ExecutorDetach(code->co_executors->executors[i]);
+                assert(code->co_executors->executors[i] == NULL);
+            }
+        }
+        code->co_executors->size = 0;
+    }
+    Py_END_CRITICAL_SECTION();
+#else
     clear_executors(code);
+#endif
 }
 
 #endif
@@ -3348,9 +3362,27 @@ deopt_code_unit(PyCodeObject *code, int i)
     if (opcode < MIN_INSTRUMENTED_OPCODE) {
         inst.op.code = _PyOpcode_Deopt[opcode];
         assert(inst.op.code < MIN_SPECIALIZED_OPCODE);
+        return inst;
     }
-    // JIT should not be enabled with free-threading
-    assert(inst.op.code != ENTER_EXECUTOR);
+    if (opcode == ENTER_EXECUTOR) {
+        _PyExecutorArray *execs = code->co_executors;
+        if (execs != NULL && inst.op.arg < execs->size) {
+            _PyExecutorObject *exec = (_PyExecutorObject *)_Py_atomic_load_ptr(
+                &execs->executors[inst.op.arg]);
+            if (exec != NULL) {
+                inst.op.code = _PyOpcode_Deopt[exec->vm_data.opcode];
+                inst.op.arg = exec->vm_data.oparg;
+                assert(inst.op.code < MIN_SPECIALIZED_OPCODE);
+                return inst;
+            }
+        }
+        inst.cache = FT_ATOMIC_LOAD_UINT16_RELAXED(*(uint16_t *)src_instr);
+        opcode = inst.op.code;
+        if (opcode < MIN_INSTRUMENTED_OPCODE) {
+            inst.op.code = _PyOpcode_Deopt[opcode];
+            assert(inst.op.code < MIN_SPECIALIZED_OPCODE);
+        }
+    }
     return inst;
 }
 
@@ -3519,10 +3551,24 @@ static void
 free_unused_bytecode(PyCodeObject *co, struct flag_set *indices_in_use)
 {
     _PyCodeArray *tlbc = co->co_tlbc;
+    Py_ssize_t code_len = Py_SIZE(co);
     // The first index always points at the main copy of the bytecode embedded
     // in the code object.
     for (Py_ssize_t i = 1; i < tlbc->size; i++) {
         if (is_bytecode_unused(tlbc, i, indices_in_use)) {
+            _Py_CODEUNIT *start = (_Py_CODEUNIT *)tlbc->entries[i];
+            _Py_CODEUNIT *end = start + code_len;
+            if (co->co_executors != NULL) {
+                for (int j = 0; j < co->co_executors->size; j++) {
+                    _PyExecutorObject *exec = co->co_executors->executors[j];
+                    if (exec != NULL &&
+                        exec->vm_data.instr_ptr >= start &&
+                        exec->vm_data.instr_ptr < end)
+                    {
+                        exec->vm_data.instr_ptr = NULL;
+                    }
+                }
+            }
             PyMem_Free(tlbc->entries[i]);
             tlbc->entries[i] = NULL;
         }

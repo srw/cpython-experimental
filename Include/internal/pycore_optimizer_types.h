@@ -49,6 +49,7 @@ typedef enum _JitSymType {
 
 typedef struct _jit_opt_known_class {
     uint8_t tag;
+    bool unshared_local;
     uint32_t version;
     PyTypeObject *type;
 } JitOptKnownClass;
@@ -99,6 +100,7 @@ typedef struct {
 typedef struct _jit_opt_recorded_value {
     uint8_t tag;
     bool known_type;
+    bool unshared_local;
     PyObject *value;
 } JitOptRecordedValue;
 

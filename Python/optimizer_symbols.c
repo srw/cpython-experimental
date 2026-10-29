@@ -315,6 +315,7 @@ _Py_uop_sym_set_type(JitOptContext *ctx, JitOptRef ref, PyTypeObject *typ)
         case JIT_SYM_TYPE_VERSION_TAG:
             if (sym->version.version == typ->tp_version_tag) {
                 sym->tag = JIT_SYM_KNOWN_CLASS_TAG;
+                sym->cls.unshared_local = false;
                 sym->cls.type = typ;
                 sym->cls.version = typ->tp_version_tag;
             }
@@ -351,6 +352,7 @@ _Py_uop_sym_set_type(JitOptContext *ctx, JitOptRef ref, PyTypeObject *typ)
         case JIT_SYM_RECORDED_TYPE_TAG:
             if (sym->recorded_type.type == typ) {
                 sym->tag = JIT_SYM_KNOWN_CLASS_TAG;
+                sym->cls.unshared_local = false;
                 sym->cls.version = 0;
                 sym->cls.type = typ;
             }
@@ -361,6 +363,7 @@ _Py_uop_sym_set_type(JitOptContext *ctx, JitOptRef ref, PyTypeObject *typ)
         case JIT_SYM_NON_NULL_TAG:
         case JIT_SYM_UNKNOWN_TAG:
             sym->tag = JIT_SYM_KNOWN_CLASS_TAG;
+            sym->cls.unshared_local = false;
             sym->cls.version = 0;
             sym->cls.type = typ;
             return;
@@ -447,8 +450,9 @@ _Py_uop_sym_set_type_version(JitOptContext *ctx, JitOptRef ref, unsigned int ver
             return true;
         case JIT_SYM_RECORDED_VALUE_TAG:
             if (Py_TYPE(sym->recorded_value.value)->tp_version_tag == version) {
-                sym->recorded_value.known_type = true;
+                bool unshared = sym->recorded_value.unshared_local;
                 sym->tag = JIT_SYM_KNOWN_CLASS_TAG;
+                sym->cls.unshared_local = unshared;
                 sym->cls.type = Py_TYPE(sym->recorded_value.value);
                 sym->cls.version = version;
                 return true;
@@ -460,6 +464,7 @@ _Py_uop_sym_set_type_version(JitOptContext *ctx, JitOptRef ref, unsigned int ver
         case JIT_SYM_RECORDED_TYPE_TAG:
             if (sym->recorded_type.type->tp_version_tag == version) {
                 sym->tag = JIT_SYM_KNOWN_CLASS_TAG;
+                sym->cls.unshared_local = false;
                 sym->cls.type = sym->recorded_type.type;
                 sym->cls.version = version;
                 return true;
@@ -784,6 +789,34 @@ _Py_uop_sym_matches_type_version(JitOptRef sym, unsigned int version)
     return _Py_uop_sym_get_type_version(sym) == version;
 }
 
+void
+_Py_uop_sym_set_unshared_local(JitOptRef ref, bool unshared)
+{
+    JitOptSymbol *sym = PyJitRef_Unwrap(ref);
+    if (sym->tag == JIT_SYM_KNOWN_CLASS_TAG) {
+        sym->cls.unshared_local = unshared;
+    }
+    else if (sym->tag == JIT_SYM_RECORDED_VALUE_TAG) {
+        sym->recorded_value.unshared_local = unshared;
+    }
+}
+
+bool
+_Py_uop_sym_is_unshared_local(JitOptRef ref)
+{
+    if (PyJitRef_IsUnique(ref)) {
+        return true;
+    }
+    JitOptSymbol *sym = PyJitRef_Unwrap(ref);
+    if (sym->tag == JIT_SYM_KNOWN_CLASS_TAG) {
+        return sym->cls.unshared_local;
+    }
+    if (sym->tag == JIT_SYM_RECORDED_VALUE_TAG) {
+        return sym->recorded_value.unshared_local;
+    }
+    return false;
+}
+
 PyObject *
 _Py_uop_sym_get_probable_value(JitOptRef ref)
 {
@@ -907,6 +940,8 @@ _Py_uop_sym_new_tuple(JitOptContext *ctx, int size, JitOptRef *args)
     }
     if (size > MAX_SYMBOLIC_TUPLE_SIZE) {
         res->tag = JIT_SYM_KNOWN_CLASS_TAG;
+        res->cls.unshared_local = false;
+        res->cls.version = 0;
         res->cls.type = &PyTuple_Type;
     }
     else {
@@ -1155,6 +1190,7 @@ _Py_uop_sym_set_recorded_value(JitOptContext *ctx, JitOptRef ref, PyObject *valu
         case JIT_SYM_UNKNOWN_TAG:
             sym->tag = JIT_SYM_RECORDED_VALUE_TAG;
             sym->recorded_value.known_type = false;
+            sym->recorded_value.unshared_local = false;
             sym->recorded_value.value = value;
             return;
         case JIT_SYM_RECORDED_VALUE_TAG:
@@ -1166,6 +1202,7 @@ _Py_uop_sym_set_recorded_value(JitOptContext *ctx, JitOptRef ref, PyObject *valu
             if (sym->recorded_type.type == Py_TYPE(value)) {
                 sym->tag = JIT_SYM_RECORDED_VALUE_TAG;
                 sym->recorded_value.known_type = false;
+                sym->recorded_value.unshared_local = false;
                 sym->recorded_value.value = value;
             }
             else {
@@ -1174,8 +1211,10 @@ _Py_uop_sym_set_recorded_value(JitOptContext *ctx, JitOptRef ref, PyObject *valu
             return;
         case JIT_SYM_KNOWN_CLASS_TAG:
             if (sym->cls.type == Py_TYPE(value)) {
+                bool unshared = sym->cls.unshared_local;
                 sym->tag = JIT_SYM_RECORDED_VALUE_TAG;
                 sym->recorded_value.known_type = true;
+                sym->recorded_value.unshared_local = unshared;
                 sym->recorded_value.value = value;
             }
             else {
@@ -1188,6 +1227,7 @@ _Py_uop_sym_set_recorded_value(JitOptContext *ctx, JitOptRef ref, PyObject *valu
             if (sym->version.version == Py_TYPE(value)->tp_version_tag) {
                 sym->tag = JIT_SYM_RECORDED_VALUE_TAG;
                 sym->recorded_value.known_type = true;
+                sym->recorded_value.unshared_local = false;
                 sym->recorded_value.value = value;
             }
             else {
@@ -1305,6 +1345,7 @@ _Py_uop_sym_set_recorded_type(JitOptContext *ctx, JitOptRef ref, PyTypeObject *t
         case JIT_SYM_TYPE_VERSION_TAG:
             if (sym->version.version == type->tp_version_tag) {
                 sym->tag = JIT_SYM_KNOWN_CLASS_TAG;
+                sym->cls.unshared_local = false;
                 sym->cls.type = type;
             }
             else {

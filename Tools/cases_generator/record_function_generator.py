@@ -32,6 +32,7 @@ MAX_RECORDED_VALUES = 3
 # Recorder uops whose slot kind differs from the leading word of their name.
 _RECORD_SLOT_KIND_OVERRIDES: dict[str, str] = {
     "_RECORD_BOUND_METHOD": "CALLABLE",
+    "_RECORD_NOS_GEN_FUNC": "NOS_GEN_FUNC",
 }
 
 

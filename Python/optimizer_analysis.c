@@ -203,6 +203,12 @@ convert_global_to_const(_PyUOpInstruction *inst, PyObject *obj)
     if (_Py_IsImmortal(res)) {
         inst->opcode = _LOAD_CONST_INLINE_BORROW;
     } else {
+#ifdef Py_GIL_DISABLED
+        PyUnstable_Object_EnableDeferredRefcount(res);
+        if (!_PyObject_HasDeferredRefcount(res)) {
+            return NULL;
+        }
+#endif
         inst->opcode = _LOAD_CONST_INLINE;
     }
     inst->operand0 = (uint64_t)res;
@@ -284,6 +290,8 @@ add_op(JitOptContext *ctx, _PyUOpInstruction *this_instr,
 #define sym_matches_type _Py_uop_sym_matches_type
 #define sym_matches_type_version _Py_uop_sym_matches_type_version
 #define sym_get_type_version _Py_uop_sym_get_type_version
+#define sym_set_unshared_local _Py_uop_sym_set_unshared_local
+#define sym_is_unshared_local _Py_uop_sym_is_unshared_local
 #define sym_set_null(SYM) _Py_uop_sym_set_null(ctx, SYM)
 #define sym_set_non_null(SYM) _Py_uop_sym_set_non_null(ctx, SYM)
 #define sym_set_type(SYM, TYPE) _Py_uop_sym_set_type(ctx, SYM, TYPE)
@@ -411,9 +419,18 @@ lookup_attr(JitOptContext *ctx, _PyBloomFilter *dependencies, _PyUOpInstruction 
 {
     // The cached value may be dead, so we need to do the lookup again... :(
     if (type && PyType_Check(type)) {
-        PyObject *lookup = _PyType_Lookup(type, name);
+        PyObject *lookup = _PyType_LookupRef(type, name);
         if (lookup) {
             bool immortal = _Py_IsImmortal(lookup) || (type->tp_flags & Py_TPFLAGS_IMMUTABLETYPE);
+#ifdef Py_GIL_DISABLED
+            if (!immortal) {
+                PyUnstable_Object_EnableDeferredRefcount(lookup);
+                if (!_PyObject_HasDeferredRefcount(lookup)) {
+                    Py_DECREF(lookup);
+                    return sym_new_not_null(ctx);
+                }
+            }
+#endif
             if (prefix != _NOP) {
                 ADD_OP(prefix, 0, 0);
             }
@@ -425,7 +442,9 @@ lookup_attr(JitOptContext *ctx, _PyBloomFilter *dependencies, _PyUOpInstruction 
             if ((type->tp_flags & Py_TPFLAGS_IMMUTABLETYPE) == 0) {
                 watch_type(type, dependencies);
             }
-            return sym_new_const(ctx, lookup);
+            JitOptRef res = sym_new_const(ctx, lookup);
+            Py_DECREF(lookup);
+            return res;
         }
     }
     return sym_new_not_null(ctx);
@@ -485,6 +504,15 @@ lookup_super_attr(JitOptContext *ctx, _PyBloomFilter *dependencies,
     if (_Py_IsImmortal(lookup) || (obj_type->tp_flags & Py_TPFLAGS_IMMUTABLETYPE)) {
         opcode = immortal;
     }
+#ifdef Py_GIL_DISABLED
+    else {
+        PyUnstable_Object_EnableDeferredRefcount(lookup);
+        if (!_PyObject_HasDeferredRefcount(lookup)) {
+            Py_DECREF(lookup);
+            return sym_new_not_null(ctx);
+        }
+    }
+#endif
     ADD_OP(_SWAP, 3, 0);
     ADD_OP(_POP_TOP, 0, 0);
     ADD_OP(_POP_TOP, 0, 0);

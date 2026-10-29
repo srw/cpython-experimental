@@ -178,6 +178,7 @@ typedef struct {
     int32_t bloom_array_idx;        // Index in interp->executor_blooms/executor_ptrs.
     _PyExecutorLinkListNode links;  // Used by deletion list.
     PyCodeObject *code;  // Weak (NULL if no corresponding ENTER_EXECUTOR).
+    _Py_CODEUNIT *instr_ptr; // Pointer to instruction in (possibly thread-local) bytecode.
 } _PyVMData;
 
 typedef struct _PyExitData {
@@ -449,6 +450,8 @@ extern bool _Py_uop_sym_has_type(JitOptRef sym);
 extern bool _Py_uop_sym_matches_type(JitOptRef sym, PyTypeObject *typ);
 extern bool _Py_uop_sym_matches_type_version(JitOptRef sym, unsigned int version);
 extern unsigned int _Py_uop_sym_get_type_version(JitOptRef sym);
+extern void _Py_uop_sym_set_unshared_local(JitOptRef ref, bool unshared);
+extern bool _Py_uop_sym_is_unshared_local(JitOptRef ref);
 extern void _Py_uop_sym_set_null(JitOptContext *ctx, JitOptRef sym);
 extern void _Py_uop_sym_set_non_null(JitOptContext *ctx, JitOptRef sym);
 extern void _Py_uop_sym_set_type(JitOptContext *ctx, JitOptRef sym, PyTypeObject *typ);

@@ -647,12 +647,21 @@ _Py_GetBaseCodeUnit(PyCodeObject *code, int i)
         return inst;
     }
     if (opcode == ENTER_EXECUTOR) {
-        _PyExecutorObject *exec = code->co_executors->executors[inst.op.arg];
-        opcode = _PyOpcode_Deopt[exec->vm_data.opcode];
-        inst.op.code = opcode;
-        inst.op.arg = exec->vm_data.oparg;
-        assert(inst.op.code < MIN_SPECIALIZED_OPCODE);
-        return inst;
+        _PyExecutorObject *exec = (_PyExecutorObject *)_Py_atomic_load_ptr(&code->co_executors->executors[inst.op.arg]);
+        if (exec != NULL) {
+            opcode = _PyOpcode_Deopt[exec->vm_data.opcode];
+            inst.op.code = opcode;
+            inst.op.arg = exec->vm_data.oparg;
+            assert(inst.op.code < MIN_SPECIALIZED_OPCODE);
+            return inst;
+        }
+        inst.cache = FT_ATOMIC_LOAD_UINT16_RELAXED(*(uint16_t *)src_instr);
+        opcode = inst.op.code;
+        if (opcode < MIN_INSTRUMENTED_OPCODE) {
+            inst.op.code = _PyOpcode_Deopt[opcode];
+            assert(inst.op.code < MIN_SPECIALIZED_OPCODE);
+            return inst;
+        }
     }
     if (opcode == INSTRUMENTED_LINE) {
         opcode = _PyCode_GetOriginalOpcode(code->_co_monitoring->lines, i);

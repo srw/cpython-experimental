@@ -102,10 +102,11 @@ void _PyOpcode_RecordFunction_CODE(_PyInterpreterFrame *frame, _PyStackRef *stac
 #define _RECORD_NOS_INDEX 2
 #define _RECORD_NOS_TYPE_INDEX 3
 #define _RECORD_3OS_GEN_FUNC_INDEX 4
-#define _RECORD_TOS_INDEX 5
-#define _RECORD_CALLABLE_INDEX 6
-#define _RECORD_CALLABLE_KW_INDEX 7
-#define _RECORD_4OS_INDEX 8
+#define _RECORD_NOS_GEN_FUNC_INDEX 5
+#define _RECORD_TOS_INDEX 6
+#define _RECORD_CALLABLE_INDEX 7
+#define _RECORD_CALLABLE_KW_INDEX 8
+#define _RECORD_4OS_INDEX 9
 
 const _PyOpcodeRecordEntry _PyOpcode_RecordEntries[256] = {
         [TO_BOOL_BOOL] = {1, {_RECORD_TOS_TYPE_INDEX}},
@@ -137,7 +138,7 @@ const _PyOpcodeRecordEntry _PyOpcode_RecordEntries[256] = {
         [STORE_SUBSCR_DICT] = {1, {_RECORD_NOS_TYPE_INDEX}},
         [SEND] = {1, {_RECORD_3OS_GEN_FUNC_INDEX}},
         [SEND_GEN] = {1, {_RECORD_3OS_GEN_FUNC_INDEX}},
-        [FOR_ITER] = {1, {_RECORD_NOS_INDEX}},
+        [FOR_ITER] = {2, {_RECORD_NOS_GEN_FUNC_INDEX, _RECORD_NOS_TYPE_INDEX}},
         [SEND_VIRTUAL] = {1, {_RECORD_3OS_GEN_FUNC_INDEX}},
         [SEND_ASYNC_GEN] = {1, {_RECORD_3OS_GEN_FUNC_INDEX}},
         [STORE_ATTR] = {1, {_RECORD_TOS_TYPE_INDEX}},
@@ -158,11 +159,11 @@ const _PyOpcodeRecordEntry _PyOpcode_RecordEntries[256] = {
         [GET_ITER] = {1, {_RECORD_TOS_TYPE_INDEX}},
         [GET_ITER_SELF] = {1, {_RECORD_TOS_TYPE_INDEX}},
         [GET_ITER_VIRTUAL] = {1, {_RECORD_TOS_TYPE_INDEX}},
-        [FOR_ITER_VIRTUAL] = {1, {_RECORD_NOS_INDEX}},
-        [FOR_ITER_LIST] = {1, {_RECORD_NOS_INDEX}},
-        [FOR_ITER_TUPLE] = {1, {_RECORD_NOS_INDEX}},
-        [FOR_ITER_RANGE] = {1, {_RECORD_NOS_INDEX}},
-        [FOR_ITER_GEN] = {1, {_RECORD_NOS_INDEX}},
+        [FOR_ITER_VIRTUAL] = {2, {_RECORD_NOS_GEN_FUNC_INDEX, _RECORD_NOS_TYPE_INDEX}},
+        [FOR_ITER_LIST] = {2, {_RECORD_NOS_GEN_FUNC_INDEX, _RECORD_NOS_TYPE_INDEX}},
+        [FOR_ITER_TUPLE] = {2, {_RECORD_NOS_GEN_FUNC_INDEX, _RECORD_NOS_TYPE_INDEX}},
+        [FOR_ITER_RANGE] = {2, {_RECORD_NOS_GEN_FUNC_INDEX, _RECORD_NOS_TYPE_INDEX}},
+        [FOR_ITER_GEN] = {2, {_RECORD_NOS_GEN_FUNC_INDEX, _RECORD_NOS_TYPE_INDEX}},
         [LOAD_SPECIAL] = {1, {_RECORD_TOS_TYPE_INDEX}},
         [LOAD_ATTR_METHOD_WITH_VALUES] = {1, {_RECORD_TOS_INDEX}},
         [LOAD_ATTR_METHOD_NO_DICT] = {1, {_RECORD_TOS_INDEX}},
@@ -206,7 +207,7 @@ const _PyOpcodeRecordSlotMap _PyOpcode_RecordSlotMaps[256] = {
         [BINARY_OP_SUBSCR_GETITEM] = {1, 0, {0}},
         [STORE_SUBSCR_DICT] = {1, 0, {0}},
         [SEND_GEN] = {1, 0, {0}},
-        [FOR_ITER] = {1, 1, {0}},
+        [FOR_ITER] = {1, 0, {1}},
         [LOAD_SUPER_ATTR_METHOD] = {1, 0, {0}},
         [LOAD_ATTR_INSTANCE_VALUE] = {1, 1, {0}},
         [LOAD_ATTR_WITH_HINT] = {1, 1, {0}},
@@ -221,7 +222,7 @@ const _PyOpcodeRecordSlotMap _PyOpcode_RecordSlotMaps[256] = {
         [GET_ITER] = {1, 0, {0}},
         [GET_ITER_SELF] = {1, 0, {0}},
         [GET_ITER_VIRTUAL] = {1, 0, {0}},
-        [FOR_ITER_GEN] = {1, 1, {0}},
+        [FOR_ITER_GEN] = {1, 0, {0}},
         [LOAD_SPECIAL] = {1, 0, {0}},
         [LOAD_ATTR_METHOD_WITH_VALUES] = {1, 1, {0}},
         [LOAD_ATTR_METHOD_NO_DICT] = {1, 1, {0}},
@@ -247,12 +248,13 @@ const _PyOpcodeRecordSlotMap _PyOpcode_RecordSlotMaps[256] = {
         [BINARY_OP] = {2, 2, {1, 0}},
 };
 
-const _Py_RecordFuncPtr _PyOpcode_RecordFunctions[9] = {
+const _Py_RecordFuncPtr _PyOpcode_RecordFunctions[10] = {
         [0] = NULL,
         [_RECORD_TOS_TYPE_INDEX] = _PyOpcode_RecordFunction_TOS_TYPE,
         [_RECORD_NOS_INDEX] = _PyOpcode_RecordFunction_NOS,
         [_RECORD_NOS_TYPE_INDEX] = _PyOpcode_RecordFunction_NOS_TYPE,
         [_RECORD_3OS_GEN_FUNC_INDEX] = _PyOpcode_RecordFunction_3OS_GEN_FUNC,
+        [_RECORD_NOS_GEN_FUNC_INDEX] = _PyOpcode_RecordFunction_NOS_GEN_FUNC,
         [_RECORD_TOS_INDEX] = _PyOpcode_RecordFunction_TOS,
         [_RECORD_CALLABLE_INDEX] = _PyOpcode_RecordFunction_CALLABLE,
         [_RECORD_CALLABLE_KW_INDEX] = _PyOpcode_RecordFunction_CALLABLE_KW,
@@ -284,25 +286,6 @@ _PyOpcode_RecordTransform_TOS_TYPE(PyObject *recorded_value)
 }
 
 static PyObject *
-_PyOpcode_RecordTransform_NOS_GEN_FUNC(PyObject *recorded_value)
-{
-    PyObject *transformed_value = NULL;
-    _PyStackRef nos;
-    nos = PyStackRef_FromPyObjectBorrow(recorded_value);
-    PyObject *obj = PyStackRef_AsPyObjectBorrow(nos);
-    if (PyGen_Check(obj)) {
-        PyGenObject *gen = (PyGenObject *)obj;
-        _PyStackRef func = gen->gi_iframe.f_funcobj;
-        if (!PyStackRef_IsNull(func)) {
-            transformed_value = (PyObject *)PyStackRef_AsPyObjectBorrow(func);
-            Py_XINCREF(transformed_value);
-        }
-    }
-    Py_DECREF(recorded_value);
-    return transformed_value;
-}
-
-static PyObject *
 _PyOpcode_RecordTransform_BOUND_METHOD(PyObject *recorded_value)
 {
     PyObject *transformed_value = NULL;
@@ -325,8 +308,6 @@ _PyOpcode_RecordTransformValue(int uop, PyObject *value)
             return _PyOpcode_RecordTransform_NOS_TYPE(value);
         case _RECORD_TOS_TYPE:
             return _PyOpcode_RecordTransform_TOS_TYPE(value);
-        case _RECORD_NOS_GEN_FUNC:
-            return _PyOpcode_RecordTransform_NOS_GEN_FUNC(value);
         case _RECORD_BOUND_METHOD:
             return _PyOpcode_RecordTransform_BOUND_METHOD(value);
         default:

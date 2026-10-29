@@ -6,6 +6,7 @@
 #include "pycore_ceval.h"         // _Py_EnterRecursiveCall()
 #include "pycore_lock.h"          // _PyOnceFlag
 #include "pycore_modsupport.h"    // _PyArg_NoPositional()
+#include "pycore_object.h"        // _Py_DECREF_TYPE()
 #include "pycore_pystate.h"       // _PyInterpreterState_GET()
 #include "pycore_runtime.h"       // _Py_ID()
 #include "pycore_setobject.h"     // _PySet_NextEntry()
@@ -1427,7 +1428,7 @@ ast_dealloc(PyObject *op)
     freefunc free_func = PyType_GetSlot(tp, Py_tp_free);
     assert(free_func != NULL);
     free_func(self);
-    Py_DECREF(tp);
+    _Py_DECREF_TYPE(tp);
 }
 
 static int
@@ -7129,12 +7130,25 @@ obj2ast_mod(struct ast_state *state, PyObject* obj, mod_ty* out, const char*
         PyErr_Format(PyExc_TypeError, "field '%s' was expecting node of type 'mod', got '%T'", field, obj);
         return 1;
     }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Module_type)) {
+        goto match_Module;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Interactive_type)) {
+        goto match_Interactive;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Expression_type)) {
+        goto match_Expression;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->FunctionType_type)) {
+        goto match_FunctionType;
+    }
     tp = state->Module_type;
     isinstance = PyObject_IsInstance(obj, tp);
     if (isinstance == -1) {
         return -1;
     }
     if (isinstance) {
+        match_Module:;
         asdl_stmt_seq* body;
         asdl_type_ignore_seq* type_ignores;
 
@@ -7224,6 +7238,7 @@ obj2ast_mod(struct ast_state *state, PyObject* obj, mod_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Interactive:;
         asdl_stmt_seq* body;
 
         if (PyObject_GetOptionalAttr(obj, state->body, &tmp) < 0) {
@@ -7274,6 +7289,7 @@ obj2ast_mod(struct ast_state *state, PyObject* obj, mod_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Expression:;
         expr_ty body;
 
         if (PyObject_GetOptionalAttr(obj, state->body, &tmp) < 0) {
@@ -7303,6 +7319,7 @@ obj2ast_mod(struct ast_state *state, PyObject* obj, mod_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_FunctionType:;
         asdl_expr_seq* argtypes;
         expr_ty returns;
 
@@ -7466,12 +7483,97 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         if (res != 0) goto failed;
         Py_CLEAR(tmp);
     }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->FunctionDef_type)) {
+        goto match_FunctionDef;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->AsyncFunctionDef_type)) {
+        goto match_AsyncFunctionDef;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->ClassDef_type)) {
+        goto match_ClassDef;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Return_type)) {
+        goto match_Return;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Delete_type)) {
+        goto match_Delete;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Assign_type)) {
+        goto match_Assign;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->TypeAlias_type)) {
+        goto match_TypeAlias;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->AugAssign_type)) {
+        goto match_AugAssign;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->AnnAssign_type)) {
+        goto match_AnnAssign;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->For_type)) {
+        goto match_For;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->AsyncFor_type)) {
+        goto match_AsyncFor;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->While_type)) {
+        goto match_While;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->If_type)) {
+        goto match_If;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->With_type)) {
+        goto match_With;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->AsyncWith_type)) {
+        goto match_AsyncWith;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Match_type)) {
+        goto match_Match;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Raise_type)) {
+        goto match_Raise;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Try_type)) {
+        goto match_Try;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->TryStar_type)) {
+        goto match_TryStar;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Assert_type)) {
+        goto match_Assert;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Import_type)) {
+        goto match_Import;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->ImportFrom_type)) {
+        goto match_ImportFrom;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Global_type)) {
+        goto match_Global;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Nonlocal_type)) {
+        goto match_Nonlocal;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Expr_type)) {
+        goto match_Expr;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Pass_type)) {
+        goto match_Pass;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Break_type)) {
+        goto match_Break;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Continue_type)) {
+        goto match_Continue;
+    }
     tp = state->FunctionDef_type;
     isinstance = PyObject_IsInstance(obj, tp);
     if (isinstance == -1) {
         return -1;
     }
     if (isinstance) {
+        match_FunctionDef:;
         identifier name;
         arguments_ty args;
         asdl_stmt_seq* body;
@@ -7676,6 +7778,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_AsyncFunctionDef:;
         identifier name;
         arguments_ty args;
         asdl_stmt_seq* body;
@@ -7880,6 +7983,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_ClassDef:;
         identifier name;
         asdl_expr_seq* bases;
         asdl_keyword_seq* keywords;
@@ -8106,6 +8210,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Return:;
         expr_ty value;
 
         if (PyObject_GetOptionalAttr(obj, state->value, &tmp) < 0) {
@@ -8136,6 +8241,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Delete:;
         asdl_expr_seq* targets;
 
         if (PyObject_GetOptionalAttr(obj, state->targets, &tmp) < 0) {
@@ -8187,6 +8293,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Assign:;
         asdl_expr_seq* targets;
         expr_ty value;
         string type_comment;
@@ -8275,6 +8382,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_TypeAlias:;
         expr_ty name;
         asdl_type_param_seq* type_params;
         expr_ty value;
@@ -8362,6 +8470,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_AugAssign:;
         expr_ty target;
         operator_ty op;
         expr_ty value;
@@ -8428,6 +8537,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_AnnAssign:;
         expr_ty target;
         expr_ty annotation;
         expr_ty value;
@@ -8512,6 +8622,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_For:;
         expr_ty target;
         expr_ty iter;
         asdl_stmt_seq* body;
@@ -8657,6 +8768,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_AsyncFor:;
         expr_ty target;
         expr_ty iter;
         asdl_stmt_seq* body;
@@ -8803,6 +8915,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_While:;
         expr_ty test;
         asdl_stmt_seq* body;
         asdl_stmt_seq* orelse;
@@ -8911,6 +9024,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_If:;
         expr_ty test;
         asdl_stmt_seq* body;
         asdl_stmt_seq* orelse;
@@ -9019,6 +9133,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_With:;
         asdl_withitem_seq* items;
         asdl_stmt_seq* body;
         string type_comment;
@@ -9128,6 +9243,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_AsyncWith:;
         asdl_withitem_seq* items;
         asdl_stmt_seq* body;
         string type_comment;
@@ -9237,6 +9353,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Match:;
         expr_ty subject;
         asdl_match_case_seq* cases;
 
@@ -9306,6 +9423,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Raise:;
         expr_ty exc;
         expr_ty cause;
 
@@ -9354,6 +9472,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Try:;
         asdl_stmt_seq* body;
         asdl_excepthandler_seq* handlers;
         asdl_stmt_seq* orelse;
@@ -9522,6 +9641,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_TryStar:;
         asdl_stmt_seq* body;
         asdl_excepthandler_seq* handlers;
         asdl_stmt_seq* orelse;
@@ -9690,6 +9810,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Assert:;
         expr_ty test;
         expr_ty msg;
 
@@ -9738,6 +9859,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Import:;
         asdl_alias_seq* names;
         int is_lazy;
 
@@ -9807,6 +9929,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_ImportFrom:;
         identifier module;
         asdl_alias_seq* names;
         int level;
@@ -9912,6 +10035,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Global:;
         asdl_identifier_seq* names;
 
         if (PyObject_GetOptionalAttr(obj, state->names, &tmp) < 0) {
@@ -9963,6 +10087,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Nonlocal:;
         asdl_identifier_seq* names;
 
         if (PyObject_GetOptionalAttr(obj, state->names, &tmp) < 0) {
@@ -10014,6 +10139,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Expr:;
         expr_ty value;
 
         if (PyObject_GetOptionalAttr(obj, state->value, &tmp) < 0) {
@@ -10044,6 +10170,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Pass:;
 
         *out = _PyAST_Pass(lineno, col_offset, end_lineno, end_col_offset,
                            arena);
@@ -10056,6 +10183,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Break:;
 
         *out = _PyAST_Break(lineno, col_offset, end_lineno, end_col_offset,
                             arena);
@@ -10068,6 +10196,7 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Continue:;
 
         *out = _PyAST_Continue(lineno, col_offset, end_lineno, end_col_offset,
                                arena);
@@ -10175,12 +10304,100 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         if (res != 0) goto failed;
         Py_CLEAR(tmp);
     }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->BoolOp_type)) {
+        goto match_BoolOp;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->NamedExpr_type)) {
+        goto match_NamedExpr;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->BinOp_type)) {
+        goto match_BinOp;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->UnaryOp_type)) {
+        goto match_UnaryOp;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Lambda_type)) {
+        goto match_Lambda;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->IfExp_type)) {
+        goto match_IfExp;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Dict_type)) {
+        goto match_Dict;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Set_type)) {
+        goto match_Set;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->ListComp_type)) {
+        goto match_ListComp;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->SetComp_type)) {
+        goto match_SetComp;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->DictComp_type)) {
+        goto match_DictComp;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->GeneratorExp_type)) {
+        goto match_GeneratorExp;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Await_type)) {
+        goto match_Await;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Yield_type)) {
+        goto match_Yield;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->YieldFrom_type)) {
+        goto match_YieldFrom;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Compare_type)) {
+        goto match_Compare;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Call_type)) {
+        goto match_Call;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->FormattedValue_type)) {
+        goto match_FormattedValue;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Interpolation_type)) {
+        goto match_Interpolation;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->JoinedStr_type)) {
+        goto match_JoinedStr;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->TemplateStr_type)) {
+        goto match_TemplateStr;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Constant_type)) {
+        goto match_Constant;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Attribute_type)) {
+        goto match_Attribute;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Subscript_type)) {
+        goto match_Subscript;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Starred_type)) {
+        goto match_Starred;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Name_type)) {
+        goto match_Name;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->List_type)) {
+        goto match_List;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Tuple_type)) {
+        goto match_Tuple;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Slice_type)) {
+        goto match_Slice;
+    }
     tp = state->BoolOp_type;
     isinstance = PyObject_IsInstance(obj, tp);
     if (isinstance == -1) {
         return -1;
     }
     if (isinstance) {
+        match_BoolOp:;
         boolop_ty op;
         asdl_expr_seq* values;
 
@@ -10250,6 +10467,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_NamedExpr:;
         expr_ty target;
         expr_ty value;
 
@@ -10298,6 +10516,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_BinOp:;
         expr_ty left;
         operator_ty op;
         expr_ty right;
@@ -10364,6 +10583,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_UnaryOp:;
         unaryop_ty op;
         expr_ty operand;
 
@@ -10412,6 +10632,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Lambda:;
         arguments_ty args;
         expr_ty body;
 
@@ -10460,6 +10681,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_IfExp:;
         expr_ty test;
         expr_ty body;
         expr_ty orelse;
@@ -10526,6 +10748,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Dict:;
         asdl_expr_seq* keys;
         asdl_expr_seq* values;
 
@@ -10616,6 +10839,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Set:;
         asdl_expr_seq* elts;
 
         if (PyObject_GetOptionalAttr(obj, state->elts, &tmp) < 0) {
@@ -10667,6 +10891,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_ListComp:;
         expr_ty elt;
         asdl_comprehension_seq* generators;
 
@@ -10736,6 +10961,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_SetComp:;
         expr_ty elt;
         asdl_comprehension_seq* generators;
 
@@ -10805,6 +11031,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_DictComp:;
         expr_ty key;
         expr_ty value;
         asdl_comprehension_seq* generators;
@@ -10892,6 +11119,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_GeneratorExp:;
         expr_ty elt;
         asdl_comprehension_seq* generators;
 
@@ -10961,6 +11189,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Await:;
         expr_ty value;
 
         if (PyObject_GetOptionalAttr(obj, state->value, &tmp) < 0) {
@@ -10991,6 +11220,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Yield:;
         expr_ty value;
 
         if (PyObject_GetOptionalAttr(obj, state->value, &tmp) < 0) {
@@ -11021,6 +11251,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_YieldFrom:;
         expr_ty value;
 
         if (PyObject_GetOptionalAttr(obj, state->value, &tmp) < 0) {
@@ -11051,6 +11282,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Compare:;
         expr_ty left;
         asdl_int_seq* ops;
         asdl_expr_seq* comparators;
@@ -11159,6 +11391,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Call:;
         expr_ty func;
         asdl_expr_seq* args;
         asdl_keyword_seq* keywords;
@@ -11267,6 +11500,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_FormattedValue:;
         expr_ty value;
         int conversion;
         expr_ty format_spec;
@@ -11334,6 +11568,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Interpolation:;
         expr_ty value;
         constant str;
         int conversion;
@@ -11419,6 +11654,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_JoinedStr:;
         asdl_expr_seq* values;
 
         if (PyObject_GetOptionalAttr(obj, state->values, &tmp) < 0) {
@@ -11470,6 +11706,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_TemplateStr:;
         asdl_expr_seq* values;
 
         if (PyObject_GetOptionalAttr(obj, state->values, &tmp) < 0) {
@@ -11521,6 +11758,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Constant:;
         constant value;
         string kind;
 
@@ -11569,6 +11807,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Attribute:;
         expr_ty value;
         identifier attr;
         expr_context_ty ctx;
@@ -11635,6 +11874,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Subscript:;
         expr_ty value;
         expr_ty slice;
         expr_context_ty ctx;
@@ -11701,6 +11941,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Starred:;
         expr_ty value;
         expr_context_ty ctx;
 
@@ -11749,6 +11990,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Name:;
         identifier id;
         expr_context_ty ctx;
 
@@ -11797,6 +12039,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_List:;
         asdl_expr_seq* elts;
         expr_context_ty ctx;
 
@@ -11866,6 +12109,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Tuple:;
         asdl_expr_seq* elts;
         expr_context_ty ctx;
 
@@ -11935,6 +12179,7 @@ obj2ast_expr(struct ast_state *state, PyObject* obj, expr_ty* out, const char*
         return -1;
     }
     if (isinstance) {
+        match_Slice:;
         expr_ty lower;
         expr_ty upper;
         expr_ty step;
@@ -12008,6 +12253,18 @@ obj2ast_expr_context(struct ast_state *state, PyObject* obj, expr_context_ty*
 {
     int isinstance;
 
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Load_type)) {
+        *out = Load;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Store_type)) {
+        *out = Store;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Del_type)) {
+        *out = Del;
+        return 0;
+    }
     isinstance = PyObject_IsInstance(obj, state->Load_type);
     if (isinstance == -1) {
         return -1;
@@ -12043,6 +12300,14 @@ obj2ast_boolop(struct ast_state *state, PyObject* obj, boolop_ty* out, const
 {
     int isinstance;
 
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->And_type)) {
+        *out = And;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Or_type)) {
+        *out = Or;
+        return 0;
+    }
     isinstance = PyObject_IsInstance(obj, state->And_type);
     if (isinstance == -1) {
         return -1;
@@ -12070,6 +12335,58 @@ obj2ast_operator(struct ast_state *state, PyObject* obj, operator_ty* out,
 {
     int isinstance;
 
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Add_type)) {
+        *out = Add;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Sub_type)) {
+        *out = Sub;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Mult_type)) {
+        *out = Mult;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->MatMult_type)) {
+        *out = MatMult;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Div_type)) {
+        *out = Div;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Mod_type)) {
+        *out = Mod;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Pow_type)) {
+        *out = Pow;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->LShift_type)) {
+        *out = LShift;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->RShift_type)) {
+        *out = RShift;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->BitOr_type)) {
+        *out = BitOr;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->BitXor_type)) {
+        *out = BitXor;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->BitAnd_type)) {
+        *out = BitAnd;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->FloorDiv_type)) {
+        *out = FloorDiv;
+        return 0;
+    }
     isinstance = PyObject_IsInstance(obj, state->Add_type);
     if (isinstance == -1) {
         return -1;
@@ -12185,6 +12502,22 @@ obj2ast_unaryop(struct ast_state *state, PyObject* obj, unaryop_ty* out, const
 {
     int isinstance;
 
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Invert_type)) {
+        *out = Invert;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Not_type)) {
+        *out = Not;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->UAdd_type)) {
+        *out = UAdd;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->USub_type)) {
+        *out = USub;
+        return 0;
+    }
     isinstance = PyObject_IsInstance(obj, state->Invert_type);
     if (isinstance == -1) {
         return -1;
@@ -12228,6 +12561,46 @@ obj2ast_cmpop(struct ast_state *state, PyObject* obj, cmpop_ty* out, const
 {
     int isinstance;
 
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Eq_type)) {
+        *out = Eq;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->NotEq_type)) {
+        *out = NotEq;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Lt_type)) {
+        *out = Lt;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->LtE_type)) {
+        *out = LtE;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Gt_type)) {
+        *out = Gt;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->GtE_type)) {
+        *out = GtE;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->Is_type)) {
+        *out = Is;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->IsNot_type)) {
+        *out = IsNot;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->In_type)) {
+        *out = In;
+        return 0;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->NotIn_type)) {
+        *out = NotIn;
+        return 0;
+    }
     isinstance = PyObject_IsInstance(obj, state->Eq_type);
     if (isinstance == -1) {
         return -1;
@@ -12514,12 +12887,16 @@ obj2ast_excepthandler(struct ast_state *state, PyObject* obj, excepthandler_ty*
         if (res != 0) goto failed;
         Py_CLEAR(tmp);
     }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->ExceptHandler_type)) {
+        goto match_ExceptHandler;
+    }
     tp = state->ExceptHandler_type;
     isinstance = PyObject_IsInstance(obj, tp);
     if (isinstance == -1) {
         return -1;
     }
     if (isinstance) {
+        match_ExceptHandler:;
         expr_ty type;
         identifier name;
         asdl_stmt_seq* body;
@@ -13474,12 +13851,37 @@ obj2ast_pattern(struct ast_state *state, PyObject* obj, pattern_ty* out, const
         if (res != 0) goto failed;
         Py_CLEAR(tmp);
     }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->MatchValue_type)) {
+        goto match_MatchValue;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->MatchSingleton_type)) {
+        goto match_MatchSingleton;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->MatchSequence_type)) {
+        goto match_MatchSequence;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->MatchMapping_type)) {
+        goto match_MatchMapping;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->MatchClass_type)) {
+        goto match_MatchClass;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->MatchStar_type)) {
+        goto match_MatchStar;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->MatchAs_type)) {
+        goto match_MatchAs;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->MatchOr_type)) {
+        goto match_MatchOr;
+    }
     tp = state->MatchValue_type;
     isinstance = PyObject_IsInstance(obj, tp);
     if (isinstance == -1) {
         return -1;
     }
     if (isinstance) {
+        match_MatchValue:;
         expr_ty value;
 
         if (PyObject_GetOptionalAttr(obj, state->value, &tmp) < 0) {
@@ -13510,6 +13912,7 @@ obj2ast_pattern(struct ast_state *state, PyObject* obj, pattern_ty* out, const
         return -1;
     }
     if (isinstance) {
+        match_MatchSingleton:;
         constant value;
 
         if (PyObject_GetOptionalAttr(obj, state->value, &tmp) < 0) {
@@ -13540,6 +13943,7 @@ obj2ast_pattern(struct ast_state *state, PyObject* obj, pattern_ty* out, const
         return -1;
     }
     if (isinstance) {
+        match_MatchSequence:;
         asdl_pattern_seq* patterns;
 
         if (PyObject_GetOptionalAttr(obj, state->patterns, &tmp) < 0) {
@@ -13591,6 +13995,7 @@ obj2ast_pattern(struct ast_state *state, PyObject* obj, pattern_ty* out, const
         return -1;
     }
     if (isinstance) {
+        match_MatchMapping:;
         asdl_expr_seq* keys;
         asdl_pattern_seq* patterns;
         identifier rest;
@@ -13699,6 +14104,7 @@ obj2ast_pattern(struct ast_state *state, PyObject* obj, pattern_ty* out, const
         return -1;
     }
     if (isinstance) {
+        match_MatchClass:;
         expr_ty cls;
         asdl_pattern_seq* patterns;
         asdl_identifier_seq* kwd_attrs;
@@ -13847,6 +14253,7 @@ obj2ast_pattern(struct ast_state *state, PyObject* obj, pattern_ty* out, const
         return -1;
     }
     if (isinstance) {
+        match_MatchStar:;
         identifier name;
 
         if (PyObject_GetOptionalAttr(obj, state->name, &tmp) < 0) {
@@ -13877,6 +14284,7 @@ obj2ast_pattern(struct ast_state *state, PyObject* obj, pattern_ty* out, const
         return -1;
     }
     if (isinstance) {
+        match_MatchAs:;
         pattern_ty pattern;
         identifier name;
 
@@ -13925,6 +14333,7 @@ obj2ast_pattern(struct ast_state *state, PyObject* obj, pattern_ty* out, const
         return -1;
     }
     if (isinstance) {
+        match_MatchOr:;
         asdl_pattern_seq* patterns;
 
         if (PyObject_GetOptionalAttr(obj, state->patterns, &tmp) < 0) {
@@ -13999,12 +14408,16 @@ obj2ast_type_ignore(struct ast_state *state, PyObject* obj, type_ignore_ty*
         PyErr_Format(PyExc_TypeError, "field '%s' was expecting node of type 'type_ignore', got '%T'", field, obj);
         return 1;
     }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->TypeIgnore_type)) {
+        goto match_TypeIgnore;
+    }
     tp = state->TypeIgnore_type;
     isinstance = PyObject_IsInstance(obj, tp);
     if (isinstance == -1) {
         return -1;
     }
     if (isinstance) {
+        match_TypeIgnore:;
         int lineno;
         string tag;
 
@@ -14147,12 +14560,22 @@ obj2ast_type_param(struct ast_state *state, PyObject* obj, type_param_ty* out,
         if (res != 0) goto failed;
         Py_CLEAR(tmp);
     }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->TypeVar_type)) {
+        goto match_TypeVar;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->ParamSpec_type)) {
+        goto match_ParamSpec;
+    }
+    if (Py_IS_TYPE(obj, (PyTypeObject *)state->TypeVarTuple_type)) {
+        goto match_TypeVarTuple;
+    }
     tp = state->TypeVar_type;
     isinstance = PyObject_IsInstance(obj, tp);
     if (isinstance == -1) {
         return -1;
     }
     if (isinstance) {
+        match_TypeVar:;
         identifier name;
         expr_ty bound;
         expr_ty default_value;
@@ -14220,6 +14643,7 @@ obj2ast_type_param(struct ast_state *state, PyObject* obj, type_param_ty* out,
         return -1;
     }
     if (isinstance) {
+        match_ParamSpec:;
         identifier name;
         expr_ty default_value;
 
@@ -14269,6 +14693,7 @@ obj2ast_type_param(struct ast_state *state, PyObject* obj, type_param_ty* out,
         return -1;
     }
     if (isinstance) {
+        match_TypeVarTuple:;
         identifier name;
         expr_ty default_value;
 

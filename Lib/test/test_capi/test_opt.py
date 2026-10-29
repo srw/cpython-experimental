@@ -86,7 +86,6 @@ def count_ops(ex, name):
 
 
 @requires_specialization
-@unittest.skipIf(Py_GIL_DISABLED, "optimizer not yet supported in free-threaded builds")
 @requires_jit_enabled
 class TestExecutorInvalidation(unittest.TestCase):
 
@@ -180,7 +179,6 @@ def get_bool_guard_ops():
 
 
 @requires_specialization
-@unittest.skipIf(Py_GIL_DISABLED, "optimizer not yet supported in free-threaded builds")
 @requires_jit_enabled
 @unittest.skipIf(os.getenv("PYTHON_UOPS_OPTIMIZE") == "0", "Needs uop optimizer to run.")
 class TestUops(unittest.TestCase):
@@ -627,7 +625,6 @@ class TestUops(unittest.TestCase):
 
 
 @requires_specialization
-@unittest.skipIf(Py_GIL_DISABLED, "optimizer not yet supported in free-threaded builds")
 @requires_jit_enabled
 @unittest.skipIf(os.getenv("PYTHON_UOPS_OPTIMIZE") == "0", "Needs uop optimizer to run.")
 class TestUopsOptimization(unittest.TestCase):
@@ -1747,7 +1744,9 @@ class TestUopsOptimization(unittest.TestCase):
     def test_guard_type_version_locked_removed(self):
         """
         Verify that redundant _GUARD_TYPE_VERSION_LOCKED guards are
-        eliminated for sequential STORE_ATTR_INSTANCE_VALUE in __init__.
+        eliminated for sequential STORE_ATTR_INSTANCE_VALUE in __init__
+        (0 guards when _CHECK_OBJECT already proved the type version) and
+        on pre-existing instances (1 guard for 3 sequential stores).
         """
 
         class Foo:
@@ -1764,8 +1763,55 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertIsNotNone(ex)
         opnames = list(iter_opnames(ex))
         guard_locked_count = opnames.count("_GUARD_TYPE_VERSION_LOCKED")
-        # Only the first store needs the guard; the rest should be NOPed.
-        self.assertEqual(guard_locked_count, 1)
+        # _CHECK_OBJECT already proved Foo's type version, so all 3 guards in __init__ are eliminated.
+        self.assertEqual(guard_locked_count, 0)
+
+        def mutate_existing(n):
+            f = Foo()
+            for _ in range(n):
+                f.a = 1
+                f.b = 2
+                f.c = 3
+
+        _, ex2 = self._run_with_optimizer(mutate_existing, TIER2_THRESHOLD)
+        self.assertIsNotNone(ex2)
+        opnames2 = list(iter_opnames(ex2))
+        # Only the first store on an existing instance needs the guard; the rest are NOPed.
+        self.assertEqual(opnames2.count("_GUARD_TYPE_VERSION_LOCKED"), 1)
+
+    def test_unshared_local_lock_object_removed(self):
+        """
+        Verify that _LOCK_OBJECT is eliminated at compile time for
+        freshly allocated unshared local objects in __init__ and caller,
+        but retained for pre-existing objects that may be shared.
+        """
+        class Foo:
+            def __init__(self):
+                self.a = 1
+                self.b = 2
+                self.c = 3
+
+        def alloc_in_loop(n):
+            for _ in range(n):
+                f = Foo()
+                f.a = 4
+
+        _, ex = self._run_with_optimizer(alloc_in_loop, TIER2_THRESHOLD)
+        self.assertIsNotNone(ex)
+        opnames = list(iter_opnames(ex))
+        self.assertIn("_STORE_ATTR_INSTANCE_VALUE", opnames)
+        self.assertEqual(opnames.count("_LOCK_OBJECT"), 0)
+
+        def mutate_existing(n):
+            f = Foo()
+            for i in range(n):
+                f.a = i
+
+        _, ex2 = self._run_with_optimizer(mutate_existing, TIER2_THRESHOLD)
+        self.assertIsNotNone(ex2)
+        opnames2 = list(iter_opnames(ex2))
+        self.assertIn("_STORE_ATTR_INSTANCE_VALUE", opnames2)
+        self.assertGreaterEqual(opnames2.count("_LOCK_OBJECT"), 1)
 
     def test_type_version_doesnt_segfault(self):
         """
@@ -5195,8 +5241,8 @@ class TestUopsOptimization(unittest.TestCase):
 
     def test_pop_top_specialize_int(self):
         def testfunc(n):
-            for _ in range(n):
-                global_identity(100000)
+            for i in range(n):
+                global_identity(i if Py_GIL_DISABLED else 100000)
 
         testfunc(TIER2_THRESHOLD)
 
@@ -5208,8 +5254,9 @@ class TestUopsOptimization(unittest.TestCase):
 
     def test_pop_top_specialize_float(self):
         def testfunc(n):
+            x = 1e6
             for _ in range(n):
-                global_identity(1e6)
+                global_identity(x + 1.0 if Py_GIL_DISABLED else 1e6)
 
         testfunc(TIER2_THRESHOLD)
 

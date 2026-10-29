@@ -665,6 +665,13 @@ gen_try_set_executing(PyGenObject *gen)
 // (small int target, small int result, or overflow), _int_inplace_res
 // is from FUNC (_PyCompactLong_Add etc.).
 // FUNC is the fallback function (_PyCompactLong_Add etc.)
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+#define INT_INPLACE_OP(left, right, TARGET, OP, FUNC)                    \
+    _PyStackRef _int_inplace_res = FUNC##InPlace(                        \
+        &(left), &(right),                                               \
+        (PyLongObject *)PyStackRef_AsPyObjectBorrow(left),               \
+        (PyLongObject *)PyStackRef_AsPyObjectBorrow(right));
+#else
 #define INT_INPLACE_OP(left, right, TARGET, OP, FUNC)                    \
     _PyStackRef _int_inplace_res = PyStackRef_NULL;                      \
     do {                                                                 \
@@ -695,6 +702,7 @@ gen_try_set_executing(PyGenObject *gen)
             (PyLongObject *)PyStackRef_AsPyObjectBorrow(left),           \
             (PyLongObject *)PyStackRef_AsPyObjectBorrow(right));         \
     }
+#endif
 
 #define CALL_TP_ITERITEM_NO_ESCAPE(ITER, INDEX) \
     Py_TYPE(ITER)->_tp_iteritem((ITER), (INDEX))
@@ -936,6 +944,8 @@ _PyEval_BinaryOpExtendGuardFast(_PyBinaryOpSpecializationDescr *d,
     }
     return d->guard(left_o, right_o);
 }
+
+#include "opcode.h"
 
 static inline Py_ALWAYS_INLINE _PyStackRef
 _PyEval_BinaryOpInPlace(_PyStackRef *plhs, _PyStackRef *prhs,

@@ -532,6 +532,11 @@ class Obj2ModVisitor(PickleVisitor):
     def simpleSum(self, sum, name):
         self.funcHeader(name)
         for t in sum.types:
+            self.emit("if (Py_IS_TYPE(obj, (PyTypeObject *)state->%s_type)) {" % t.name, 1)
+            self.emit("*out = %s;" % t.name, 2)
+            self.emit("return 0;", 2)
+            self.emit("}", 1)
+        for t in sum.types:
             line = ("isinstance = PyObject_IsInstance(obj, "
                     "state->%s_type);")
             self.emit(line % (t.name,), 1)
@@ -575,12 +580,17 @@ class Obj2ModVisitor(PickleVisitor):
         for a in sum.attributes:
             self.visitField(a, name, sum=sum, depth=1)
         for t in sum.types:
+            self.emit("if (Py_IS_TYPE(obj, (PyTypeObject *)state->%s_type)) {" % (t.name,), 1)
+            self.emit("goto match_%s;" % (t.name,), 2)
+            self.emit("}", 1)
+        for t in sum.types:
             self.emit("tp = state->%s_type;" % (t.name,), 1)
             self.emit("isinstance = PyObject_IsInstance(obj, tp);", 1)
             self.emit("if (isinstance == -1) {", 1)
             self.emit("return -1;", 2)
             self.emit("}", 1)
             self.emit("if (isinstance) {", 1)
+            self.emit("match_%s:;" % (t.name,), 2)
             for f in t.fields:
                 self.visitFieldDeclaration(f, t.name, sum=sum, depth=2)
             self.emit("", 0)
@@ -926,7 +936,7 @@ ast_dealloc(PyObject *op)
     freefunc free_func = PyType_GetSlot(tp, Py_tp_free);
     assert(free_func != NULL);
     free_func(self);
-    Py_DECREF(tp);
+    _Py_DECREF_TYPE(tp);
 }
 
 static int
@@ -2317,6 +2327,7 @@ def generate_module_def(mod, metadata, f, internal_h):
         #include "pycore_ceval.h"         // _Py_EnterRecursiveCall()
         #include "pycore_lock.h"          // _PyOnceFlag
         #include "pycore_modsupport.h"    // _PyArg_NoPositional()
+        #include "pycore_object.h"        // _Py_DECREF_TYPE()
         #include "pycore_pystate.h"       // _PyInterpreterState_GET()
         #include "pycore_runtime.h"       // _Py_ID()
         #include "pycore_setobject.h"     // _PySet_NextEntry()

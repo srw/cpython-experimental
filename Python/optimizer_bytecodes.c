@@ -26,6 +26,8 @@ typedef struct _Py_UOpsAbstractFrame _Py_UOpsAbstractFrame;
 #define sym_matches_type _Py_uop_sym_matches_type
 #define sym_matches_type_version _Py_uop_sym_matches_type_version
 #define sym_get_type_version _Py_uop_sym_get_type_version
+#define sym_set_unshared_local _Py_uop_sym_set_unshared_local
+#define sym_is_unshared_local _Py_uop_sym_is_unshared_local
 #define sym_get_type _Py_uop_sym_get_type
 #define sym_has_type _Py_uop_sym_has_type
 #define sym_set_null(SYM) _Py_uop_sym_set_null(ctx, SYM)
@@ -164,13 +166,13 @@ dummy_func(void) {
 
     op(_STORE_ATTR_INSTANCE_VALUE, (offset/1, value, owner -- o)) {
         (void)offset;
-        (void)value;
+        sym_set_unshared_local(value, false);
         o = owner;
     }
 
     op(_STORE_ATTR_WITH_HINT, (hint/1, value, owner -- o)) {
         (void)hint;
-        (void)value;
+        sym_set_unshared_local(value, false);
         o = owner;
     }
 
@@ -181,14 +183,14 @@ dummy_func(void) {
     }
 
     op(_STORE_SUBSCR_LIST_INT, (value, list_st, sub_st -- ls, ss)) {
-        (void)value;
+        sym_set_unshared_local(value, false);
         ls = list_st;
         ss = sub_st;
     }
 
     op(_STORE_ATTR_SLOT, (index/1, value, owner -- o)) {
         (void)index;
-        (void)value;
+        sym_set_unshared_local(value, false);
         o = owner;
     }
 
@@ -198,7 +200,7 @@ dummy_func(void) {
             optimize_dict_known_hash(ctx, dependencies, this_instr,
                                      sub_o, _STORE_SUBSCR_DICT_KNOWN_HASH);
         }
-        (void)value;
+        sym_set_unshared_local(value, false);
         st = dict_st;
     }
 
@@ -1325,15 +1327,30 @@ dummy_func(void) {
             assert(init != NULL);
             assert(PyFunction_Check(init));
             callable = sym_new_const(ctx, init);
+            self_or_null = sym_new_type(ctx, (PyTypeObject *)callable_o);
+            sym_set_type_version(self_or_null, type_version);
+            sym_set_unshared_local(self_or_null, true);
             watch_type((PyTypeObject *)callable_o, dependencies);
         }
         else {
             callable = sym_new_not_null(ctx);
+            self_or_null = sym_new_unknown(ctx);
         }
     }
 
     op(_ALLOCATE_OBJECT, (callable, self_or_null, unused[oparg] -- callable, self_or_null, unused[oparg])) {
-        self_or_null = sym_new_not_null(ctx);
+        if (sym_has_type(self_or_null)) {
+            self_or_null = PyJitRef_MakeUnique(self_or_null);
+        }
+        else {
+            self_or_null = PyJitRef_MakeUnique(sym_new_not_null(ctx));
+        }
+    }
+
+    op(_LOCK_OBJECT, (value -- value)) {
+        if (sym_is_unshared_local(value)) {
+            ADD_OP(_NOP, 0, 0);
+        }
     }
 
     op(_CREATE_INIT_FRAME, (init, self, args[oparg] -- init_frame)) {
@@ -1685,7 +1702,7 @@ dummy_func(void) {
     }
 
     op(_CALL_LIST_APPEND, (callable, self, arg -- none, c, s)) {
-        (void)(arg);
+        sym_set_unshared_local(arg, false);
         c = callable;
         s = self;
         none = sym_new_const(ctx, Py_None);
@@ -2057,27 +2074,37 @@ dummy_func(void) {
         PyTypeObject *type = sym_get_probable_type(method_and_self[1]);
         if (type != NULL) {
             PyObject *name = _Py_SpecialMethods[oparg].name;
-            PyObject *descr = _PyType_Lookup(type, name);
+            PyObject *descr = _PyType_LookupRef(type, name);
             if (descr != NULL && (Py_TYPE(descr)->tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR)) {
-                /* LOAD_SPECIAL expands to _RECORD_TOS_TYPE + _INSERT_NULL +
-                 * _LOAD_SPECIAL. Insert _GUARD_TYPE_VERSION before the
-                 * already-emitted _INSERT_NULL so deopt sees the original
-                 * stack shape.*/
-                _PyUOpInstruction *insert_null = uop_buffer_last(&ctx->out_buffer);
-                assert(insert_null->opcode == _INSERT_NULL);
-                assert(insert_null->target == this_instr->target);
-                REPLACE_OP(insert_null, _GUARD_TYPE_VERSION, 0, type->tp_version_tag);
-                ADD_OP(_INSERT_NULL, 0, 0);
-
                 bool immortal = _Py_IsImmortal(descr) || (type->tp_flags & Py_TPFLAGS_IMMUTABLETYPE);
-                ADD_OP(immortal ? _LOAD_CONST_INLINE_BORROW : _LOAD_CONST_INLINE,
-                       0, (uintptr_t)descr);
-                ADD_OP(_SWAP, 3, 0);
-                optimize_pop_top(ctx, this_instr, method_and_self[0]);
-                watch_type(type, dependencies);
-                method_and_self[0] = sym_new_const(ctx, descr);
-                optimized = true;
+                bool can_inline = true;
+#ifdef Py_GIL_DISABLED
+                if (!immortal) {
+                    PyUnstable_Object_EnableDeferredRefcount(descr);
+                    can_inline = _PyObject_HasDeferredRefcount(descr);
+                }
+#endif
+                if (can_inline) {
+                    /* LOAD_SPECIAL expands to _RECORD_TOS_TYPE + _INSERT_NULL +
+                     * _LOAD_SPECIAL. Insert _GUARD_TYPE_VERSION before the
+                     * already-emitted _INSERT_NULL so deopt sees the original
+                     * stack shape.*/
+                    _PyUOpInstruction *insert_null = uop_buffer_last(&ctx->out_buffer);
+                    assert(insert_null->opcode == _INSERT_NULL);
+                    assert(insert_null->target == this_instr->target);
+                    REPLACE_OP(insert_null, _GUARD_TYPE_VERSION, 0, type->tp_version_tag);
+                    ADD_OP(_INSERT_NULL, 0, 0);
+
+                    ADD_OP(immortal ? _LOAD_CONST_INLINE_BORROW : _LOAD_CONST_INLINE,
+                           0, (uintptr_t)descr);
+                    ADD_OP(_SWAP, 3, 0);
+                    optimize_pop_top(ctx, this_instr, method_and_self[0]);
+                    watch_type(type, dependencies);
+                    method_and_self[0] = sym_new_const(ctx, descr);
+                    optimized = true;
+                }
             }
+            Py_XDECREF(descr);
         }
         if (!optimized) {
             method_and_self[0] = sym_new_not_null(ctx);
@@ -2111,19 +2138,19 @@ dummy_func(void) {
     }
 
     op(_BUILD_LIST, (values[oparg] -- list)) {
-        list = sym_new_type(ctx, &PyList_Type);
+        list = PyJitRef_MakeUnique(sym_new_type(ctx, &PyList_Type));
     }
 
     op(_BUILD_SLICE, (args[oparg] -- slice)) {
-        slice = sym_new_type(ctx, &PySlice_Type);
+        slice = PyJitRef_MakeUnique(sym_new_type(ctx, &PySlice_Type));
     }
 
     op(_BUILD_MAP, (values[oparg*2] -- map)) {
-        map = sym_new_type(ctx, &PyDict_Type);
+        map = PyJitRef_MakeUnique(sym_new_type(ctx, &PyDict_Type));
     }
 
     op(_BUILD_STRING, (pieces[oparg] -- str)) {
-        str = sym_new_type(ctx, &PyUnicode_Type);
+        str = PyJitRef_MakeUnique(sym_new_type(ctx, &PyUnicode_Type));
     }
 
     op(_BUILD_SET, (values[oparg] -- set)) {

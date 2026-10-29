@@ -633,7 +633,7 @@
                 assert(PyLong_CheckExact(left_o));
                 assert(PyLong_CheckExact(right_o));
                 STAT_INC(BINARY_OP, hit);
-                #if defined(TIER_ONE)
+                #if defined(TIER_ONE) || defined(TIER_TWO)
                 res_stackref = _PyCompactLong_MultiplyInPlace(
                     &left, &right, (PyLongObject *)left_o, (PyLongObject *)right_o);
                 #else
@@ -709,7 +709,7 @@
                 assert(PyLong_CheckExact(left_o));
                 assert(PyLong_CheckExact(right_o));
                 STAT_INC(BINARY_OP, hit);
-                #if defined(TIER_ONE)
+                #if defined(TIER_ONE) || defined(TIER_TWO)
                 res_stackref = _PyCompactLong_AddInPlace(
                     &left, &right, (PyLongObject *)left_o, (PyLongObject *)right_o);
                 #else
@@ -785,7 +785,7 @@
                 assert(PyLong_CheckExact(left_o));
                 assert(PyLong_CheckExact(right_o));
                 STAT_INC(BINARY_OP, hit);
-                #if defined(TIER_ONE)
+                #if defined(TIER_ONE) || defined(TIER_TWO)
                 res_stackref = _PyCompactLong_SubtractInPlace(
                     &left, &right, (PyLongObject *)left_o, (PyLongObject *)right_o);
                 #else
@@ -1753,7 +1753,7 @@
             sub_st = stack_pointer[-1];
             list_st = stack_pointer[-2];
             value = stack_pointer[-3];
-            (void)value;
+            sym_set_unshared_local(value, false);
             ls = list_st;
             ss = sub_st;
             CHECK_STACK_BOUNDS(-1);
@@ -1777,7 +1777,7 @@
                 optimize_dict_known_hash(ctx, dependencies, this_instr,
                                      sub_o, _STORE_SUBSCR_DICT_KNOWN_HASH);
             }
-            (void)value;
+            sym_set_unshared_local(value, false);
             st = dict_st;
             CHECK_STACK_BOUNDS(-2);
             stack_pointer[-3] = st;
@@ -2413,7 +2413,7 @@
 
         case _BUILD_STRING: {
             JitOptRef str;
-            str = sym_new_type(ctx, &PyUnicode_Type);
+            str = PyJitRef_MakeUnique(sym_new_type(ctx, &PyUnicode_Type));
             CHECK_STACK_BOUNDS(1 - oparg);
             stack_pointer[-oparg] = str;
             stack_pointer += 1 - oparg;
@@ -2456,7 +2456,7 @@
 
         case _BUILD_LIST: {
             JitOptRef list;
-            list = sym_new_type(ctx, &PyList_Type);
+            list = PyJitRef_MakeUnique(sym_new_type(ctx, &PyList_Type));
             CHECK_STACK_BOUNDS(1 - oparg);
             stack_pointer[-oparg] = list;
             stack_pointer += 1 - oparg;
@@ -2500,7 +2500,7 @@
 
         case _BUILD_MAP: {
             JitOptRef map;
-            map = sym_new_type(ctx, &PyDict_Type);
+            map = PyJitRef_MakeUnique(sym_new_type(ctx, &PyDict_Type));
             CHECK_STACK_BOUNDS(1 - oparg*2);
             stack_pointer[-oparg*2] = map;
             stack_pointer += 1 - oparg*2;
@@ -2869,9 +2869,29 @@
             break;
         }
 
-        /* _STORE_ATTR_INSTANCE_VALUE is not a viable micro-op for tier 2 */
+        case _STORE_ATTR_INSTANCE_VALUE: {
+            JitOptRef owner;
+            JitOptRef value;
+            JitOptRef o;
+            owner = stack_pointer[-1];
+            value = stack_pointer[-2];
+            uint16_t offset = (uint16_t)this_instr->operand0;
+            (void)offset;
+            sym_set_unshared_local(value, false);
+            o = owner;
+            CHECK_STACK_BOUNDS(-1);
+            stack_pointer[-2] = o;
+            stack_pointer += -1;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            break;
+        }
 
         case _LOCK_OBJECT: {
+            JitOptRef value;
+            value = stack_pointer[-1];
+            if (sym_is_unshared_local(value)) {
+                ADD_OP(_NOP, 0, 0);
+            }
             break;
         }
 
@@ -2883,7 +2903,7 @@
             value = stack_pointer[-2];
             uint16_t hint = (uint16_t)this_instr->operand0;
             (void)hint;
-            (void)value;
+            sym_set_unshared_local(value, false);
             o = owner;
             CHECK_STACK_BOUNDS(-1);
             stack_pointer[-2] = o;
@@ -2900,7 +2920,7 @@
             value = stack_pointer[-2];
             uint16_t index = (uint16_t)this_instr->operand0;
             (void)index;
-            (void)value;
+            sym_set_unshared_local(value, false);
             o = owner;
             CHECK_STACK_BOUNDS(-1);
             stack_pointer[-2] = o;
@@ -3078,7 +3098,7 @@
                 PyObject *left_o = PyStackRef_AsPyObjectBorrow(left);
                 PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);
                 STAT_INC(COMPARE_OP, hit);
-                #if defined(TIER_ONE) && PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+                #if (defined(TIER_ONE) || defined(TIER_TWO)) && PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
                 Py_ssize_t ileft = _PyLong_AsSTwoDigits_Fast((PyLongObject *)left_o);
                 Py_ssize_t iright = _PyLong_AsSTwoDigits_Fast((PyLongObject *)right_o);
                 #else
@@ -3910,22 +3930,32 @@
             PyTypeObject *type = sym_get_probable_type(method_and_self[1]);
             if (type != NULL) {
                 PyObject *name = _Py_SpecialMethods[oparg].name;
-                PyObject *descr = _PyType_Lookup(type, name);
+                PyObject *descr = _PyType_LookupRef(type, name);
                 if (descr != NULL && (Py_TYPE(descr)->tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR)) {
-                    _PyUOpInstruction *insert_null = uop_buffer_last(&ctx->out_buffer);
-                    assert(insert_null->opcode == _INSERT_NULL);
-                    assert(insert_null->target == this_instr->target);
-                    REPLACE_OP(insert_null, _GUARD_TYPE_VERSION, 0, type->tp_version_tag);
-                    ADD_OP(_INSERT_NULL, 0, 0);
                     bool immortal = _Py_IsImmortal(descr) || (type->tp_flags & Py_TPFLAGS_IMMUTABLETYPE);
-                    ADD_OP(immortal ? _LOAD_CONST_INLINE_BORROW : _LOAD_CONST_INLINE,
-                        0, (uintptr_t)descr);
-                    ADD_OP(_SWAP, 3, 0);
-                    optimize_pop_top(ctx, this_instr, method_and_self[0]);
-                    watch_type(type, dependencies);
-                    method_and_self[0] = sym_new_const(ctx, descr);
-                    optimized = true;
+                    bool can_inline = true;
+                    #ifdef Py_GIL_DISABLED
+                    if (!immortal) {
+                        PyUnstable_Object_EnableDeferredRefcount(descr);
+                        can_inline = _PyObject_HasDeferredRefcount(descr);
+                    }
+                    #endif
+                    if (can_inline) {
+                        _PyUOpInstruction *insert_null = uop_buffer_last(&ctx->out_buffer);
+                        assert(insert_null->opcode == _INSERT_NULL);
+                        assert(insert_null->target == this_instr->target);
+                        REPLACE_OP(insert_null, _GUARD_TYPE_VERSION, 0, type->tp_version_tag);
+                        ADD_OP(_INSERT_NULL, 0, 0);
+                        ADD_OP(immortal ? _LOAD_CONST_INLINE_BORROW : _LOAD_CONST_INLINE,
+                            0, (uintptr_t)descr);
+                        ADD_OP(_SWAP, 3, 0);
+                        optimize_pop_top(ctx, this_instr, method_and_self[0]);
+                        watch_type(type, dependencies);
+                        method_and_self[0] = sym_new_const(ctx, descr);
+                        optimized = true;
+                    }
                 }
+                Py_XDECREF(descr);
             }
             if (!optimized) {
                 method_and_self[0] = sym_new_not_null(ctx);
@@ -4437,20 +4467,31 @@
                 assert(init != NULL);
                 assert(PyFunction_Check(init));
                 callable = sym_new_const(ctx, init);
+                self_or_null = sym_new_type(ctx, (PyTypeObject *)callable_o);
+                sym_set_type_version(self_or_null, type_version);
+                sym_set_unshared_local(self_or_null, true);
                 stack_pointer[-2 - oparg] = callable;
+                stack_pointer[-1 - oparg] = self_or_null;
                 watch_type((PyTypeObject *)callable_o, dependencies);
             }
             else {
                 callable = sym_new_not_null(ctx);
+                self_or_null = sym_new_unknown(ctx);
             }
             stack_pointer[-2 - oparg] = callable;
+            stack_pointer[-1 - oparg] = self_or_null;
             break;
         }
 
         case _ALLOCATE_OBJECT: {
             JitOptRef self_or_null;
             self_or_null = stack_pointer[-1 - oparg];
-            self_or_null = sym_new_not_null(ctx);
+            if (sym_has_type(self_or_null)) {
+                self_or_null = PyJitRef_MakeUnique(self_or_null);
+            }
+            else {
+                self_or_null = PyJitRef_MakeUnique(sym_new_not_null(ctx));
+            }
             stack_pointer[-1 - oparg] = self_or_null;
             break;
         }
@@ -4753,7 +4794,7 @@
             arg = stack_pointer[-1];
             self = stack_pointer[-2];
             callable = stack_pointer[-3];
-            (void)(arg);
+            sym_set_unshared_local(arg, false);
             c = callable;
             s = self;
             none = sym_new_const(ctx, Py_None);
@@ -5259,7 +5300,7 @@
 
         case _BUILD_SLICE: {
             JitOptRef slice;
-            slice = sym_new_type(ctx, &PySlice_Type);
+            slice = PyJitRef_MakeUnique(sym_new_type(ctx, &PySlice_Type));
             CHECK_STACK_BOUNDS(1 - oparg);
             stack_pointer[-oparg] = slice;
             stack_pointer += 1 - oparg;

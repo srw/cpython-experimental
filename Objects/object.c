@@ -1917,15 +1917,15 @@ _PyObject_GenericGetAttrWithDict(PyObject *obj, PyObject *name,
 
     Py_INCREF(name);
 
-    PyThreadState *tstate = _PyThreadState_GET();
+    _PyStackRef ref;
+    _PyType_LookupStackRefAndVersion(tp, name, &ref);
+    descr = PyStackRef_AsPyObjectBorrow(ref);
+
     _PyCStackRef cref;
-    _PyThreadState_PushCStackRef(tstate, &cref);
-
-    _PyType_LookupStackRefAndVersion(tp, name, &cref.ref);
-    descr = PyStackRef_AsPyObjectBorrow(cref.ref);
-
     f = NULL;
     if (descr != NULL) {
+        _PyThreadState_PushCStackRef(_PyThreadState_GET(), &cref);
+        cref.ref = ref;
         f = Py_TYPE(descr)->tp_descr_get;
         if (f != NULL && PyDescr_IsData(descr)) {
             // gh-157840: We special-case member descriptors here to avoid
@@ -2019,7 +2019,9 @@ _PyObject_GenericGetAttrWithDict(PyObject *obj, PyObject *name,
         _PyObject_SetAttributeErrorContext(obj, name);
     }
   done:
-    _PyThreadState_PopCStackRef(tstate, &cref);
+    if (descr != NULL) {
+        _PyThreadState_PopCStackRef(_PyThreadState_GET(), &cref);
+    }
     Py_DECREF(name);
     return res;
 }
@@ -2054,19 +2056,22 @@ _PyObject_GenericSetAttrWithDict(PyObject *obj, PyObject *name,
     Py_INCREF(name);
     _Py_INCREF_TYPE(tp);
 
-    PyThreadState *tstate = _PyThreadState_GET();
-    _PyCStackRef cref;
-    _PyThreadState_PushCStackRef(tstate, &cref);
-
-    _PyType_LookupStackRefAndVersion(tp, name, &cref.ref);
-    descr = PyStackRef_AsPyObjectBorrow(cref.ref);
+    _PyStackRef ref;
+    _PyType_LookupStackRefAndVersion(tp, name, &ref);
+    descr = PyStackRef_AsPyObjectBorrow(ref);
 
     if (descr != NULL) {
         f = Py_TYPE(descr)->tp_descr_set;
         if (f != NULL) {
+            PyThreadState *tstate = _PyThreadState_GET();
+            _PyCStackRef cref;
+            _PyThreadState_PushCStackRef(tstate, &cref);
+            cref.ref = ref;
             res = f(descr, obj, value);
+            _PyThreadState_PopCStackRef(tstate, &cref);
             goto done;
         }
+        PyStackRef_CLOSE(ref);
     }
 
     if (dict == NULL) {
@@ -2126,7 +2131,6 @@ _PyObject_GenericSetAttrWithDict(PyObject *obj, PyObject *name,
         _PyObject_SetAttributeErrorContext(obj, name);
     }
   done:
-    _PyThreadState_PopCStackRef(tstate, &cref);
     _Py_DECREF_TYPE(tp);
     Py_DECREF(name);
     return res;
