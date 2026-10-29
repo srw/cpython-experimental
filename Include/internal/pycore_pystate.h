@@ -128,6 +128,23 @@ _PyThreadState_IsAttached(PyThreadState *tstate)
     return (_Py_atomic_load_int_relaxed(&tstate->state) == _Py_THREAD_ATTACHED);
 }
 
+#if !defined(Py_BUILD_CORE_MODULE)
+extern uint8_t _Py_SingleThreaded;
+#endif
+
+static inline Py_ALWAYS_INLINE int
+_Py_IsSingleThreaded(void)
+{
+#if !defined(Py_BUILD_CORE_MODULE)
+    return _Py_atomic_load_uint8_relaxed(&_Py_SingleThreaded);
+#else
+    PyThreadState *tstate = _PyThreadState_GET();
+    return (tstate != NULL &&
+            _Py_atomic_load_ptr_relaxed(&tstate->next) == NULL &&
+            _Py_atomic_load_ptr_relaxed(&tstate->prev) == NULL);
+#endif
+}
+
 // Attaches the current thread to the interpreter.
 //
 // This may block while acquiring the GIL (if the GIL is enabled) or while

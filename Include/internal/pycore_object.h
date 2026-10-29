@@ -204,6 +204,11 @@ _PyObject_IsUnsharedLocal(PyObject *ob)
 #if !defined(Py_GIL_DISABLED)
     return 1;
 #else
+    if (_Py_IsSingleThreaded() &&
+        _Py_atomic_load_uint8_relaxed(&ob->ob_mutex._bits) == 0)
+    {
+        return 1;
+    }
     return (_Py_IsOwnedByCurrentThread(ob) &&
             _Py_atomic_load_ssize_relaxed(&ob->ob_ref_shared) == 0 &&
             (_Py_atomic_load_uint8_relaxed(&ob->ob_gc_bits) & _PyGC_BITS_SHARED) == 0 &&

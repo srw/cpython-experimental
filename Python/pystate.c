@@ -346,6 +346,7 @@ init_runtime(_PyRuntimeState *runtime,
     runtime->main_thread = PyThread_get_thread_ident();
 
     runtime->unicode_state.ids.next_index = unicode_next_index;
+    _Py_atomic_store_uint8_relaxed(&_Py_SingleThreaded, 1);
     runtime->_initialized = 1;
 }
 
@@ -737,6 +738,7 @@ _PyInterpreterState_New(PyThreadState *tstate, PyInterpreterState **pinterp)
     else {
         assert(interpreters->main != NULL);
         assert(id != 0);
+        _Py_atomic_store_uint8_relaxed(&_Py_SingleThreaded, 0);
 
         interp = alloc_interpreter();
         if (interp == NULL) {
@@ -1662,6 +1664,19 @@ init_threadstate(_PyThreadStateImpl *_tstate,
     tstate->_status.initialized = 1;
 }
 
+uint8_t _Py_SingleThreaded = 1;
+
+static inline void
+update_single_threaded_flag(_PyRuntimeState *runtime)
+{
+    PyInterpreterState *interp = runtime->interpreters.head;
+    uint8_t single = (interp == NULL ||
+                      (interp->next == NULL &&
+                       (interp->threads.head == NULL ||
+                        interp->threads.head->next == NULL)));
+    _Py_atomic_store_uint8_relaxed(&_Py_SingleThreaded, single);
+}
+
 static void
 add_threadstate(PyInterpreterState *interp, PyThreadState *tstate,
                 PyThreadState *next)
@@ -1670,6 +1685,12 @@ add_threadstate(PyInterpreterState *interp, PyThreadState *tstate,
     if (next != NULL) {
         assert(next->prev == NULL || next->prev == tstate);
         next->prev = tstate;
+        _Py_atomic_store_uint8_relaxed(&_Py_SingleThreaded, 0);
+    }
+    else if (interp->runtime->interpreters.head != NULL &&
+             interp->runtime->interpreters.head->next != NULL)
+    {
+        _Py_atomic_store_uint8_relaxed(&_Py_SingleThreaded, 0);
     }
     tstate->next = next;
     assert(tstate->prev == NULL);
@@ -2106,6 +2127,7 @@ _PyThreadState_RemoveExcept(PyThreadState *tstate)
     }
     tstate->prev = tstate->next = NULL;
     interp->threads.head = tstate;
+    update_single_threaded_flag(runtime);
     HEAD_UNLOCK(runtime);
 
     return list;

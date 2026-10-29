@@ -210,7 +210,11 @@ _PyTypeCache_Lookup(PyTypeObject *type, PyObject *name)
         PyObject *entry_name = FT_ATOMIC_LOAD_PTR_ACQUIRE(cache->hashtable[index].name);
         if (entry_name == name) {
 #ifdef Py_GIL_DISABLED
-            if (!_Py_TryXGetStackRef(&cache->hashtable[index].value, &out_ref)) {
+            if (_Py_IsSingleThreaded()) {
+                PyObject *v = FT_ATOMIC_LOAD_PTR_RELAXED(cache->hashtable[index].value);
+                out_ref = v ? PyStackRef_FromPyObjectNew(v) : PyStackRef_NULL;
+            }
+            else if (!_Py_TryXGetStackRef(&cache->hashtable[index].value, &out_ref)) {
                 return miss;
             }
 #else

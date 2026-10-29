@@ -3401,22 +3401,28 @@ copy_code(PyInterpreterState *interp, _Py_CODEUNIT *dst, PyCodeObject *co)
         for (int i = 0; i < code_len;) {
             uint8_t base_op = dst[i].op.code;
             int caches = _PyOpcode_Caches[base_op];
-            if (caches > 0 &&
-                base_op != JUMP_BACKWARD &&
-                base_op != RESUME &&
-                base_op != POP_JUMP_IF_FALSE &&
-                base_op != POP_JUMP_IF_TRUE &&
-                base_op != POP_JUMP_IF_NONE &&
-                base_op != POP_JUMP_IF_NOT_NONE)
-            {
-                _Py_CODEUNIT src_inst = {
+            if (base_op == JUMP_BACKWARD_JIT) {
+                _Py_CODEUNIT orig_inst = {
+                    .cache = FT_ATOMIC_LOAD_UINT16_RELAXED(*(uint16_t *)&src[i])
+                };
+                if (orig_inst.op.code == JUMP_BACKWARD_JIT) {
+                    uint16_t src_ctr = FT_ATOMIC_LOAD_UINT16_RELAXED(*(uint16_t *)&src[i + 1]);
+                    if ((src_ctr & BACKOFF_MASK) != UNREACHABLE_BACKOFF &&
+                        src_ctr < dst[i + 1].cache)
+                    {
+                        dst[i + 1].cache = src_ctr;
+                    }
+                }
+            }
+            else if (caches > 0 && base_op != RESUME && base_op != JUMP_BACKWARD) {
+                _Py_CODEUNIT orig_inst = {
                     .cache = FT_ATOMIC_LOAD_UINT16_RELAXED(*(uint16_t *)&src[i])
                 };
                 _Py_atomic_fence_acquire();
-                if (src_inst.op.code < MIN_INSTRUMENTED_OPCODE &&
-                    src_inst.op.code != base_op &&
-                    src_inst.op.code != ENTER_EXECUTOR &&
-                    _PyOpcode_Deopt[src_inst.op.code] == base_op)
+                if (orig_inst.op.code < MIN_INSTRUMENTED_OPCODE &&
+                    orig_inst.op.code != base_op &&
+                    orig_inst.op.code != ENTER_EXECUTOR &&
+                    _PyOpcode_Deopt[orig_inst.op.code] == base_op)
                 {
                     for (int c = 1; c <= caches; c++) {
                         dst[i + c].cache = FT_ATOMIC_LOAD_UINT16_RELAXED(*(uint16_t *)&src[i + c]);
@@ -3425,8 +3431,8 @@ copy_code(PyInterpreterState *interp, _Py_CODEUNIT *dst, PyCodeObject *co)
                     _Py_CODEUNIT src_inst2 = {
                         .cache = FT_ATOMIC_LOAD_UINT16_RELAXED(*(uint16_t *)&src[i])
                     };
-                    if (src_inst2.cache == src_inst.cache) {
-                        dst[i] = src_inst;
+                    if (src_inst2.cache == orig_inst.cache) {
+                        dst[i] = orig_inst;
                         dst[i + 1].counter = adaptive_counter_cooldown();
                     }
                     else {

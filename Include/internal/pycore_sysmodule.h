@@ -34,8 +34,22 @@ extern PyObject *_PySys_DispatchMapArray(
     Py_ssize_t chunksize,
     int is_explicit);
 
+extern PyObject *_PySys_DispatchStarmapArray(
+    PyObject *func,
+    PyObject *const *items,
+    Py_ssize_t n,
+    Py_ssize_t chunksize,
+    int is_explicit);
+
+extern int _PySys_ShouldDispatch(
+    PyObject *func,
+    Py_ssize_t rem_items,
+    int64_t sample_ns);
+
 extern PyObject *_PyMap_MaterializeList(PyObject *map_obj);
 extern PyObject *_PyFilter_MaterializeList(PyObject *filter_obj);
+extern int _PyStarmap_CheckExact(PyObject *op);
+extern PyObject *_PyStarmap_MaterializeList(PyObject *starmap_obj);
 
 #ifdef __cplusplus
 }

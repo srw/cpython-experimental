@@ -282,6 +282,8 @@ do_start_joinable_thread(void (*func)(void *), void *arg, pthread_t* out_id)
     callback->func = func;
     callback->arg = arg;
 
+    _Py_atomic_store_uint8_relaxed(&_Py_SingleThreaded, 0);
+
     status = pthread_create(&th,
 #if defined(THREAD_STACK_SIZE) || defined(PTHREAD_SYSTEM_SCHED_SUPPORTED)
                              &attrs,

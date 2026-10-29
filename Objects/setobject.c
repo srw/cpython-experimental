@@ -410,6 +410,17 @@ set_insert_clean(setentry *table, size_t mask, PyObject *key, Py_hash_t hash)
 /* ======== End logic for probing the hash table ========================== */
 /* ======================================================================== */
 
+static inline int
+set_is_unshared_or_1t(PySetObject *so)
+{
+#ifdef Py_GIL_DISABLED
+    return (_PyObject_IsUnsharedLocal((PyObject *)so) && !SET_IS_SHARED(so)) ||
+           (_Py_IsSingleThreaded() && ((PyObject *)so)->ob_mutex._bits == 0);
+#else
+    return 1;
+#endif
+}
+
 static inline Py_ALWAYS_INLINE int
 set_compare_unshared(PySetObject *so, setentry *table, setentry *entry,
                      PyObject *key, Py_hash_t hash)
@@ -425,13 +436,15 @@ set_compare_unshared(PySetObject *so, setentry *table, setentry *entry,
             && PyUnicode_CheckExact(key)
             && unicode_eq(startkey, key))
             return SET_LOOKKEY_FOUND;
+        if (SET_IS_SHARED(so) && !_Py_IsSingleThreaded())
+            return SET_LOOKKEY_CHANGED;
         Py_INCREF(startkey);
         int cmp = PyObject_RichCompareBool(startkey, key, Py_EQ);
         Py_DECREF(startkey);
         if (cmp < 0)
             return SET_LOOKKEY_ERROR;
-        if (!_PyObject_IsUnsharedLocal((PyObject *)so) ||
-            SET_IS_SHARED(so) ||
+        if (!set_is_unshared_or_1t(so) ||
+            (SET_IS_SHARED(so) && !_Py_IsSingleThreaded()) ||
             table != so->table ||
             entry->key != startkey)
             return SET_LOOKKEY_CHANGED;
@@ -450,7 +463,7 @@ set_lookkey(PySetObject *so, PyObject *key, Py_hash_t hash, setentry **epp)
                                set_compare_frozenset);
     }
     else {
-        if (_PyObject_IsUnsharedLocal((PyObject *)so) && !SET_IS_SHARED(so)) {
+        if (set_is_unshared_or_1t(so)) {
             if (so->used == 0) {
                 return SET_LOOKKEY_NO_MATCH;
             }
@@ -487,7 +500,7 @@ set_lookkey_threadsafe(PySetObject *so, PyObject *key, Py_hash_t hash)
                status == SET_LOOKKEY_ERROR);
         return status;
     }
-    if (_PyObject_IsUnsharedLocal((PyObject *)so) && !SET_IS_SHARED(so)) {
+    if (set_is_unshared_or_1t(so)) {
         if (so->used == 0) {
             return SET_LOOKKEY_NO_MATCH;
         }
@@ -1161,7 +1174,7 @@ static PyObject *setiter_iternext(PyObject *self)
         return NULL;
     }
 
-    if (_PyObject_IsUnsharedLocal((PyObject *)so) && !SET_IS_SHARED(so)) {
+    if (set_is_unshared_or_1t(so)) {
         i = si->si_pos;
         assert(i>=0);
         entry = so->table;

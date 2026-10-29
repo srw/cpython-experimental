@@ -377,7 +377,9 @@ exit:
 static inline PyObject*
 list_get_item_ref(PyListObject *op, Py_ssize_t i)
 {
-    if (_PyObject_IsUnsharedLocal((PyObject *)op)) {
+    if (_PyObject_IsUnsharedLocal((PyObject *)op) ||
+        (_Py_IsSingleThreaded() && ((PyObject *)op)->ob_mutex._bits == 0))
+    {
         if (!valid_index(i, Py_SIZE(op))) {
             return NULL;
         }
@@ -1613,10 +1615,15 @@ _list_extend(PyListObject *self, PyObject *iterable)
         res = list_extend_dictitems(self, dict);
         Py_END_CRITICAL_SECTION2();
     }
-    else if (Py_IS_TYPE(iterable, &PyMap_Type) || Py_IS_TYPE(iterable, &PyFilter_Type)) {
+    else if (Py_IS_TYPE(iterable, &PyMap_Type) ||
+             Py_IS_TYPE(iterable, &PyFilter_Type) ||
+             _PyStarmap_CheckExact(iterable))
+    {
         PyObject *mapped = Py_IS_TYPE(iterable, &PyMap_Type)
             ? _PyMap_MaterializeList(iterable)
-            : _PyFilter_MaterializeList(iterable);
+            : (Py_IS_TYPE(iterable, &PyFilter_Type)
+               ? _PyFilter_MaterializeList(iterable)
+               : _PyStarmap_MaterializeList(iterable));
         if (mapped != NULL) {
             Py_BEGIN_CRITICAL_SECTION(self);
             res = list_extend_lock_held(self, mapped);

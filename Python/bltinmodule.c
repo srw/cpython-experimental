@@ -374,6 +374,10 @@ builtin_abs(PyObject *module, PyObject *number)
     return PyNumber_Absolute(number);
 }
 
+#ifdef Py_GIL_DISABLED
+static int _py_map_try_any_all(PyObject *iterable, int is_any, PyObject **out_res);
+#endif
+
 /*[clinic input]
 all as builtin_all
 
@@ -392,6 +396,15 @@ builtin_all(PyObject *module, PyObject *iterable)
     PyObject *it, *item;
     PyObject *(*iternext)(PyObject *);
     int cmp;
+
+#ifdef Py_GIL_DISABLED
+    if (Py_IS_TYPE(iterable, &PyMap_Type)) {
+        PyObject *fast_res = NULL;
+        if (_py_map_try_any_all(iterable, 0, &fast_res)) {
+            return fast_res;
+        }
+    }
+#endif
 
     it = PyObject_GetIter(iterable);
     if (it == NULL)
@@ -441,6 +454,15 @@ builtin_any(PyObject *module, PyObject *iterable)
     PyObject *it, *item;
     PyObject *(*iternext)(PyObject *);
     int cmp;
+
+#ifdef Py_GIL_DISABLED
+    if (Py_IS_TYPE(iterable, &PyMap_Type)) {
+        PyObject *fast_res = NULL;
+        if (_py_map_try_any_all(iterable, 1, &fast_res)) {
+            return fast_res;
+        }
+    }
+#endif
 
     it = PyObject_GetIter(iterable);
     if (it == NULL)
@@ -1785,6 +1807,162 @@ _PyMap_MaterializeList(PyObject *map_obj)
     return NULL;
 }
 
+#ifdef Py_GIL_DISABLED
+static int
+_py_map_try_any_all(PyObject *iterable, int is_any, PyObject **out_res)
+{
+    mapobject *lz = _mapobject_CAST(iterable);
+    if (lz->strict || lz->iters == NULL || PyTuple_GET_SIZE(lz->iters) != 1) {
+        return 0;
+    }
+    if (!_py_map_is_parallelizable_callable(lz->func)) {
+        return 0;
+    }
+    PyObject *it = PyTuple_GET_ITEM(lz->iters, 0);
+    if (Py_IS_TYPE(it, &PyListIter_Type)) {
+        _PyListIterObject *lit = (_PyListIterObject *)it;
+        PyListObject *seq = lit->it_seq;
+        Py_ssize_t idx = lit->it_index;
+        if (seq == NULL) {
+            return 0;
+        }
+        Py_ssize_t n = PyList_GET_SIZE(seq);
+        if (idx < 0 || n - idx < 3) {
+            return 0;
+        }
+        PyObject *item0 = Py_NewRef(PyList_GET_ITEM(seq, idx));
+        lit->it_index = idx + 1;
+        PyTime_t t0 = 0, t1 = 0;
+        (void)PyTime_PerfCounterRaw(&t0);
+        PyObject *val0 = PyObject_CallOneArg(lz->func, item0);
+        (void)PyTime_PerfCounterRaw(&t1);
+        Py_DECREF(item0);
+        if (val0 == NULL) {
+            *out_res = NULL;
+            return 1;
+        }
+        int cmp0 = PyObject_IsTrue(val0);
+        Py_DECREF(val0);
+        if (cmp0 < 0) {
+            *out_res = NULL;
+            return 1;
+        }
+        if (is_any ? (cmp0 > 0) : (cmp0 == 0)) {
+            *out_res = Py_NewRef(is_any ? Py_True : Py_False);
+            return 1;
+        }
+        if (lit->it_seq != seq || lit->it_index != idx + 1 || PyList_GET_SIZE(seq) != n) {
+            return 0;
+        }
+        int64_t sample_ns = (int64_t)(t1 - t0);
+        if (sample_ns <= 0) {
+            sample_ns = 1;
+        }
+        Py_ssize_t rem = n - (idx + 1);
+        if (!_PySys_ShouldDispatch(lz->func, rem, sample_ns)) {
+            return 0;
+        }
+        lit->it_seq = NULL;
+        lit->it_index = -1;
+        PyObject *mapped = _PySys_DispatchMapArray(
+            lz->func, _PyList_ITEMS(seq) + idx + 1, rem, 0, 0);
+        Py_DECREF(seq);
+        if (mapped == NULL) {
+            *out_res = NULL;
+            return 1;
+        }
+        Py_ssize_t mlen = PyList_GET_SIZE(mapped);
+        for (Py_ssize_t i = 0; i < mlen; i++) {
+            int c = PyObject_IsTrue(PyList_GET_ITEM(mapped, i));
+            if (c < 0) {
+                Py_DECREF(mapped);
+                *out_res = NULL;
+                return 1;
+            }
+            if (is_any ? (c > 0) : (c == 0)) {
+                Py_DECREF(mapped);
+                *out_res = Py_NewRef(is_any ? Py_True : Py_False);
+                return 1;
+            }
+        }
+        Py_DECREF(mapped);
+        *out_res = Py_NewRef(is_any ? Py_False : Py_True);
+        return 1;
+    }
+    if (Py_IS_TYPE(it, &PyTupleIter_Type)) {
+        _PyTupleIterObject *tit = (_PyTupleIterObject *)it;
+        PyTupleObject *seq = tit->it_seq;
+        Py_ssize_t idx = tit->it_index;
+        if (seq == NULL) {
+            return 0;
+        }
+        Py_ssize_t n = PyTuple_GET_SIZE(seq);
+        if (idx < 0 || n - idx < 3) {
+            return 0;
+        }
+        PyObject *item0 = Py_NewRef(PyTuple_GET_ITEM(seq, idx));
+        tit->it_index = idx + 1;
+        PyTime_t t0 = 0, t1 = 0;
+        (void)PyTime_PerfCounterRaw(&t0);
+        PyObject *val0 = PyObject_CallOneArg(lz->func, item0);
+        (void)PyTime_PerfCounterRaw(&t1);
+        Py_DECREF(item0);
+        if (val0 == NULL) {
+            *out_res = NULL;
+            return 1;
+        }
+        int cmp0 = PyObject_IsTrue(val0);
+        Py_DECREF(val0);
+        if (cmp0 < 0) {
+            *out_res = NULL;
+            return 1;
+        }
+        if (is_any ? (cmp0 > 0) : (cmp0 == 0)) {
+            *out_res = Py_NewRef(is_any ? Py_True : Py_False);
+            return 1;
+        }
+        if (tit->it_seq != seq || tit->it_index != idx + 1) {
+            return 0;
+        }
+        int64_t sample_ns = (int64_t)(t1 - t0);
+        if (sample_ns <= 0) {
+            sample_ns = 1;
+        }
+        Py_ssize_t rem = n - (idx + 1);
+        if (!_PySys_ShouldDispatch(lz->func, rem, sample_ns)) {
+            return 0;
+        }
+        tit->it_seq = NULL;
+        tit->it_index = -1;
+        PyObject *mapped = _PySys_DispatchMapArray(
+            lz->func, _PyTuple_ITEMS(seq) + idx + 1, rem, 0, 0);
+        Py_DECREF(seq);
+        if (mapped == NULL) {
+            *out_res = NULL;
+            return 1;
+        }
+        Py_ssize_t mlen = PyList_GET_SIZE(mapped);
+        for (Py_ssize_t i = 0; i < mlen; i++) {
+            int c = PyObject_IsTrue(PyList_GET_ITEM(mapped, i));
+            if (c < 0) {
+                Py_DECREF(mapped);
+                *out_res = NULL;
+                return 1;
+            }
+            if (is_any ? (c > 0) : (c == 0)) {
+                Py_DECREF(mapped);
+                *out_res = Py_NewRef(is_any ? Py_True : Py_False);
+                return 1;
+            }
+        }
+        Py_DECREF(mapped);
+        *out_res = Py_NewRef(is_any ? Py_False : Py_True);
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 static PyObject *
 map_next(PyObject *self)
 {
@@ -2242,8 +2420,101 @@ min_max(PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames, int op)
         keyfunc = NULL;
     }
 
+#ifdef Py_GIL_DISABLED
+    if (keyfunc != NULL && _py_map_is_parallelizable_callable(keyfunc)) {
+        PyObject *const *seq_items = NULL;
+        Py_ssize_t seq_n = 0;
+        PyObject *seq_holder = NULL;
+        if (positional && nargs >= 3) {
+            seq_items = args;
+            seq_n = nargs;
+        }
+        else if (!positional && PyTuple_CheckExact(args[0]) && PyTuple_GET_SIZE(args[0]) >= 3) {
+            seq_items = _PyTuple_ITEMS(args[0]);
+            seq_n = PyTuple_GET_SIZE(args[0]);
+        }
+        else if (!positional && PyList_CheckExact(args[0]) && PyList_GET_SIZE(args[0]) >= 3) {
+            seq_holder = PyList_AsTuple(args[0]);
+            if (seq_holder == NULL) {
+                Py_XDECREF(it);
+                return NULL;
+            }
+            seq_items = _PyTuple_ITEMS(seq_holder);
+            seq_n = PyTuple_GET_SIZE(seq_holder);
+        }
+        if (seq_items != NULL && seq_n >= 3) {
+            PyTime_t t0 = 0, t1 = 0;
+            (void)PyTime_PerfCounterRaw(&t0);
+            PyObject *val0 = PyObject_CallOneArg(keyfunc, seq_items[0]);
+            (void)PyTime_PerfCounterRaw(&t1);
+            if (val0 == NULL) {
+                Py_XDECREF(seq_holder);
+                Py_XDECREF(it);
+                return NULL;
+            }
+            int64_t sample_ns = (int64_t)(t1 - t0);
+            if (sample_ns <= 0) {
+                sample_ns = 1;
+            }
+            if (_PySys_ShouldDispatch(keyfunc, seq_n - 1, sample_ns)) {
+                PyObject *keys = _PySys_DispatchMapArray(
+                    keyfunc, seq_items + 1, seq_n - 1, 0, 0);
+                if (keys == NULL) {
+                    Py_DECREF(val0);
+                    Py_XDECREF(seq_holder);
+                    Py_XDECREF(it);
+                    return NULL;
+                }
+                maxitem = Py_NewRef(seq_items[0]);
+                maxval = val0;
+                for (Py_ssize_t i = 0; i < seq_n - 1; i++) {
+                    PyObject *val_i = PyList_GET_ITEM(keys, i);
+                    int cmp = PyObject_RichCompareBool(val_i, maxval, op);
+                    if (cmp < 0) {
+                        Py_DECREF(keys);
+                        Py_DECREF(maxval);
+                        Py_DECREF(maxitem);
+                        Py_XDECREF(seq_holder);
+                        Py_XDECREF(it);
+                        return NULL;
+                    }
+                    if (cmp > 0) {
+                        Py_SETREF(maxval, Py_NewRef(val_i));
+                        Py_SETREF(maxitem, Py_NewRef(seq_items[i + 1]));
+                    }
+                }
+                Py_DECREF(keys);
+                Py_DECREF(maxval);
+                Py_XDECREF(seq_holder);
+                Py_XDECREF(it);
+                return maxitem;
+            }
+            /* Fall through to sequential loop starting after item 0 */
+            Py_XDECREF(seq_holder);
+            maxitem = Py_NewRef(seq_items[0]);
+            maxval = val0;
+            if (it == NULL) {
+                args++;
+                nargs--;
+            }
+            else {
+                PyObject *consumed0 = PyIter_Next(it);
+                Py_XDECREF(consumed0);
+                if (consumed0 == NULL && PyErr_Occurred()) {
+                    goto Fail_it;
+                }
+            }
+            goto loop_start;
+        }
+        Py_XDECREF(seq_holder);
+    }
+#endif
+
     maxitem = NULL; /* the result */
     maxval = NULL;  /* the value associated with the result */
+#ifdef Py_GIL_DISABLED
+loop_start:
+#endif
     while (1) {
         if (it == NULL) {
             if (nargs-- <= 0) {

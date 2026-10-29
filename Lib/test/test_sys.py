@@ -2675,6 +2675,50 @@ class TestSysConcurrentDispatch(unittest.TestCase):
         self.assertEqual(list(f), expected_filtered[1:])
         self.assertEqual(list(f), [])
 
+    def test_transparent_min_max_any_all_starmap(self):
+        import itertools
+
+        def heavy_key(x):
+            acc = x
+            for _ in range(150):
+                acc = (acc * 1103515245 + 12345) & 0x7FFFFFFF
+            return acc
+
+        def heavy_pred_true(x):
+            return heavy_key(x) >= 0
+
+        def heavy_pred_some(x):
+            return (heavy_key(x) & 0xFF) == 0x42
+
+        def heavy_pair(a, b):
+            return heavy_key(a) ^ heavy_key(b)
+
+        inputs = list(range(300))
+        pairs = [(i, i + 100) for i in range(300)]
+
+        prev = sys.get_dispatch_threshold()
+        try:
+            sys.set_dispatch_threshold("off")
+            exp_min = min(inputs, key=heavy_key)
+            exp_max = max(inputs, key=heavy_key)
+            exp_all_t = all(map(heavy_pred_true, inputs))
+            exp_all_f = all(map(heavy_pred_some, inputs))
+            exp_any_t = any(map(heavy_pred_some, inputs))
+            exp_starmap = list(itertools.starmap(heavy_pair, pairs))
+            exp_starmap_tuple = tuple(itertools.starmap(heavy_pair, pairs))
+
+            for thresh in ("auto", 32):
+                sys.set_dispatch_threshold(thresh)
+                self.assertEqual(min(inputs, key=heavy_key), exp_min)
+                self.assertEqual(max(inputs, key=heavy_key), exp_max)
+                self.assertEqual(all(map(heavy_pred_true, inputs)), exp_all_t)
+                self.assertEqual(all(map(heavy_pred_some, inputs)), exp_all_f)
+                self.assertEqual(any(map(heavy_pred_some, inputs)), exp_any_t)
+                self.assertEqual(list(itertools.starmap(heavy_pair, pairs)), exp_starmap)
+                self.assertEqual(tuple(itertools.starmap(heavy_pair, pairs)), exp_starmap_tuple)
+        finally:
+            sys.set_dispatch_threshold(prev)
+
 
 if __name__ == "__main__":
     unittest.main()

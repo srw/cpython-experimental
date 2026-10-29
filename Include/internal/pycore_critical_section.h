@@ -116,9 +116,28 @@ _PyCriticalSection_BeginMutex(PyThreadState *tstate, PyCriticalSection *c, PyMut
     }
 }
 
+static inline int
+_PyCriticalSection_IsSingleThreaded(PyThreadState *tstate)
+{
+#if !defined(Py_BUILD_CORE_MODULE)
+    (void)tstate;
+    return _Py_atomic_load_uint8_relaxed(&_Py_SingleThreaded);
+#else
+    return (_Py_atomic_load_ptr_relaxed(&tstate->next) == NULL &&
+            _Py_atomic_load_ptr_relaxed(&tstate->prev) == NULL);
+#endif
+}
+
 static inline void
 _PyCriticalSection_Begin(PyThreadState *tstate, PyCriticalSection *c, PyObject *op)
 {
+    if (_PyCriticalSection_IsSingleThreaded(tstate) && op->ob_mutex._bits == _Py_UNLOCKED) {
+        op->ob_mutex._bits = _Py_LOCKED;
+        c->_cs_mutex = &op->ob_mutex;
+        c->_cs_prev = tstate->critical_section;
+        tstate->critical_section = (uintptr_t)c;
+        return;
+    }
     _PyCriticalSection_BeginMutex(tstate, c, &op->ob_mutex);
 }
 
@@ -143,6 +162,11 @@ _PyCriticalSection_End(PyThreadState *tstate, PyCriticalSection *c)
     // _PyCriticalSection_BeginSlow for locks already held in the top-most
     // critical section, and we shouldn't unlock or pop this critical section.
     if (c->_cs_mutex == NULL) {
+        return;
+    }
+    if (_PyCriticalSection_IsSingleThreaded(tstate) && c->_cs_mutex->_bits == _Py_LOCKED) {
+        c->_cs_mutex->_bits = _Py_UNLOCKED;
+        _PyCriticalSection_Pop(tstate, c);
         return;
     }
     PyMutex_Unlock(c->_cs_mutex);
@@ -190,6 +214,31 @@ _PyCriticalSection2_BeginMutex(PyThreadState *tstate, PyCriticalSection2 *c, PyM
 static inline void
 _PyCriticalSection2_Begin(PyThreadState *tstate, PyCriticalSection2 *c, PyObject *a, PyObject *b)
 {
+    if (_PyCriticalSection_IsSingleThreaded(tstate) &&
+        a->ob_mutex._bits == _Py_UNLOCKED &&
+        b->ob_mutex._bits == _Py_UNLOCKED)
+    {
+        if (a == b) {
+            a->ob_mutex._bits = _Py_LOCKED;
+            c->_cs_base._cs_mutex = &a->ob_mutex;
+            c->_cs_mutex2 = NULL;
+        }
+        else if ((uintptr_t)&b->ob_mutex < (uintptr_t)&a->ob_mutex) {
+            b->ob_mutex._bits = _Py_LOCKED;
+            a->ob_mutex._bits = _Py_LOCKED;
+            c->_cs_base._cs_mutex = &b->ob_mutex;
+            c->_cs_mutex2 = &a->ob_mutex;
+        }
+        else {
+            a->ob_mutex._bits = _Py_LOCKED;
+            b->ob_mutex._bits = _Py_LOCKED;
+            c->_cs_base._cs_mutex = &a->ob_mutex;
+            c->_cs_mutex2 = &b->ob_mutex;
+        }
+        c->_cs_base._cs_prev = tstate->critical_section;
+        tstate->critical_section = (uintptr_t)c | _Py_CRITICAL_SECTION_TWO_MUTEXES;
+        return;
+    }
     _PyCriticalSection2_BeginMutex(tstate, c, &a->ob_mutex, &b->ob_mutex);
 }
 
@@ -201,6 +250,17 @@ _PyCriticalSection2_End(PyThreadState *tstate, PyCriticalSection2 *c)
     // that are already held, and mutex2 should also be NULL.
     if (c->_cs_base._cs_mutex == NULL) {
         assert(c->_cs_mutex2 == NULL);
+        return;
+    }
+    if (_PyCriticalSection_IsSingleThreaded(tstate) &&
+        c->_cs_base._cs_mutex->_bits == _Py_LOCKED &&
+        (c->_cs_mutex2 == NULL || c->_cs_mutex2->_bits == _Py_LOCKED))
+    {
+        if (c->_cs_mutex2) {
+            c->_cs_mutex2->_bits = _Py_UNLOCKED;
+        }
+        c->_cs_base._cs_mutex->_bits = _Py_UNLOCKED;
+        _PyCriticalSection_Pop(tstate, &c->_cs_base);
         return;
     }
     if (c->_cs_mutex2) {

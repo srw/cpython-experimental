@@ -162,10 +162,17 @@ it's USABLE_FRACTION (currently two-thirds) full.
 
 #ifdef Py_GIL_DISABLED
 
+static inline Py_ALWAYS_INLINE bool
+dict_is_unshared_or_1t(PyDictObject *mp)
+{
+    return _PyObject_IsUnsharedLocal((PyObject *)mp) ||
+           (_Py_IsSingleThreaded() && ((PyObject *)mp)->ob_mutex._bits == 0);
+}
+
 static inline void
 ASSERT_DICT_LOCKED(PyObject *op)
 {
-    if (!_PyObject_IsUnsharedLocal(op)) {
+    if (!dict_is_unshared_or_1t((PyDictObject *)op)) {
         _Py_CRITICAL_SECTION_ASSERT_OBJECT_LOCKED(op);
     }
 }
@@ -1665,8 +1672,8 @@ compare_unicode_generic_unshared(PyDictObject *mp, PyDictKeysObject *dk,
         if (cmp < 0) {
             return DKIX_ERROR;
         }
-        if (_PyObject_IsUnsharedLocal((PyObject *)mp) &&
-            !IS_DICT_SHARED(mp) &&
+        if (dict_is_unshared_or_1t(mp) &&
+            (!IS_DICT_SHARED(mp) || _Py_IsSingleThreaded()) &&
             dk == mp->ma_keys &&
             ep->me_key == startkey) {
             return cmp;
@@ -1703,8 +1710,8 @@ compare_generic_unshared(PyDictObject *mp, PyDictKeysObject *dk,
         if (cmp < 0) {
             return DKIX_ERROR;
         }
-        if (_PyObject_IsUnsharedLocal((PyObject *)mp) &&
-            !IS_DICT_SHARED(mp) &&
+        if (dict_is_unshared_or_1t(mp) &&
+            (!IS_DICT_SHARED(mp) || _Py_IsSingleThreaded()) &&
             dk == mp->ma_keys &&
             ep->me_key == startkey) {
             return cmp;
@@ -1738,7 +1745,7 @@ dict_lookup_unshared_local(PyDictObject *mp, PyObject *key, Py_hash_t hash,
             *ix_addr = ix;
             return true;
         }
-        else if (dk->dk_kind == DICT_KEYS_UNICODE && !IS_DICT_SHARED(mp)) {
+        else if (dk->dk_kind == DICT_KEYS_UNICODE && (!IS_DICT_SHARED(mp) || _Py_IsSingleThreaded())) {
             Py_ssize_t ix = do_lookup(mp, dk, key, hash, compare_unicode_generic_unshared);
             if (ix != DKIX_KEY_CHANGED) {
                 *value_addr = (ix >= 0) ? DK_UNICODE_ENTRIES(dk)[ix].me_value : NULL;
@@ -1747,7 +1754,7 @@ dict_lookup_unshared_local(PyDictObject *mp, PyObject *key, Py_hash_t hash,
             }
         }
     }
-    else if (!IS_DICT_SHARED(mp)) {
+    else if (!IS_DICT_SHARED(mp) || _Py_IsSingleThreaded()) {
         Py_ssize_t ix = do_lookup(mp, dk, key, hash, compare_generic_unshared);
         if (ix != DKIX_KEY_CHANGED) {
             *value_addr = (ix >= 0) ? DK_ENTRIES(dk)[ix].me_value : NULL;
@@ -1762,7 +1769,7 @@ static inline Py_ssize_t
 _Py_dict_lookup_threadsafe_borrowed(PyDictObject *mp, PyObject *key, Py_hash_t hash, PyObject **value_addr)
 {
     Py_ssize_t ix;
-    if (_PyObject_IsUnsharedLocal((PyObject *)mp) &&
+    if (dict_is_unshared_or_1t(mp) &&
         dict_lookup_unshared_local(mp, key, hash, value_addr, &ix)) {
         return ix;
     }
@@ -1779,7 +1786,7 @@ _Py_dict_lookup_threadsafe(PyDictObject *mp, PyObject *key, Py_hash_t hash, PyOb
     Py_ssize_t ix;
     PyObject *value;
 
-    if (_PyObject_IsUnsharedLocal((PyObject *)mp) &&
+    if (dict_is_unshared_or_1t(mp) &&
         dict_lookup_unshared_local(mp, key, hash, &value, &ix)) {
         *value_addr = Py_XNewRef(value);
         return ix;
@@ -1912,7 +1919,7 @@ _Py_dict_lookup_threadsafe_stackref(PyDictObject *mp, PyObject *key, Py_hash_t h
 {
     Py_ssize_t ix;
     PyObject *value;
-    if (_PyObject_IsUnsharedLocal((PyObject *)mp) &&
+    if (dict_is_unshared_or_1t(mp) &&
         dict_lookup_unshared_local(mp, key, hash, &value, &ix)) {
         *value_addr = (ix >= 0 && value != NULL)
             ? PyStackRef_FromPyObjectNew(value)
@@ -3236,20 +3243,22 @@ int
 _PyDict_SetItem_Take2(PyDictObject *mp, PyObject *key, PyObject *value)
 {
 #ifdef Py_GIL_DISABLED
-    if (_PyObject_IsUniquelyReferenced((PyObject *)mp) && mp->ma_values == NULL) {
+    if ((_PyObject_IsUniquelyReferenced((PyObject *)mp) ||
+         (_Py_IsSingleThreaded() && ((PyObject *)mp)->ob_mutex._bits == 0)) &&
+        mp->ma_values == NULL) {
         if (PyUnicode_CheckExact(key) && DK_IS_UNICODE(mp->ma_keys)) {
             Py_hash_t hash = ((PyASCIIObject *)key)->hash;
             if (hash != -1 && mp->ma_keys != Py_EMPTY_KEYS) {
                 Py_ssize_t hashpos;
                 Py_ssize_t ix = unicodekeys_lookup_or_empty_slot(
-                    mp->ma_keys, key, hash, &hashpos, true);
+                    mp->ma_keys, key, hash, &hashpos, !IS_DICT_SHARED(mp));
                 if (ix >= 0) {
                     PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(mp->ma_keys)[ix];
                     PyObject *old_value = ep->me_value;
                     assert(old_value != NULL);
                     if (old_value != value) {
                         _PyDict_NotifyEvent(PyDict_EVENT_MODIFIED, mp, key, value);
-                        ep->me_value = value;
+                        STORE_VALUE(ep, value);
                     }
                     Py_DECREF(old_value);
                     Py_DECREF(key);
@@ -3267,7 +3276,7 @@ _PyDict_SetItem_Take2(PyDictObject *mp, PyObject *key, PyObject *value)
             }
             return setitem_take2_lock_held(mp, key, value);
         }
-        if (PyLong_CheckExact(key)) {
+        if (_PyObject_IsUniquelyReferenced((PyObject *)mp) && PyLong_CheckExact(key)) {
             return setitem_take2_lock_held(mp, key, value);
         }
     }
@@ -3388,7 +3397,8 @@ int
 _PyDict_SetItem_Take2_KnownHash(PyDictObject *mp, PyObject *key, PyObject *value, Py_hash_t hash)
 {
 #ifdef Py_GIL_DISABLED
-    if (_PyObject_IsUniquelyReferenced((PyObject *)mp) &&
+    if ((_PyObject_IsUniquelyReferenced((PyObject *)mp) ||
+         (_Py_IsSingleThreaded() && ((PyObject *)mp)->ob_mutex._bits == 0)) &&
         PyUnicode_CheckExact(key) &&
         DK_IS_UNICODE(mp->ma_keys) &&
         mp->ma_values == NULL)
@@ -3396,14 +3406,14 @@ _PyDict_SetItem_Take2_KnownHash(PyDictObject *mp, PyObject *key, PyObject *value
         if (mp->ma_keys != Py_EMPTY_KEYS) {
             Py_ssize_t hashpos;
             Py_ssize_t ix = unicodekeys_lookup_or_empty_slot(
-                mp->ma_keys, key, hash, &hashpos, true);
+                mp->ma_keys, key, hash, &hashpos, !IS_DICT_SHARED(mp));
             if (ix >= 0) {
                 PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(mp->ma_keys)[ix];
                 PyObject *old_value = ep->me_value;
                 assert(old_value != NULL);
                 if (old_value != value) {
                     _PyDict_NotifyEvent(PyDict_EVENT_MODIFIED, mp, key, value);
-                    ep->me_value = value;
+                    STORE_VALUE(ep, value);
                 }
                 Py_DECREF(old_value);
                 Py_DECREF(key);
@@ -4430,16 +4440,25 @@ _PyDict_SubscriptKnownHash(PyObject *self, PyObject *key, Py_hash_t hash)
     PyObject *value;
 
 #ifdef Py_GIL_DISABLED
-    if (_PyObject_IsUniquelyReferenced(self) &&
+    if (dict_is_unshared_or_1t(mp) &&
         PyUnicode_CheckExact(key) &&
         mp->ma_keys->dk_kind == DICT_KEYS_UNICODE)
     {
         ix = unicodekeys_lookup_unicode(mp->ma_keys, key, hash);
         if (ix >= 0) {
-            value = DK_UNICODE_ENTRIES(mp->ma_keys)[ix].me_value;
+            if (mp->ma_values != NULL) {
+                value = mp->ma_values->values[ix];
+            }
+            else {
+                value = DK_UNICODE_ENTRIES(mp->ma_keys)[ix].me_value;
+            }
             if (value != NULL) {
                 return Py_NewRef(value);
             }
+        }
+        if (PyDict_CheckExact(mp)) {
+            _PyErr_SetKeyError(key);
+            return NULL;
         }
     }
 #endif
@@ -5440,7 +5459,7 @@ dict_get_impl(PyDictObject *self, PyObject *key, PyObject *default_value)
     Py_ssize_t ix;
 
 #ifdef Py_GIL_DISABLED
-    if (_PyObject_IsUnsharedLocal((PyObject *)self)) {
+    if (dict_is_unshared_or_1t(self)) {
         PyDictKeysObject *dk = self->ma_keys;
         if (dk->dk_kind == DICT_KEYS_UNICODE && PyUnicode_CheckExact(key)) {
             hash = ((PyASCIIObject *)key)->hash;
@@ -6000,6 +6019,22 @@ _PyDict_Contains_KnownHash(PyObject *op, PyObject *key, Py_hash_t hash)
     Py_ssize_t ix;
 
 #ifdef Py_GIL_DISABLED
+    if (dict_is_unshared_or_1t(mp) &&
+        PyUnicode_CheckExact(key) &&
+        mp->ma_keys->dk_kind == DICT_KEYS_UNICODE)
+    {
+        ix = unicodekeys_lookup_unicode(mp->ma_keys, key, hash);
+        if (ix < 0) {
+            return 0;
+        }
+        if (mp->ma_values != NULL) {
+            value = mp->ma_values->values[ix];
+        }
+        else {
+            value = DK_UNICODE_ENTRIES(mp->ma_keys)[ix].me_value;
+        }
+        return value != NULL;
+    }
     ix = _Py_dict_lookup_threadsafe(mp, key, hash, &value);
 #else
     ix = _Py_dict_lookup(mp, key, hash, &value);

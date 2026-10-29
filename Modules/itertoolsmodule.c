@@ -6,7 +6,9 @@
 #include "pycore_moduleobject.h"      // _PyModule_GetState()
 #include "pycore_typeobject.h"        // _PyType_GetModuleState()
 #include "pycore_object.h"            // _PyObject_GC_TRACK()
-#include "pycore_tuple.h"             // _PyTuple_ITEMS()
+#include "pycore_list.h"              // _PyListIterObject
+#include "pycore_sysmodule.h"         // _PySys_DispatchStarmapArray()
+#include "pycore_tuple.h"             // _PyTuple_ITEMS(), _PyTupleIterObject
 
 #include <stddef.h>                   // offsetof()
 
@@ -1864,6 +1866,80 @@ starmap_next(PyObject *op)
     result = PyObject_Call(lz->func, args, NULL);
     Py_DECREF(args);
     return result;
+}
+
+int
+_PyStarmap_CheckExact(PyObject *op)
+{
+    return Py_TYPE(op)->tp_iternext == starmap_next &&
+           Py_IS_TYPE(op, find_state_by_type(Py_TYPE(op))->starmap_type);
+}
+
+static inline int
+_py_starmap_is_parallelizable_callable(PyObject *func)
+{
+    if (PyFunction_Check(func)) {
+        return 1;
+    }
+    if (PyMethod_Check(func)) {
+        PyObject *inner = PyMethod_GET_FUNCTION(func);
+        return inner != NULL && PyFunction_Check(inner);
+    }
+    return 0;
+}
+
+PyObject *
+_PyStarmap_MaterializeList(PyObject *starmap_obj)
+{
+    if (!_PyStarmap_CheckExact(starmap_obj)) {
+        return NULL;
+    }
+    starmapobject *lz = starmapobject_CAST(starmap_obj);
+    if (!_py_starmap_is_parallelizable_callable(lz->func)) {
+        return NULL;
+    }
+    PyObject *it = lz->it;
+    if (Py_IS_TYPE(it, &PyListIter_Type)) {
+        _PyListIterObject *lit = (_PyListIterObject *)it;
+        PyListObject *seq = lit->it_seq;
+        Py_ssize_t idx = lit->it_index;
+        if (seq == NULL) {
+            return PyList_New(0);
+        }
+        Py_ssize_t n = PyList_GET_SIZE(seq);
+        if (idx < 0 || idx >= n) {
+            lit->it_seq = NULL;
+            Py_DECREF(seq);
+            return PyList_New(0);
+        }
+        lit->it_seq = NULL;
+        lit->it_index = -1;
+        PyObject *res = _PySys_DispatchStarmapArray(
+            lz->func, _PyList_ITEMS(seq) + idx, n - idx, 0, 0);
+        Py_DECREF(seq);
+        return res;
+    }
+    if (Py_IS_TYPE(it, &PyTupleIter_Type)) {
+        _PyTupleIterObject *tit = (_PyTupleIterObject *)it;
+        PyTupleObject *seq = tit->it_seq;
+        Py_ssize_t idx = tit->it_index;
+        if (seq == NULL) {
+            return PyList_New(0);
+        }
+        Py_ssize_t n = PyTuple_GET_SIZE(seq);
+        if (idx < 0 || idx >= n) {
+            tit->it_seq = NULL;
+            Py_DECREF(seq);
+            return PyList_New(0);
+        }
+        tit->it_seq = NULL;
+        tit->it_index = -1;
+        PyObject *res = _PySys_DispatchStarmapArray(
+            lz->func, _PyTuple_ITEMS(seq) + idx, n - idx, 0, 0);
+        Py_DECREF(seq);
+        return res;
+    }
+    return NULL;
 }
 
 static PyType_Slot starmap_slots[] = {

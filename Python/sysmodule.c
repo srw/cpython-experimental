@@ -2699,6 +2699,28 @@ _py_dispatch_parse_threshold_wstr(const wchar_t *ws)
     (void)_py_dispatch_parse_threshold_str(buf);
 }
 
+static inline PyObject *
+_py_dispatch_call_one(PyThreadState *tstate, PyObject *func, PyObject *arg, int is_starmap)
+{
+    if (!is_starmap) {
+        return _PyObject_VectorcallTstate(tstate, func, &arg, 1, NULL);
+    }
+    if (PyTuple_CheckExact(arg)) {
+        Py_ssize_t nargs = PyTuple_GET_SIZE(arg);
+        PyObject *const *args = (nargs > 0) ? &PyTuple_GET_ITEM(arg, 0) : NULL;
+        return _PyObject_VectorcallTstate(tstate, func, args, nargs, NULL);
+    }
+    PyObject *targs = PySequence_Tuple(arg);
+    if (targs == NULL) {
+        return NULL;
+    }
+    Py_ssize_t nargs = PyTuple_GET_SIZE(targs);
+    PyObject *const *args = (nargs > 0) ? &PyTuple_GET_ITEM(targs, 0) : NULL;
+    PyObject *res = _PyObject_VectorcallTstate(tstate, func, args, nargs, NULL);
+    Py_DECREF(targs);
+    return res;
+}
+
 #if defined(Py_GIL_DISABLED) && !defined(MS_WINDOWS)
 #include <pthread.h>
 #ifdef __APPLE__
@@ -2778,6 +2800,7 @@ typedef struct {
     Py_ssize_t next_idx;        /* Atomic work-stealing cursor */
     int active_workers;
     int measure_first;
+    int is_starmap;
     int has_error;
     PyObject *exc_value;
 } _PyDispatchPool;
@@ -2951,6 +2974,7 @@ _py_dispatch_execute_slice(PyThreadState *tstate)
     PyObject *res_list = _py_dispatch_pool.res_list;
     Py_ssize_t total = _py_dispatch_pool.total_items;
     Py_ssize_t fixed_chunk = _py_dispatch_pool.chunk_size;
+    int is_starmap = _py_dispatch_pool.is_starmap;
 
     for (;;) {
         if (_Py_atomic_load_int_relaxed(&_py_dispatch_pool.has_error)) {
@@ -2987,8 +3011,7 @@ _py_dispatch_execute_slice(PyThreadState *tstate)
                 (void)PyTime_PerfCounterRaw(&t0);
             }
             for (Py_ssize_t i = start; i < end; i++) {
-                PyObject *arg = items[i];
-                PyObject *val = _PyObject_VectorcallTstate(tstate, func, &arg, 1, NULL);
+                PyObject *val = _py_dispatch_call_one(tstate, func, items[i], is_starmap);
                 if (val == NULL) {
                     _py_dispatch_record_error(tstate);
                     return;
@@ -3091,6 +3114,7 @@ _py_dispatch_ensure_workers_locked(PyInterpreterState *interp, int needed)
         needed = _PY_DISPATCH_MAX_WORKERS;
     }
     while (_py_dispatch_pool.num_spawned < needed) {
+        _Py_atomic_store_uint8_relaxed(&_Py_SingleThreaded, 0);
         int wid = _py_dispatch_pool.num_spawned;
         _py_dispatch_worker_args[wid].interp = interp;
         _py_dispatch_worker_args[wid].worker_id = wid;
@@ -3112,13 +3136,52 @@ _py_dispatch_ensure_workers_locked(PyInterpreterState *interp, int needed)
 }
 #endif /* Py_GIL_DISABLED && !MS_WINDOWS */
 
-PyObject *
-_PySys_DispatchMapArray(
+int
+_PySys_ShouldDispatch(PyObject *func, Py_ssize_t rem_items, int64_t sample_ns)
+{
+#if defined(Py_GIL_DISABLED) && !defined(MS_WINDOWS)
+    if (rem_items <= 0) {
+        return 0;
+    }
+    Py_ssize_t thresh = _Py_atomic_load_ssize_relaxed(&_py_dispatch_threshold);
+    if (thresh == 0) {
+        return 0;
+    }
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (_Py_atomic_load_int_relaxed(&_py_dispatch_pool.busy) ||
+        _PyEval_IsGILEnabled(tstate) ||
+        !_Py_IsMainInterpreter(tstate->interp))
+    {
+        return 0;
+    }
+    if (thresh > 0) {
+        return (rem_items + 1) >= thresh;
+    }
+    if (sample_ns > 0) {
+        _py_dispatch_update_cost_ns(func, sample_ns);
+    }
+    int64_t cost_ns = _py_dispatch_lookup_cost_ns(func);
+    if (cost_ns <= 0) {
+        cost_ns = sample_ns;
+    }
+    if (cost_ns > 0) {
+        int64_t est_rem_ns = (rem_items > 1000000)
+                             ? 1000000000LL
+                             : ((int64_t)rem_items * cost_ns);
+        return est_rem_ns >= _PY_DISPATCH_ADAPTIVE_MIN_NS;
+    }
+#endif
+    return 0;
+}
+
+static PyObject *
+_py_dispatch_map_array_impl(
     PyObject *func,
     PyObject *const *items,
     Py_ssize_t n,
     Py_ssize_t chunksize,
-    int is_explicit)
+    int is_explicit,
+    int is_starmap)
 {
     PyObject *res_list = PyList_New(n);
     if (res_list == NULL || n == 0) {
@@ -3148,13 +3211,12 @@ _PySys_DispatchMapArray(
             /* Adaptive Cost-Guided Mode (thresh == -1) */
             int64_t cost_ns = _py_dispatch_lookup_cost_ns(func);
             if (cost_ns == 0 && !is_explicit) {
-                /* Cold callable in implicit map(): probe Item 0 on Core 0 first.
-                   This specializes bytecode and measures actual per-item latency
-                   without waking pthreads for trivial callables. */
+                /* Cold callable in implicit map()/starmap(): probe Item 0 on
+                   Core 0 first. This specializes bytecode and measures actual
+                   per-item latency without waking pthreads for trivial callables. */
                 PyTime_t t0 = 0, t1 = 0;
-                PyObject *arg0 = items[0];
                 (void)PyTime_PerfCounterRaw(&t0);
-                PyObject *val0 = _PyObject_VectorcallTstate(tstate, func, &arg0, 1, NULL);
+                PyObject *val0 = _py_dispatch_call_one(tstate, func, items[0], is_starmap);
                 (void)PyTime_PerfCounterRaw(&t1);
                 if (val0 == NULL) {
                     Py_DECREF(res_list);
@@ -3217,6 +3279,7 @@ _PySys_DispatchMapArray(
                 _py_dispatch_pool.total_items = n;
                 _py_dispatch_pool.chunk_size = csize;
                 _py_dispatch_pool.measure_first = measure_first;
+                _py_dispatch_pool.is_starmap = is_starmap;
                 _Py_atomic_store_ssize_relaxed(&_py_dispatch_pool.next_idx, start_idx);
                 _Py_atomic_store_int_relaxed(&_py_dispatch_pool.has_error, 0);
                 _py_dispatch_pool.exc_value = NULL;
@@ -3246,6 +3309,7 @@ _PySys_DispatchMapArray(
                 _py_dispatch_pool.func = NULL;
                 _py_dispatch_pool.items = NULL;
                 _py_dispatch_pool.res_list = NULL;
+                _py_dispatch_pool.is_starmap = 0;
 
                 pthread_mutex_lock(&_py_dispatch_pool.mutex);
                 _py_dispatch_pool.busy = 0;
@@ -3263,8 +3327,7 @@ _PySys_DispatchMapArray(
 #endif
 
     for (Py_ssize_t i = start_idx; i < n; i++) {
-        PyObject *arg = items[i];
-        PyObject *val = _PyObject_VectorcallTstate(tstate, func, &arg, 1, NULL);
+        PyObject *val = _py_dispatch_call_one(tstate, func, items[i], is_starmap);
         if (val == NULL) {
             Py_DECREF(res_list);
             return NULL;
@@ -3272,6 +3335,28 @@ _PySys_DispatchMapArray(
         PyList_SET_ITEM(res_list, i, val);
     }
     return res_list;
+}
+
+PyObject *
+_PySys_DispatchMapArray(
+    PyObject *func,
+    PyObject *const *items,
+    Py_ssize_t n,
+    Py_ssize_t chunksize,
+    int is_explicit)
+{
+    return _py_dispatch_map_array_impl(func, items, n, chunksize, is_explicit, 0);
+}
+
+PyObject *
+_PySys_DispatchStarmapArray(
+    PyObject *func,
+    PyObject *const *items,
+    Py_ssize_t n,
+    Py_ssize_t chunksize,
+    int is_explicit)
+{
+    return _py_dispatch_map_array_impl(func, items, n, chunksize, is_explicit, 1);
 }
 
 PyDoc_STRVAR(concurrent_map_doc,
@@ -3400,6 +3485,7 @@ sys_concurrent_perform(PyObject *module, PyObject *const *args, Py_ssize_t nargs
             _py_dispatch_pool.total_items = count;
             _py_dispatch_pool.chunk_size = 0;
             _py_dispatch_pool.measure_first = measure_first;
+            _py_dispatch_pool.is_starmap = 0;
             _Py_atomic_store_ssize_relaxed(&_py_dispatch_pool.next_idx, 0);
             _Py_atomic_store_int_relaxed(&_py_dispatch_pool.has_error, 0);
             _py_dispatch_pool.exc_value = NULL;
