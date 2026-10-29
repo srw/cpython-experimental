@@ -79,7 +79,9 @@ ensure_shared_on_resize(PyListObject *self)
     // We can't use _Py_CRITICAL_SECTION_ASSERT_OBJECT_LOCKED here because
     // the `CALL_LIST_APPEND` bytecode handler may lock the list without
     // a critical section.
-    assert(Py_REFCNT(self) == 1 || PyMutex_IsLocked(&_PyObject_CAST(self)->ob_mutex));
+    assert(Py_REFCNT(self) == 1 ||
+           _PyObject_IsUnsharedLocal((PyObject *)self) ||
+           PyMutex_IsLocked(&_PyObject_CAST(self)->ob_mutex));
 
     // Ensure that the list array is freed using QSBR if we are not the
     // owning thread.
@@ -374,6 +376,12 @@ exit:
 static inline PyObject*
 list_get_item_ref(PyListObject *op, Py_ssize_t i)
 {
+    if (_PyObject_IsUnsharedLocal((PyObject *)op)) {
+        if (!valid_index(i, Py_SIZE(op))) {
+            return NULL;
+        }
+        return Py_NewRef(op->ob_item[i]);
+    }
     if (!_Py_IsOwnedByCurrentThread((PyObject *)op) && !_PyObject_GC_IS_SHARED(op)) {
         return list_item_impl(op, i);
     }
@@ -594,6 +602,11 @@ int
 PyList_Append(PyObject *op, PyObject *newitem)
 {
     if (PyList_Check(op) && (newitem != NULL)) {
+#ifdef Py_GIL_DISABLED
+        if (_PyObject_IsUniquelyReferenced(op)) {
+            return _PyList_AppendTakeRef((PyListObject *)op, Py_NewRef(newitem));
+        }
+#endif
         int ret;
         Py_BEGIN_CRITICAL_SECTION(op);
         ret = _PyList_AppendTakeRef((PyListObject *)op, Py_NewRef(newitem));
@@ -972,12 +985,12 @@ ptr_wise_atomic_memmove(PyListObject *a, PyObject **dest, PyObject **src, Py_ssi
 #ifndef Py_GIL_DISABLED
     memmove(dest, src, n * sizeof(PyObject *));
 #else
-    _Py_CRITICAL_SECTION_ASSERT_OBJECT_LOCKED(a);
     if (_Py_IsOwnedByCurrentThread((PyObject *)a) && !_PyObject_GC_IS_SHARED(a)) {
         // No other threads can read this list concurrently
         memmove(dest, src, n * sizeof(PyObject *));
         return;
     }
+    _Py_CRITICAL_SECTION_ASSERT_OBJECT_LOCKED(a);
     if (dest < src) {
         for (Py_ssize_t i = 0; i != n; i++) {
             _Py_atomic_store_ptr_release(&dest[i], src[i]);
@@ -1106,6 +1119,13 @@ list_ass_slice(PyListObject *a, Py_ssize_t ilow, Py_ssize_t ihigh, PyObject *v)
         }
         Py_END_CRITICAL_SECTION();
     }
+#ifdef Py_GIL_DISABLED
+    else if (_PyObject_IsUniquelyReferenced((PyObject *)a) &&
+             (v == NULL || (PyList_CheckExact(v) && _PyObject_IsUniquelyReferenced(v))))
+    {
+        ret = list_ass_slice_lock_held(a, ilow, ihigh, v);
+    }
+#endif
     else if (v != NULL && PyList_CheckExact(v)) {
         Py_BEGIN_CRITICAL_SECTION2(a, v);
         ret = list_ass_slice_lock_held(a, ilow, ihigh, v);

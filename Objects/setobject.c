@@ -410,6 +410,37 @@ set_insert_clean(setentry *table, size_t mask, PyObject *key, Py_hash_t hash)
 /* ======== End logic for probing the hash table ========================== */
 /* ======================================================================== */
 
+static inline Py_ALWAYS_INLINE int
+set_compare_unshared(PySetObject *so, setentry *table, setentry *entry,
+                     PyObject *key, Py_hash_t hash)
+{
+    if (entry->hash == 0 && entry->key == NULL)
+        return SET_LOOKKEY_EMPTY;
+    if (entry->hash == hash) {
+        PyObject *startkey = entry->key;
+        assert(startkey != dummy);
+        if (startkey == key)
+            return SET_LOOKKEY_FOUND;
+        if (PyUnicode_CheckExact(startkey)
+            && PyUnicode_CheckExact(key)
+            && unicode_eq(startkey, key))
+            return SET_LOOKKEY_FOUND;
+        Py_INCREF(startkey);
+        int cmp = PyObject_RichCompareBool(startkey, key, Py_EQ);
+        Py_DECREF(startkey);
+        if (cmp < 0)
+            return SET_LOOKKEY_ERROR;
+        if (!_PyObject_IsUnsharedLocal((PyObject *)so) ||
+            SET_IS_SHARED(so) ||
+            table != so->table ||
+            entry->key != startkey)
+            return SET_LOOKKEY_CHANGED;
+        if (cmp > 0)
+            return SET_LOOKKEY_FOUND;
+    }
+    return SET_LOOKKEY_NO_MATCH;
+}
+
 static int
 set_lookkey(PySetObject *so, PyObject *key, Py_hash_t hash, setentry **epp)
 {
@@ -419,6 +450,16 @@ set_lookkey(PySetObject *so, PyObject *key, Py_hash_t hash, setentry **epp)
                                set_compare_frozenset);
     }
     else {
+        if (_PyObject_IsUnsharedLocal((PyObject *)so) && !SET_IS_SHARED(so)) {
+            if (so->used == 0) {
+                return SET_LOOKKEY_NO_MATCH;
+            }
+            status = set_do_lookup(so, so->table, so->mask, key, hash, epp,
+                                   set_compare_unshared);
+            if (status != SET_LOOKKEY_CHANGED) {
+                return status;
+            }
+        }
         Py_BEGIN_CRITICAL_SECTION(so);
         do {
             status = set_do_lookup(so, so->table, so->mask, key, hash, epp,
@@ -445,6 +486,16 @@ set_lookkey_threadsafe(PySetObject *so, PyObject *key, Py_hash_t hash)
                status == SET_LOOKKEY_NO_MATCH ||
                status == SET_LOOKKEY_ERROR);
         return status;
+    }
+    if (_PyObject_IsUnsharedLocal((PyObject *)so) && !SET_IS_SHARED(so)) {
+        if (so->used == 0) {
+            return SET_LOOKKEY_NO_MATCH;
+        }
+        status = set_do_lookup(so, so->table, so->mask, key, hash, &entry,
+                               set_compare_unshared);
+        if (status != SET_LOOKKEY_CHANGED) {
+            return status;
+        }
     }
     ensure_shared_on_read(so);
     setentry *table = FT_ATOMIC_LOAD_PTR_ACQUIRE(so->table);
@@ -1110,18 +1161,32 @@ static PyObject *setiter_iternext(PyObject *self)
         return NULL;
     }
 
-    Py_BEGIN_CRITICAL_SECTION(so);
-    i = si->si_pos;
-    assert(i>=0);
-    entry = so->table;
-    mask = so->mask;
-    while (i <= mask && (entry[i].key == NULL || entry[i].key == dummy)) {
-        i++;
+    if (_PyObject_IsUnsharedLocal((PyObject *)so) && !SET_IS_SHARED(so)) {
+        i = si->si_pos;
+        assert(i>=0);
+        entry = so->table;
+        mask = so->mask;
+        while (i <= mask && (entry[i].key == NULL || entry[i].key == dummy)) {
+            i++;
+        }
+        if (i <= mask) {
+            key = Py_NewRef(entry[i].key);
+        }
     }
-    if (i <= mask) {
-        key = Py_NewRef(entry[i].key);
+    else {
+        Py_BEGIN_CRITICAL_SECTION(so);
+        i = si->si_pos;
+        assert(i>=0);
+        entry = so->table;
+        mask = so->mask;
+        while (i <= mask && (entry[i].key == NULL || entry[i].key == dummy)) {
+            i++;
+        }
+        if (i <= mask) {
+            key = Py_NewRef(entry[i].key);
+        }
+        Py_END_CRITICAL_SECTION();
     }
-    Py_END_CRITICAL_SECTION();
     si->si_pos = i+1;
     if (key == NULL) {
         si->si_set = NULL;
@@ -3094,6 +3159,10 @@ PySet_Discard(PyObject *set, PyObject *key)
         return -1;
     }
 
+    if (_PyObject_IsUniquelyReferenced(set)) {
+        return set_discard_key((PySetObject *)set, key);
+    }
+
     int rv;
     Py_BEGIN_CRITICAL_SECTION(set);
     rv = set_discard_key((PySetObject *)set, key);
@@ -3105,6 +3174,9 @@ int
 PySet_Add(PyObject *anyset, PyObject *key)
 {
     if (PySet_Check(anyset)) {
+        if (_PyObject_IsUniquelyReferenced(anyset)) {
+            return set_add_key((PySetObject *)anyset, key);
+        }
         int rv;
         Py_BEGIN_CRITICAL_SECTION(anyset);
         rv = set_add_key((PySetObject *)anyset, key);

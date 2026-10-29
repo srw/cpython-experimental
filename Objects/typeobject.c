@@ -2491,9 +2491,18 @@ _PyType_AllocNoTrack(PyTypeObject *type, Py_ssize_t nitems)
     size_t size = _PyObject_VAR_SIZE(type, nitems+1);
 
     const size_t presize = _PyType_PreHeaderSize(type);
+    Py_ssize_t inline_values_usable = 0;
+    size_t inline_values_len = 0;
     if (type->tp_flags & Py_TPFLAGS_INLINE_VALUES) {
         assert(type->tp_itemsize == 0);
-        size += _PyInlineValuesSize(type);
+        PyDictKeysObject *keys = ((PyHeapTypeObject *)type)->ht_cached_keys;
+        assert(keys != NULL);
+        inline_values_usable = FT_ATOMIC_LOAD_SSIZE_ACQUIRE(keys->dk_usable);
+        Py_ssize_t dk_nentries = FT_ATOMIC_LOAD_SSIZE_ACQUIRE(keys->dk_nentries);
+        inline_values_len = (size_t)(dk_nentries + inline_values_usable);
+        size_t prefix_size = _Py_SIZE_ROUND_UP(inline_values_len, sizeof(PyObject *));
+        assert(prefix_size < 256);
+        size += prefix_size + (inline_values_len + 1) * sizeof(PyObject *);
     }
     char *alloc = _PyObject_MallocWithType(type, size + presize);
     if (alloc  == NULL) {
@@ -2508,8 +2517,26 @@ _PyType_AllocNoTrack(PyTypeObject *type, Py_ssize_t nitems)
         _PyObject_GC_Link(obj);
     }
     // Zero out the object after the PyObject header. The header fields are
-    // initialized by _PyObject_Init[Var]().
-    memset((char *)obj + sizeof(PyObject), 0, size - sizeof(PyObject));
+    // initialized by _PyObject_Init[Var](), and inline values are initialized
+    // below or by _PyObject_InitInlineValues().
+    size_t clear_size = ((type->tp_flags & Py_TPFLAGS_INLINE_VALUES)
+                         ? (size_t)type->tp_basicsize
+                         : size) - sizeof(PyObject);
+    if (clear_size == sizeof(PyObject *)) {
+        *(PyObject **)((char *)obj + sizeof(PyObject)) = NULL;
+    }
+    else if (clear_size <= 8 * sizeof(PyObject *) &&
+             (clear_size % sizeof(PyObject *)) == 0)
+    {
+        PyObject **p = (PyObject **)((char *)obj + sizeof(PyObject));
+        size_t n = clear_size / sizeof(PyObject *);
+        for (size_t i = 0; i < n; i++) {
+            p[i] = NULL;
+        }
+    }
+    else if (clear_size > 0) {
+        memset((char *)obj + sizeof(PyObject), 0, clear_size);
+    }
 
     if (type->tp_itemsize == 0) {
         _PyObject_Init(obj, type);
@@ -2518,7 +2545,21 @@ _PyType_AllocNoTrack(PyTypeObject *type, Py_ssize_t nitems)
         _PyObject_InitVar((PyVarObject *)obj, type, nitems);
     }
     if (type->tp_flags & Py_TPFLAGS_INLINE_VALUES) {
-        _PyObject_InitInlineValues(obj, type);
+        if (inline_values_usable <= 1) {
+            OBJECT_STAT_INC(inline_values);
+            PyDictValues *values = _PyObject_InlineValues(obj);
+            assert(inline_values_len < 256);
+            values->capacity = (uint8_t)inline_values_len;
+            values->size = 0;
+            values->embedded = 1;
+            values->valid = 1;
+            for (size_t i = 0; i < inline_values_len; i++) {
+                values->values[i] = NULL;
+            }
+        }
+        else {
+            _PyObject_InitInlineValues(obj, type);
+        }
     }
     return obj;
 }
@@ -2695,6 +2736,67 @@ subtype_dealloc(PyObject *self)
     /* Extract the type; we expect it to be a heap type */
     type = Py_TYPE(self);
     _PyObject_ASSERT((PyObject *)type, type->tp_flags & Py_TPFLAGS_HEAPTYPE);
+
+    if (__builtin_expect(
+            type->tp_base == &PyBaseObject_Type &&
+            _PyType_IS_GC(type) &&
+            type->tp_finalize == NULL &&
+            type->tp_del == NULL, 1))
+    {
+        if (_PyObject_GC_IS_TRACKED(self)) {
+            _PyObject_GC_UNTRACK(self);
+        }
+        if (type->tp_weaklistoffset &&
+            *_PyObject_GET_WEAKREFS_LISTPTR_FROM_OFFSET(self) != NULL)
+        {
+            PyObject_ClearWeakRefs(self);
+        }
+        if (Py_SIZE(type)) {
+            clear_slots(type, self);
+        }
+        if (type->tp_flags & Py_TPFLAGS_MANAGED_DICT) {
+            if ((type->tp_flags & Py_TPFLAGS_INLINE_VALUES) &&
+                _PyObject_GetManagedDict(self) == NULL)
+            {
+                PyDictValues *values = _PyObject_InlineValues(self);
+                if (values->valid) {
+                    values->valid = 0;
+                    for (Py_ssize_t i = 0; i < values->capacity; i++) {
+                        PyObject *value = values->values[i];
+                        if (value != NULL) {
+                            values->values[i] = NULL;
+                            Py_DECREF(value);
+                        }
+                    }
+                }
+            }
+            else {
+                PyObject_ClearManagedDict(self);
+            }
+        }
+        else if (type->tp_dictoffset) {
+            PyObject **dictptr = _PyObject_ComputedDictPointer(self);
+            if (dictptr != NULL) {
+                PyObject *dict = *dictptr;
+                if (dict != NULL) {
+                    Py_DECREF(dict);
+                    *dictptr = NULL;
+                }
+            }
+        }
+        type = Py_TYPE(self);
+        int type_needs_decref = (type->tp_flags & Py_TPFLAGS_HEAPTYPE) != 0;
+        if (__builtin_expect(type->tp_free == PyObject_GC_Del, 1)) {
+            PyObject_GC_Del(self);
+        }
+        else {
+            type->tp_free(self);
+        }
+        if (type_needs_decref) {
+            _Py_DECREF_TYPE(type);
+        }
+        return;
+    }
 
     /* Test whether the type has GC exactly once */
 
