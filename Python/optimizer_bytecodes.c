@@ -670,19 +670,24 @@ dummy_func(void) {
     }
 
     op(_BINARY_OP_SUBSCR_STR_INT, (str_st, sub_st -- res, s, i)) {
-        res = sym_new_type(ctx, &PyUnicode_Type);
         s = str_st;
         i = sub_st;
+        sym_set_compact_int(sub_st);
+        REPLACE_OPCODE_IF_EVALUATES_PURE(str_st, sub_st, res);
+        res = PyJitRef_Borrow(sym_new_type(ctx, &PyUnicode_Type));
     }
 
     op(_BINARY_OP_SUBSCR_USTR_INT, (str_st, sub_st -- res, s, i)) {
-        res = sym_new_type(ctx, &PyUnicode_Type);
         s = str_st;
         i = sub_st;
+        sym_set_compact_int(sub_st);
+        REPLACE_OPCODE_IF_EVALUATES_PURE(str_st, sub_st, res);
+        res = PyJitRef_Borrow(sym_new_type(ctx, &PyUnicode_Type));
     }
 
     op(_GUARD_BINARY_OP_SUBSCR_TUPLE_INT_BOUNDS, (tuple_st, sub_st -- tuple_st, sub_st)) {
         assert(sym_matches_type(tuple_st, &PyTuple_Type));
+        sym_set_compact_int(sub_st);
         if (sym_is_const(ctx, sub_st)) {
             assert(PyLong_CheckExact(sym_get_const(ctx, sub_st)));
             long index = PyLong_AsLong(sym_get_const(ctx, sub_st));
@@ -776,7 +781,8 @@ dummy_func(void) {
         int already_bool = optimize_to_bool(this_instr, ctx, value, &res,
                                             _NOP, _SWAP);
         if (!already_bool) {
-            res = sym_new_type(ctx, &PyBool_Type);
+            sym_set_type(value, &PyList_Type);
+            res = sym_new_truthiness(ctx, value, true);
         }
         v = value;
     }
@@ -2529,7 +2535,11 @@ dummy_func(void) {
     }
 
     op(_CALL_LEN, (callable, null, arg -- res, a, c)) {
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+        res = PyJitRef_MakeUnique(sym_new_compact_int(ctx));
+#else
         res = sym_new_type(ctx, &PyLong_Type);
+#endif
         Py_ssize_t length = sym_tuple_length(arg);
 
         // Not a tuple, check if it's another immutable const with known length
@@ -2572,7 +2582,11 @@ dummy_func(void) {
     op(_GET_LEN, (obj -- obj, len)) {
         Py_ssize_t tuple_length = sym_tuple_length(obj);
         if (tuple_length == -1) {
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+            len = PyJitRef_MakeUnique(sym_new_compact_int(ctx));
+#else
             len = sym_new_type(ctx, &PyLong_Type);
+#endif
         }
         else {
             assert(tuple_length >= 0);
