@@ -48,9 +48,9 @@ validate_step(PyObject *step)
 {
     /* No step specified, use a step of 1. */
     if (!step)
-        return PyLong_FromLong(1);
+        return _PyLong_GetOne();
 
-    step = PyNumber_Index(step);
+    step = PyLong_CheckExact(step) ? Py_NewRef(step) : PyNumber_Index(step);
     if (step && _PyLong_IsZero((PyLongObject *)step)) {
         PyErr_SetString(PyExc_ValueError,
                         "range() arg 3 must not be zero");
@@ -104,11 +104,11 @@ range_from_array(PyTypeObject *type, PyObject *const *args, Py_ssize_t num_args)
             _Py_FALLTHROUGH;
         case 2:
             /* Convert borrowed refs to owned refs */
-            start = PyNumber_Index(args[0]);
+            start = PyLong_CheckExact(args[0]) ? Py_NewRef(args[0]) : PyNumber_Index(args[0]);
             if (!start) {
                 return NULL;
             }
-            stop = PyNumber_Index(args[1]);
+            stop = PyLong_CheckExact(args[1]) ? Py_NewRef(args[1]) : PyNumber_Index(args[1]);
             if (!stop) {
                 Py_DECREF(start);
                 return NULL;
@@ -121,7 +121,7 @@ range_from_array(PyTypeObject *type, PyObject *const *args, Py_ssize_t num_args)
             }
             break;
         case 1:
-            stop = PyNumber_Index(args[0]);
+            stop = PyLong_CheckExact(args[0]) ? Py_NewRef(args[0]) : PyNumber_Index(args[0]);
             if (!stop) {
                 return NULL;
             }
@@ -201,6 +201,17 @@ get_len_of_range(long lo, long hi, long step);
  */
 static long compute_range_length_long(PyObject *start,
                 PyObject *stop, PyObject *step) {
+#if SIZEOF_LONG >= 8
+    if (_PyLong_CheckExactAndCompact(start) &&
+        _PyLong_CheckExactAndCompact(stop) &&
+        _PyLong_CheckExactAndCompact(step))
+    {
+        long long_start = (long)_PyLong_CompactValue((PyLongObject *)start);
+        long long_stop = (long)_PyLong_CompactValue((PyLongObject *)stop);
+        long long_step = (long)_PyLong_CompactValue((PyLongObject *)step);
+        return (long)get_len_of_range(long_start, long_stop, long_step);
+    }
+#endif
     int overflow = 0;
 
     long long_start = PyLong_AsLongAndOverflow(start, &overflow);
@@ -1228,6 +1239,20 @@ range_iter(PyObject *seq)
     unsigned long ulen;
 
     assert(PyRange_Check(seq));
+
+#if SIZEOF_LONG >= 8
+    if (_PyLong_CheckExactAndCompact(r->start) &&
+        _PyLong_CheckExactAndCompact(r->stop) &&
+        _PyLong_CheckExactAndCompact(r->step) &&
+        _PyLong_CheckExactAndCompact(r->length))
+    {
+        return fast_range_iter(
+            (long)_PyLong_CompactValue((PyLongObject *)r->start),
+            (long)_PyLong_CompactValue((PyLongObject *)r->stop),
+            (long)_PyLong_CompactValue((PyLongObject *)r->step),
+            (long)_PyLong_CompactValue((PyLongObject *)r->length));
+    }
+#endif
 
     /* If all three fields and the length convert to long, use the int
      * version */

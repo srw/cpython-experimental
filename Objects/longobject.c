@@ -169,10 +169,21 @@ long_alloc(Py_ssize_t size)
      * assume that there is always at least one digit present. */
     Py_ssize_t ndigits = size ? size : 1;
 
-    if (ndigits == 1) {
+    if (ndigits <= 2) {
+        Py_BUILD_ASSERT(sizeof(PyLongObject) >=
+                        offsetof(PyLongObject, long_value.ob_digit) + 2 * sizeof(digit));
         result = (PyLongObject *)_Py_FREELIST_POP(PyLongObject, ints);
+        if (result == NULL) {
+            result = PyObject_Malloc(sizeof(PyLongObject));
+            if (!result) {
+                PyErr_NoMemory();
+                return NULL;
+            }
+            _PyObject_Init((PyObject*)result, &PyLong_Type);
+            _PyLong_InitTag(result);
+        }
     }
-    if (result == NULL) {
+    else {
         /* Number of bytes needed is: offsetof(PyLongObject, ob_digit) +
         sizeof(digit)*size.  Previous incarnations of this code used
         sizeof() instead of the offsetof, but this risks being
@@ -247,7 +258,7 @@ _PyLong_Copy(PyLongObject *src)
     return (PyObject *)result;
 }
 
-static PyObject *
+static inline Py_ALWAYS_INLINE PyObject *
 _PyLong_FromMedium(sdigit x)
 {
     assert(!IS_SMALL_INT(x));
@@ -289,6 +300,15 @@ _PyLong_FromLarge(stwodigits ival)
     /* Must be at least two digits */
     assert(abs_ival >> PyLong_SHIFT != 0);
     twodigits t = abs_ival >> (PyLong_SHIFT * 2);
+    if (__builtin_expect(t == 0, 1)) {
+        PyLongObject *v = (PyLongObject *)_Py_FREELIST_POP(PyLongObject, ints);
+        if (__builtin_expect(v != NULL, 1)) {
+            _PyLong_SetSignAndDigitCount(v, sign, 2);
+            v->long_value.ob_digit[0] = (digit)(abs_ival & PyLong_MASK);
+            v->long_value.ob_digit[1] = (digit)(abs_ival >> PyLong_SHIFT);
+            return (PyObject *)v;
+        }
+    }
     Py_ssize_t ndigits = 2;
     while (t) {
         ++ndigits;
@@ -324,7 +344,7 @@ _PyLong_FromSTwoDigits(stwodigits x)
 
 /* Create a new medium int object from a medium int.
  * Do not raise. Return NULL if not medium or can't allocate. */
-static inline _PyStackRef
+static inline Py_ALWAYS_INLINE _PyStackRef
 medium_from_stwodigits(stwodigits x)
 {
     if (IS_SMALL_INT(x)) {
@@ -3640,7 +3660,7 @@ _PyLong_ExactDealloc(PyObject *self)
         _Py_SetImmortal(self);
         return;
     }
-    if (_PyLong_IsCompact((PyLongObject *)self)) {
+    if (_PyLong_DigitCount((PyLongObject *)self) <= 2) {
         _Py_FREELIST_FREE(ints, self, PyObject_Free);
         return;
     }
@@ -3660,7 +3680,7 @@ long_dealloc(PyObject *self)
         _Py_SetImmortal(self);
         return;
     }
-    if (PyLong_CheckExact(self) && _PyLong_IsCompact((PyLongObject *)self)) {
+    if (PyLong_CheckExact(self) && _PyLong_DigitCount((PyLongObject *)self) <= 2) {
         _Py_FREELIST_FREE(ints, self, PyObject_Free);
         return;
     }
@@ -3756,6 +3776,22 @@ x_add(PyLongObject *a, PyLongObject *b)
         { Py_ssize_t size_temp = size_a;
             size_a = size_b;
             size_b = size_temp; }
+    }
+    if (size_a == 2) {
+        twodigits val_a = ((twodigits)a->long_value.ob_digit[1] << PyLong_SHIFT) |
+                          a->long_value.ob_digit[0];
+        twodigits val_b = (size_b == 2)
+            ? (((twodigits)b->long_value.ob_digit[1] << PyLong_SHIFT) | b->long_value.ob_digit[0])
+            : (size_b == 1 ? b->long_value.ob_digit[0] : 0);
+        twodigits sum = val_a + val_b;
+        if (__builtin_expect((sum >> (2 * PyLong_SHIFT)) == 0, 1)) {
+            z = long_alloc(2);
+            if (z != NULL) {
+                z->long_value.ob_digit[0] = (digit)(sum & PyLong_MASK);
+                z->long_value.ob_digit[1] = (digit)(sum >> PyLong_SHIFT);
+            }
+            return z;
+        }
     }
     z = long_alloc(size_a+1);
     if (z == NULL)
@@ -4344,6 +4380,22 @@ long_mul(PyLongObject *a, PyLongObject *b)
         stwodigits v = medium_value(a) * medium_value(b);
         return _PyLong_FromSTwoDigits(v);
     }
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    if ((a->long_value.lv_tag | b->long_value.lv_tag) < (3 << _PyLong_NON_SIZE_BITS)) {
+        twodigits ma = _PyLong_IsCompact(a)
+            ? (a->long_value.lv_tag < (1 << _PyLong_NON_SIZE_BITS) ? 0 : a->long_value.ob_digit[0])
+            : (((twodigits)a->long_value.ob_digit[1] << PyLong_SHIFT) | a->long_value.ob_digit[0]);
+        twodigits mb = _PyLong_IsCompact(b)
+            ? (b->long_value.lv_tag < (1 << _PyLong_NON_SIZE_BITS) ? 0 : b->long_value.ob_digit[0])
+            : (((twodigits)b->long_value.ob_digit[1] << PyLong_SHIFT) | b->long_value.ob_digit[0]);
+        unsigned __int128 prod = (unsigned __int128)ma * (unsigned __int128)mb;
+        if ((prod >> (2 * PyLong_SHIFT)) == 0) {
+            int sign = _PyLong_SameSign(a, b) ? 1 : -1;
+            stwodigits sval = sign > 0 ? (stwodigits)prod : -(stwodigits)prod;
+            return _PyLong_FromSTwoDigits(sval);
+        }
+    }
+#endif
 
     PyLongObject *z = k_mul(a, b);
     /* Negate if exactly one of the inputs is negative. */
@@ -5577,6 +5629,27 @@ long_bitwise(PyLongObject *a,
 
     PyLongObject *new_a = NULL;
     PyLongObject *new_b = NULL;
+
+    if ((a->long_value.lv_tag | b->long_value.lv_tag) < (3 << _PyLong_NON_SIZE_BITS)) {
+        stwodigits va = _PyLong_IsCompact(a)
+            ? medium_value(a)
+            : ((a->long_value.lv_tag & _PyLong_SIGN_MASK) == 0
+               ? (stwodigits)(((twodigits)a->long_value.ob_digit[1] << PyLong_SHIFT) | a->long_value.ob_digit[0])
+               : -(stwodigits)(((twodigits)a->long_value.ob_digit[1] << PyLong_SHIFT) | a->long_value.ob_digit[0]));
+        stwodigits vb = _PyLong_IsCompact(b)
+            ? medium_value(b)
+            : ((b->long_value.lv_tag & _PyLong_SIGN_MASK) == 0
+               ? (stwodigits)(((twodigits)b->long_value.ob_digit[1] << PyLong_SHIFT) | b->long_value.ob_digit[0])
+               : -(stwodigits)(((twodigits)b->long_value.ob_digit[1] << PyLong_SHIFT) | b->long_value.ob_digit[0]));
+        stwodigits vc;
+        switch (op) {
+            case '&': vc = va & vb; break;
+            case '|': vc = va | vb; break;
+            case '^': vc = va ^ vb; break;
+            default: Py_UNREACHABLE();
+        }
+        return (PyObject *)_PyLong_FromSTwoDigits(vc);
+    }
 
     /* Bitwise operations for negative numbers operate as though
        on a two's complement representation.  So convert arguments

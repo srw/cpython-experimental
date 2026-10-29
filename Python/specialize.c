@@ -8,6 +8,7 @@
 #include "pycore_critical_section.h"
 #include "pycore_descrobject.h"   // _PyMethodWrapper_Type
 #include "pycore_dict.h"          // DICT_KEYS_UNICODE
+#include "pycore_freelist.h"      // _Py_FREELIST_POP
 #include "pycore_function.h"      // _PyFunction_GetVersionForCurrentState()
 #include "pycore_interpframe.h"   // FRAME_SPECIALS_SIZE
 #include "pycore_lazyimportobject.h" // PyLazyImport_CheckExact
@@ -2158,23 +2159,64 @@ SEQ_INT_MULTIPLY_ACTION(int_tuple_multiply, _PyTuple_Repeat,   rhs, lhs)
 #undef SEQ_INT_MULTIPLY_ACTION
 
 static int
-compactlongs_guard(PyObject *lhs, PyObject *rhs)
+nonzero_compactlongs_guard(PyObject *lhs, PyObject *rhs)
 {
-    return (is_compactlong(lhs) && is_compactlong(rhs));
+    return (is_compactlong(lhs) && is_compactlong(rhs) &&
+            !_PyLong_IsZero((PyLongObject *)rhs));
 }
 
-#define BITWISE_LONGS_ACTION(NAME, OP) \
-    static PyObject * \
-    (NAME)(PyObject *lhs, PyObject *rhs) \
-    { \
-        Py_ssize_t rhs_val = _PyLong_CompactValue((PyLongObject *)rhs); \
-        Py_ssize_t lhs_val = _PyLong_CompactValue((PyLongObject *)lhs); \
-        return PyLong_FromSsize_t(lhs_val OP rhs_val); \
+static inline Py_ALWAYS_INLINE PyObject *
+compactlong_from_ssize_t(Py_ssize_t val)
+{
+    if (_PY_IS_SMALL_INT(val)) {
+        return (PyObject *)&_PyLong_SMALL_INTS[_PY_NSMALLNEGINTS + val];
     }
-BITWISE_LONGS_ACTION(compactlongs_or, |)
-BITWISE_LONGS_ACTION(compactlongs_and, &)
-BITWISE_LONGS_ACTION(compactlongs_xor, ^)
-#undef BITWISE_LONGS_ACTION
+    if (((twodigits)val + PyLong_MASK) < ((twodigits)PyLong_MASK + PyLong_BASE)) {
+        PyLongObject *v = _Py_FREELIST_POP(PyLongObject, ints);
+        if (__builtin_expect(v != NULL, 1)) {
+            _PyLong_SetSignAndDigitCount(v, val < 0 ? -1 : 1, 1);
+            v->long_value.ob_digit[0] = (digit)(val < 0 ? -(twodigits)val : (twodigits)val);
+            return (PyObject *)v;
+        }
+    }
+    return PyLong_FromSsize_t(val);
+}
+
+static inline Py_ALWAYS_INLINE PyObject *
+float_from_double_fast(double val)
+{
+    PyFloatObject *op = _Py_FREELIST_POP(PyFloatObject, floats);
+    if (__builtin_expect(op != NULL, 1)) {
+        op->ob_fval = val;
+        return (PyObject *)op;
+    }
+    return PyFloat_FromDouble(val);
+}
+
+static PyObject *
+compactlongs_floor_div(PyObject *lhs, PyObject *rhs)
+{
+    Py_ssize_t lhs_val = _PyLong_CompactValue((PyLongObject *)lhs);
+    Py_ssize_t rhs_val = _PyLong_CompactValue((PyLongObject *)rhs);
+    Py_ssize_t q = lhs_val / rhs_val;
+    Py_ssize_t r = lhs_val % rhs_val;
+    if (r != 0 && ((lhs_val ^ rhs_val) < 0)) {
+        q -= 1;
+    }
+    return compactlong_from_ssize_t(q);
+}
+
+static PyObject *
+compactlongs_modulo(PyObject *lhs, PyObject *rhs)
+{
+    Py_ssize_t lhs_val = _PyLong_CompactValue((PyLongObject *)lhs);
+    Py_ssize_t rhs_val = _PyLong_CompactValue((PyLongObject *)rhs);
+    Py_ssize_t r = lhs_val % rhs_val;
+    if (r != 0 && ((lhs_val ^ rhs_val) < 0)) {
+        r += rhs_val;
+    }
+    return compactlong_from_ssize_t(r);
+}
 
 /* float-long */
 
@@ -2203,7 +2245,7 @@ nonzero_float_compactlong_guard(PyObject *lhs, PyObject *rhs)
     { \
         double lhs_val = PyFloat_AS_DOUBLE(lhs); \
         Py_ssize_t rhs_val = _PyLong_CompactValue((PyLongObject *)rhs); \
-        return PyFloat_FromDouble(lhs_val OP rhs_val); \
+        return float_from_double_fast(lhs_val OP rhs_val); \
     }
 FLOAT_LONG_ACTION(float_compactlong_add, +)
 FLOAT_LONG_ACTION(float_compactlong_subtract, -)
@@ -2238,7 +2280,7 @@ nonzero_compactlong_float_guard(PyObject *lhs, PyObject *rhs)
     { \
         double rhs_val = PyFloat_AS_DOUBLE(rhs); \
         Py_ssize_t lhs_val = _PyLong_CompactValue((PyLongObject *)lhs); \
-        return PyFloat_FromDouble(lhs_val OP rhs_val); \
+        return float_from_double_fast(lhs_val OP rhs_val); \
     }
 LONG_FLOAT_ACTION(compactlong_float_add, +)
 LONG_FLOAT_ACTION(compactlong_float_subtract, -)
@@ -2246,15 +2288,215 @@ LONG_FLOAT_ACTION(compactlong_float_multiply, *)
 LONG_FLOAT_ACTION(compactlong_float_true_div, /)
 #undef LONG_FLOAT_ACTION
 
+static inline Py_ALWAYS_INLINE PyObject *
+long_from_stwodigits_fast(stwodigits val)
+{
+    if (_PY_IS_SMALL_INT(val)) {
+        return (PyObject *)&_PyLong_SMALL_INTS[_PY_NSMALLNEGINTS + val];
+    }
+    twodigits abs_val = val < 0 ? 0U - (twodigits)val : (twodigits)val;
+    if (__builtin_expect((abs_val >> (2 * PyLong_SHIFT)) == 0, 1)) {
+        PyLongObject *v = _Py_FREELIST_POP(PyLongObject, ints);
+        if (__builtin_expect(v != NULL, 1)) {
+            int sign = val < 0 ? -1 : 1;
+            if ((abs_val >> PyLong_SHIFT) == 0) {
+                _PyLong_SetSignAndDigitCount(v, sign, 1);
+                v->long_value.ob_digit[0] = (digit)abs_val;
+            }
+            else {
+                _PyLong_SetSignAndDigitCount(v, sign, 2);
+                v->long_value.ob_digit[0] = (digit)(abs_val & PyLong_MASK);
+                v->long_value.ob_digit[1] = (digit)(abs_val >> PyLong_SHIFT);
+            }
+            return (PyObject *)v;
+        }
+    }
+    return PyLong_FromSsize_t((Py_ssize_t)val);
+}
+
+static inline Py_ALWAYS_INLINE stwodigits
+long_as_stwodigits_fast(const PyLongObject *op)
+{
+    assert(op->long_value.lv_tag < (3 << _PyLong_NON_SIZE_BITS));
+    if (__builtin_expect(_PyLong_IsCompact(op), 1)) {
+        return _PyLong_CompactValue(op);
+    }
+    twodigits mag = ((twodigits)op->long_value.ob_digit[1] << PyLong_SHIFT) |
+                    op->long_value.ob_digit[0];
+    return (op->long_value.lv_tag & _PyLong_SIGN_MASK) == 0
+           ? (stwodigits)mag
+           : -(stwodigits)mag;
+}
+
+static PyObject *
+long_add_fast(PyObject *lhs, PyObject *rhs)
+{
+    PyLongObject *a = (PyLongObject *)lhs;
+    PyLongObject *b = (PyLongObject *)rhs;
+    if (_PyLong_BothAreCompact(a, b)) {
+        return compactlong_from_ssize_t(
+            _PyLong_CompactValue(a) + _PyLong_CompactValue(b));
+    }
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    if ((a->long_value.lv_tag | b->long_value.lv_tag) < (3 << _PyLong_NON_SIZE_BITS)) {
+        stwodigits x = long_as_stwodigits_fast(a) + long_as_stwodigits_fast(b);
+        const stwodigits max_2digit = ((stwodigits)1 << (2 * PyLong_SHIFT)) - 1;
+        if (__builtin_expect(x >= -max_2digit && x <= max_2digit, 1)) {
+            return long_from_stwodigits_fast(x);
+        }
+    }
+#endif
+    return PyLong_Type.tp_as_number->nb_add(lhs, rhs);
+}
+
+static PyObject *
+long_subtract_fast(PyObject *lhs, PyObject *rhs)
+{
+    PyLongObject *a = (PyLongObject *)lhs;
+    PyLongObject *b = (PyLongObject *)rhs;
+    if (_PyLong_BothAreCompact(a, b)) {
+        return compactlong_from_ssize_t(
+            _PyLong_CompactValue(a) - _PyLong_CompactValue(b));
+    }
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    if ((a->long_value.lv_tag | b->long_value.lv_tag) < (3 << _PyLong_NON_SIZE_BITS)) {
+        stwodigits x = long_as_stwodigits_fast(a) - long_as_stwodigits_fast(b);
+        const stwodigits max_2digit = ((stwodigits)1 << (2 * PyLong_SHIFT)) - 1;
+        if (__builtin_expect(x >= -max_2digit && x <= max_2digit, 1)) {
+            return long_from_stwodigits_fast(x);
+        }
+    }
+#endif
+    return PyLong_Type.tp_as_number->nb_subtract(lhs, rhs);
+}
+
+static PyObject *
+long_multiply_fast(PyObject *lhs, PyObject *rhs)
+{
+    PyLongObject *a = (PyLongObject *)lhs;
+    PyLongObject *b = (PyLongObject *)rhs;
+    if (_PyLong_BothAreCompact(a, b)) {
+        return long_from_stwodigits_fast(
+            (stwodigits)_PyLong_CompactValue(a) * (stwodigits)_PyLong_CompactValue(b));
+    }
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    if ((a->long_value.lv_tag | b->long_value.lv_tag) < (3 << _PyLong_NON_SIZE_BITS)) {
+        __int128 prod = (__int128)long_as_stwodigits_fast(a) * (__int128)long_as_stwodigits_fast(b);
+        const stwodigits max_2digit = ((stwodigits)1 << (2 * PyLong_SHIFT)) - 1;
+        if (__builtin_expect(prod >= -max_2digit && prod <= max_2digit, 1)) {
+            return long_from_stwodigits_fast((stwodigits)prod);
+        }
+    }
+#endif
+    return PyLong_Type.tp_as_number->nb_multiply(lhs, rhs);
+}
+
+static PyObject *
+long_and_fast(PyObject *lhs, PyObject *rhs)
+{
+    PyLongObject *a = (PyLongObject *)lhs;
+    PyLongObject *b = (PyLongObject *)rhs;
+    if (_PyLong_BothAreCompact(a, b)) {
+        return compactlong_from_ssize_t(
+            _PyLong_CompactValue(a) & _PyLong_CompactValue(b));
+    }
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    if ((a->long_value.lv_tag | b->long_value.lv_tag) < (3 << _PyLong_NON_SIZE_BITS)) {
+        return long_from_stwodigits_fast(
+            long_as_stwodigits_fast(a) & long_as_stwodigits_fast(b));
+    }
+#endif
+    return PyLong_Type.tp_as_number->nb_and(lhs, rhs);
+}
+
+static PyObject *
+long_or_fast(PyObject *lhs, PyObject *rhs)
+{
+    PyLongObject *a = (PyLongObject *)lhs;
+    PyLongObject *b = (PyLongObject *)rhs;
+    if (_PyLong_BothAreCompact(a, b)) {
+        return compactlong_from_ssize_t(
+            _PyLong_CompactValue(a) | _PyLong_CompactValue(b));
+    }
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    if ((a->long_value.lv_tag | b->long_value.lv_tag) < (3 << _PyLong_NON_SIZE_BITS)) {
+        return long_from_stwodigits_fast(
+            long_as_stwodigits_fast(a) | long_as_stwodigits_fast(b));
+    }
+#endif
+    return PyLong_Type.tp_as_number->nb_or(lhs, rhs);
+}
+
+static PyObject *
+long_xor_fast(PyObject *lhs, PyObject *rhs)
+{
+    PyLongObject *a = (PyLongObject *)lhs;
+    PyLongObject *b = (PyLongObject *)rhs;
+    if (_PyLong_BothAreCompact(a, b)) {
+        return compactlong_from_ssize_t(
+            _PyLong_CompactValue(a) ^ _PyLong_CompactValue(b));
+    }
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    if ((a->long_value.lv_tag | b->long_value.lv_tag) < (3 << _PyLong_NON_SIZE_BITS)) {
+        return long_from_stwodigits_fast(
+            long_as_stwodigits_fast(a) ^ long_as_stwodigits_fast(b));
+    }
+#endif
+    return PyLong_Type.tp_as_number->nb_xor(lhs, rhs);
+}
+
+static PyObject *
+long_rshift_fast(PyObject *lhs, PyObject *rhs)
+{
+    PyLongObject *a = (PyLongObject *)lhs;
+    PyLongObject *b = (PyLongObject *)rhs;
+    if (_PyLong_BothAreCompact(a, b)) {
+        Py_ssize_t rval = _PyLong_CompactValue(b);
+        if (__builtin_expect((size_t)rval < PyLong_SHIFT, 1)) {
+            return compactlong_from_ssize_t(_PyLong_CompactValue(a) >> rval);
+        }
+    }
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    if ((a->long_value.lv_tag | b->long_value.lv_tag) < (3 << _PyLong_NON_SIZE_BITS)) {
+        stwodigits rval = long_as_stwodigits_fast(b);
+        if (__builtin_expect((size_t)rval < 2 * PyLong_SHIFT, 1)) {
+            return long_from_stwodigits_fast(long_as_stwodigits_fast(a) >> rval);
+        }
+    }
+#endif
+    return PyLong_Type.tp_as_number->nb_rshift(lhs, rhs);
+}
+
+static PyObject *
+long_lshift_fast(PyObject *lhs, PyObject *rhs)
+{
+    PyLongObject *a = (PyLongObject *)lhs;
+    PyLongObject *b = (PyLongObject *)rhs;
+    if (_PyLong_BothAreCompact(a, b)) {
+        Py_ssize_t rval = _PyLong_CompactValue(b);
+        if (__builtin_expect((size_t)rval < PyLong_SHIFT, 1)) {
+            return long_from_stwodigits_fast((stwodigits)_PyLong_CompactValue(a) << rval);
+        }
+    }
+    return PyLong_Type.tp_as_number->nb_lshift(lhs, rhs);
+}
+
 static _PyBinaryOpSpecializationDescr binaryop_extend_descrs[] = {
-    /* long-long arithmetic: guards also check _PyLong_IsCompact, so
-       type alone is not sufficient to eliminate the guard. */
-    {NB_OR, compactlongs_guard, compactlongs_or, &PyLong_Type, 1, NULL, NULL},
-    {NB_AND, compactlongs_guard, compactlongs_and, &PyLong_Type, 1, NULL, NULL},
-    {NB_XOR, compactlongs_guard, compactlongs_xor, &PyLong_Type, 1, NULL, NULL},
-    {NB_INPLACE_OR, compactlongs_guard, compactlongs_or, &PyLong_Type, 1, NULL, NULL},
-    {NB_INPLACE_AND, compactlongs_guard, compactlongs_and, &PyLong_Type, 1, NULL, NULL},
-    {NB_INPLACE_XOR, compactlongs_guard, compactlongs_xor, &PyLong_Type, 1, NULL, NULL},
+    /* long-long bitwise and shift operations (1-digit, 2-digit, and multi-digit fallback) */
+    {NB_OR, NULL, long_or_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_AND, NULL, long_and_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_XOR, NULL, long_xor_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_RSHIFT, NULL, long_rshift_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_LSHIFT, NULL, long_lshift_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_FLOOR_DIVIDE, nonzero_compactlongs_guard, compactlongs_floor_div, &PyLong_Type, 1, NULL, NULL},
+    {NB_REMAINDER, nonzero_compactlongs_guard, compactlongs_modulo, &PyLong_Type, 1, NULL, NULL},
+    {NB_INPLACE_OR, NULL, long_or_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_INPLACE_AND, NULL, long_and_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_INPLACE_XOR, NULL, long_xor_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_INPLACE_RSHIFT, NULL, long_rshift_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_INPLACE_LSHIFT, NULL, long_lshift_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_INPLACE_FLOOR_DIVIDE, nonzero_compactlongs_guard, compactlongs_floor_div, &PyLong_Type, 1, NULL, NULL},
+    {NB_INPLACE_REMAINDER, nonzero_compactlongs_guard, compactlongs_modulo, &PyLong_Type, 1, NULL, NULL},
 
     /* float-long arithmetic: guards also check NaN and compactness. */
     {NB_ADD, float_compactlong_guard, float_compactlong_add, &PyFloat_Type, 1, NULL, NULL},
@@ -2312,6 +2554,14 @@ static _PyBinaryOpSpecializationDescr binaryop_extend_descrs[] = {
     /* dict | dict */
     {NB_OR, NULL, _PyDict_Or, &PyDict_Type, 1, &PyDict_Type, &PyDict_Type},
     {NB_INPLACE_OR, NULL, _PyDict_IOr, &PyDict_Type, 0, &PyDict_Type, &PyDict_Type},
+
+    /* multi-digit long-long fallback when BINARY_OP_ADD/SUBTRACT/MULTIPLY_INT deopts */
+    {NB_ADD, NULL, long_add_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_SUBTRACT, NULL, long_subtract_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_MULTIPLY, NULL, long_multiply_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_INPLACE_ADD, NULL, long_add_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_INPLACE_SUBTRACT, NULL, long_subtract_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
+    {NB_INPLACE_MULTIPLY, NULL, long_multiply_fast, &PyLong_Type, 0, &PyLong_Type, &PyLong_Type},
 };
 
 static int

@@ -2,6 +2,7 @@
 
 #include "Python.h"
 #include "pycore_call.h"          // _PyObject_CallNoArgs()
+#include "pycore_freelist.h"      // _Py_FREELIST_POP()
 #include "pycore_long.h"          // _PyLong_GetOne()
 #include "pycore_modsupport.h"    // _PyArg_NoKwnames()
 #include "pycore_object.h"        // _PyObject_GC_TRACK()
@@ -165,6 +166,23 @@ enum_next_long(enumobject *en, PyObject* next_item)
     return _PyTuple_FromPairSteal(next_index, next_item);
 }
 
+static inline Py_ALWAYS_INLINE PyObject *
+enum_index_from_ssize_t(Py_ssize_t val)
+{
+    if (_PY_IS_SMALL_INT(val)) {
+        return (PyObject *)&_PyLong_SMALL_INTS[_PY_NSMALLNEGINTS + val];
+    }
+    if ((stwodigits)val > 0 && (stwodigits)val <= (stwodigits)PyLong_MASK) {
+        PyLongObject *v = _Py_FREELIST_POP(PyLongObject, ints);
+        if (__builtin_expect(v != NULL, 1)) {
+            _PyLong_SetSignAndDigitCount(v, 1, 1);
+            v->long_value.ob_digit[0] = (digit)val;
+            return (PyObject *)v;
+        }
+    }
+    return PyLong_FromSsize_t(val);
+}
+
 static PyObject *
 enum_next(PyObject *op)
 {
@@ -184,7 +202,7 @@ enum_next(PyObject *op)
     if (en_index == PY_SSIZE_T_MAX)
         return enum_next_long(en, next_item);
 
-    next_index = PyLong_FromSsize_t(en_index);
+    next_index = enum_index_from_ssize_t(en_index);
     if (next_index == NULL) {
         Py_DECREF(next_item);
         return NULL;
