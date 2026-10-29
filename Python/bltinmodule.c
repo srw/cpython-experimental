@@ -18,6 +18,7 @@
 #include "pycore_pyerrors.h"      // _PyErr_NoMemory()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
 #include "pycore_pythonrun.h"     // _Py_SourceAsString()
+#include "pycore_range.h"         // _PyRangeIterObject
 #include "pycore_sysmodule.h"     // _PySys_DispatchMapArray()
 #include "pycore_tuple.h"         // _PyTuple_Recycle()
 
@@ -378,6 +379,43 @@ builtin_abs(PyObject *module, PyObject *number)
 static int _py_map_try_any_all(PyObject *iterable, int is_any, PyObject **out_res);
 #endif
 
+static inline int
+seq_can_read_items_fast(PyObject *seq)
+{
+    if (PyTuple_CheckExact(seq)) {
+        return 1;
+    }
+    if (PyList_CheckExact(seq)) {
+#ifdef Py_GIL_DISABLED
+        return _Py_IsOwnedByCurrentThread(seq) || !_PyObject_GC_IS_SHARED(seq);
+#else
+        return 1;
+#endif
+    }
+    return 0;
+}
+
+static inline int
+item_is_true_fast(PyObject *item)
+{
+    if (item == Py_True) {
+        return 1;
+    }
+    if (item == Py_False || item == Py_None) {
+        return 0;
+    }
+    if (Py_IS_TYPE(item, &PyLong_Type)) {
+        return !_PyLong_IsZero((PyLongObject *)item);
+    }
+    if (Py_IS_TYPE(item, &PyFloat_Type)) {
+        return PyFloat_AS_DOUBLE(item) != 0.0;
+    }
+    if (Py_IS_TYPE(item, &PyUnicode_Type)) {
+        return PyUnicode_GET_LENGTH(item) != 0;
+    }
+    return -1;
+}
+
 /*[clinic input]
 all as builtin_all
 
@@ -396,6 +434,40 @@ builtin_all(PyObject *module, PyObject *iterable)
     PyObject *it, *item;
     PyObject *(*iternext)(PyObject *);
     int cmp;
+
+    if (seq_can_read_items_fast(iterable)) {
+        Py_ssize_t n = PyTuple_CheckExact(iterable)
+                       ? PyTuple_GET_SIZE(iterable)
+                       : PyList_GET_SIZE(iterable);
+        PyObject *const *items = PyTuple_CheckExact(iterable)
+                                 ? _PyTuple_ITEMS(iterable)
+                                 : (PyObject *const *)((PyListObject *)iterable)->ob_item;
+        Py_ssize_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            int c0 = item_is_true_fast(items[i]);
+            int c1 = item_is_true_fast(items[i + 1]);
+            int c2 = item_is_true_fast(items[i + 2]);
+            int c3 = item_is_true_fast(items[i + 3]);
+            if ((c0 | c1 | c2 | c3) < 0) {
+                break;
+            }
+            if ((c0 & c1 & c2 & c3) == 0) {
+                Py_RETURN_FALSE;
+            }
+        }
+        for (; i < n; i++) {
+            int c = item_is_true_fast(items[i]);
+            if (c < 0) {
+                break;
+            }
+            if (c == 0) {
+                Py_RETURN_FALSE;
+            }
+        }
+        if (i == n) {
+            Py_RETURN_TRUE;
+        }
+    }
 
 #ifdef Py_GIL_DISABLED
     if (Py_IS_TYPE(iterable, &PyMap_Type)) {
@@ -454,6 +526,40 @@ builtin_any(PyObject *module, PyObject *iterable)
     PyObject *it, *item;
     PyObject *(*iternext)(PyObject *);
     int cmp;
+
+    if (seq_can_read_items_fast(iterable)) {
+        Py_ssize_t n = PyTuple_CheckExact(iterable)
+                       ? PyTuple_GET_SIZE(iterable)
+                       : PyList_GET_SIZE(iterable);
+        PyObject *const *items = PyTuple_CheckExact(iterable)
+                                 ? _PyTuple_ITEMS(iterable)
+                                 : (PyObject *const *)((PyListObject *)iterable)->ob_item;
+        Py_ssize_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            int c0 = item_is_true_fast(items[i]);
+            int c1 = item_is_true_fast(items[i + 1]);
+            int c2 = item_is_true_fast(items[i + 2]);
+            int c3 = item_is_true_fast(items[i + 3]);
+            if ((c0 | c1 | c2 | c3) < 0) {
+                break;
+            }
+            if ((c0 | c1 | c2 | c3) != 0) {
+                Py_RETURN_TRUE;
+            }
+        }
+        for (; i < n; i++) {
+            int c = item_is_true_fast(items[i]);
+            if (c < 0) {
+                break;
+            }
+            if (c > 0) {
+                Py_RETURN_TRUE;
+            }
+        }
+        if (i == n) {
+            Py_RETURN_FALSE;
+        }
+    }
 
 #ifdef Py_GIL_DISABLED
     if (Py_IS_TYPE(iterable, &PyMap_Type)) {
@@ -2420,6 +2526,104 @@ min_max(PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames, int op)
         keyfunc = NULL;
     }
 
+    if (keyfunc == NULL) {
+        PyObject *const *fast_items = NULL;
+        Py_ssize_t fast_n = 0;
+        if (positional) {
+            fast_items = args;
+            fast_n = nargs;
+        }
+        else if (seq_can_read_items_fast(args[0])) {
+            fast_n = PyTuple_CheckExact(args[0])
+                     ? PyTuple_GET_SIZE(args[0])
+                     : PyList_GET_SIZE(args[0]);
+            fast_items = PyTuple_CheckExact(args[0])
+                         ? _PyTuple_ITEMS(args[0])
+                         : (PyObject *const *)((PyListObject *)args[0])->ob_item;
+        }
+        if (fast_items != NULL && fast_n > 0) {
+            PyObject *first = fast_items[0];
+            if (Py_IS_TYPE(first, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)first)) {
+                Py_ssize_t best_val = _PyLong_CompactValue((PyLongObject *)first);
+                PyObject *best_obj = first;
+                Py_ssize_t i = 1;
+                if (op == Py_LT) {
+                    for (; i < fast_n; i++) {
+                        PyObject *cur = fast_items[i];
+                        if (!Py_IS_TYPE(cur, &PyLong_Type) || !_PyLong_IsCompact((PyLongObject *)cur)) {
+                            break;
+                        }
+                        Py_ssize_t v = _PyLong_CompactValue((PyLongObject *)cur);
+                        if (v < best_val) {
+                            best_val = v;
+                            best_obj = cur;
+                        }
+                    }
+                }
+                else {
+                    for (; i < fast_n; i++) {
+                        PyObject *cur = fast_items[i];
+                        if (!Py_IS_TYPE(cur, &PyLong_Type) || !_PyLong_IsCompact((PyLongObject *)cur)) {
+                            break;
+                        }
+                        Py_ssize_t v = _PyLong_CompactValue((PyLongObject *)cur);
+                        if (v > best_val) {
+                            best_val = v;
+                            best_obj = cur;
+                        }
+                    }
+                }
+                if (i == fast_n) {
+                    Py_XDECREF(it);
+                    return Py_NewRef(best_obj);
+                }
+            }
+            else if (Py_IS_TYPE(first, &PyFloat_Type)) {
+                double best_val = PyFloat_AS_DOUBLE(first);
+                if (!isnan(best_val)) {
+                    PyObject *best_obj = first;
+                    Py_ssize_t i = 1;
+                    if (op == Py_LT) {
+                        for (; i < fast_n; i++) {
+                            PyObject *cur = fast_items[i];
+                            if (!Py_IS_TYPE(cur, &PyFloat_Type)) {
+                                break;
+                            }
+                            double v = PyFloat_AS_DOUBLE(cur);
+                            if (isnan(v)) {
+                                break;
+                            }
+                            if (v < best_val) {
+                                best_val = v;
+                                best_obj = cur;
+                            }
+                        }
+                    }
+                    else {
+                        for (; i < fast_n; i++) {
+                            PyObject *cur = fast_items[i];
+                            if (!Py_IS_TYPE(cur, &PyFloat_Type)) {
+                                break;
+                            }
+                            double v = PyFloat_AS_DOUBLE(cur);
+                            if (isnan(v)) {
+                                break;
+                            }
+                            if (v > best_val) {
+                                best_val = v;
+                                best_obj = cur;
+                            }
+                        }
+                    }
+                    if (i == fast_n) {
+                        Py_XDECREF(it);
+                        return Py_NewRef(best_obj);
+                    }
+                }
+            }
+        }
+    }
+
 #ifdef Py_GIL_DISABLED
     if (keyfunc != NULL && _py_map_is_parallelizable_callable(keyfunc)) {
         PyObject *const *seq_items = NULL;
@@ -3377,6 +3581,99 @@ builtin_sum_impl(PyObject *module, PyObject *iterable, PyObject *start)
         if (overflow == 0) {
             Py_SETREF(result, NULL);
         }
+        if (result == NULL) {
+#if defined(__SIZEOF_INT128__)
+            if (Py_IS_TYPE(iter, &PyRangeIter_Type)) {
+                _PyRangeIterObject *rit = (_PyRangeIterObject *)iter;
+                long n = rit->len;
+                if (n > 0) {
+                    __int128 first = (__int128)rit->start;
+                    __int128 step = (__int128)rit->step;
+                    __int128 count = (__int128)n;
+                    __int128 total = (__int128)i_result + count * first +
+                                     (count * (count - 1) / 2) * step;
+                    if (total >= (__int128)PY_SSIZE_T_MIN &&
+                        total <= (__int128)PY_SSIZE_T_MAX)
+                    {
+                        rit->start = (long)(first + count * step);
+                        rit->len = 0;
+                        Py_DECREF(iter);
+                        return PyLong_FromSsize_t((Py_ssize_t)total);
+                    }
+                }
+                else {
+                    Py_DECREF(iter);
+                    return PyLong_FromSsize_t(i_result);
+                }
+            }
+#endif
+            if (Py_IS_TYPE(iter, &PyListIter_Type) || Py_IS_TYPE(iter, &PyTupleIter_Type)) {
+                int is_tuple = Py_IS_TYPE(iter, &PyTupleIter_Type);
+                PyObject *seq = is_tuple
+                                ? (PyObject *)((_PyTupleIterObject *)iter)->it_seq
+                                : (PyObject *)((_PyListIterObject *)iter)->it_seq;
+                if (seq != NULL && seq_can_read_items_fast(seq)) {
+                    Py_ssize_t idx = is_tuple
+                                     ? ((_PyTupleIterObject *)iter)->it_index
+                                     : ((_PyListIterObject *)iter)->it_index;
+                    Py_ssize_t n = is_tuple ? PyTuple_GET_SIZE(seq) : PyList_GET_SIZE(seq);
+                    PyObject *const *items = is_tuple
+                                             ? _PyTuple_ITEMS(seq)
+                                             : (PyObject *const *)((PyListObject *)seq)->ob_item;
+                    while (idx + 4 <= n) {
+                        PyObject *o0 = items[idx];
+                        PyObject *o1 = items[idx + 1];
+                        PyObject *o2 = items[idx + 2];
+                        PyObject *o3 = items[idx + 3];
+                        if (Py_IS_TYPE(o0, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)o0) &&
+                            Py_IS_TYPE(o1, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)o1) &&
+                            Py_IS_TYPE(o2, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)o2) &&
+                            Py_IS_TYPE(o3, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)o3))
+                        {
+                            Py_ssize_t v0 = _PyLong_CompactValue((PyLongObject *)o0);
+                            Py_ssize_t v1 = _PyLong_CompactValue((PyLongObject *)o1);
+                            Py_ssize_t v2 = _PyLong_CompactValue((PyLongObject *)o2);
+                            Py_ssize_t v3 = _PyLong_CompactValue((PyLongObject *)o3);
+                            /* Each compact int is < 2**30 (or < 2**15 on 32-bit),
+                             * so the 4-way sum cannot overflow Py_ssize_t. */
+                            Py_ssize_t s0123 = (v0 + v1) + (v2 + v3);
+                            if (i_result >= 0 ? (s0123 <= PY_SSIZE_T_MAX - i_result)
+                                              : (s0123 >= PY_SSIZE_T_MIN - i_result))
+                            {
+                                i_result += s0123;
+                                idx += 4;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    while (idx < n) {
+                        PyObject *obj = items[idx];
+                        if (Py_IS_TYPE(obj, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)obj)) {
+                            Py_ssize_t b = _PyLong_CompactValue((PyLongObject *)obj);
+                            if (i_result >= 0 ? (b <= PY_SSIZE_T_MAX - i_result)
+                                              : (b >= PY_SSIZE_T_MIN - i_result))
+                            {
+                                i_result += b;
+                                idx++;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    if (is_tuple) {
+                        ((_PyTupleIterObject *)iter)->it_index = idx;
+                    }
+                    else {
+                        ((_PyListIterObject *)iter)->it_index = idx;
+                    }
+                    if (idx == n) {
+                        Py_DECREF(iter);
+                        return PyLong_FromSsize_t(i_result);
+                    }
+                }
+            }
+        }
         while(result == NULL) {
             item = PyIter_Next(iter);
             if (item == NULL) {
@@ -3425,6 +3722,59 @@ builtin_sum_impl(PyObject *module, PyObject *iterable, PyObject *start)
     if (PyFloat_CheckExact(result)) {
         CompensatedSum re_sum = cs_from_double(PyFloat_AS_DOUBLE(result));
         Py_SETREF(result, NULL);
+        if (Py_IS_TYPE(iter, &PyListIter_Type) || Py_IS_TYPE(iter, &PyTupleIter_Type)) {
+            int is_tuple = Py_IS_TYPE(iter, &PyTupleIter_Type);
+            PyObject *seq = is_tuple
+                            ? (PyObject *)((_PyTupleIterObject *)iter)->it_seq
+                            : (PyObject *)((_PyListIterObject *)iter)->it_seq;
+            if (seq != NULL && seq_can_read_items_fast(seq)) {
+                Py_ssize_t idx = is_tuple
+                                 ? ((_PyTupleIterObject *)iter)->it_index
+                                 : ((_PyListIterObject *)iter)->it_index;
+                Py_ssize_t n = is_tuple ? PyTuple_GET_SIZE(seq) : PyList_GET_SIZE(seq);
+                PyObject *const *items = is_tuple
+                                         ? _PyTuple_ITEMS(seq)
+                                         : (PyObject *const *)((PyListObject *)seq)->ob_item;
+                while (idx + 4 <= n) {
+                    PyObject *o0 = items[idx];
+                    PyObject *o1 = items[idx + 1];
+                    PyObject *o2 = items[idx + 2];
+                    PyObject *o3 = items[idx + 3];
+                    if (Py_IS_TYPE(o0, &PyFloat_Type) &&
+                        Py_IS_TYPE(o1, &PyFloat_Type) &&
+                        Py_IS_TYPE(o2, &PyFloat_Type) &&
+                        Py_IS_TYPE(o3, &PyFloat_Type))
+                    {
+                        re_sum = cs_add(re_sum, PyFloat_AS_DOUBLE(o0));
+                        re_sum = cs_add(re_sum, PyFloat_AS_DOUBLE(o1));
+                        re_sum = cs_add(re_sum, PyFloat_AS_DOUBLE(o2));
+                        re_sum = cs_add(re_sum, PyFloat_AS_DOUBLE(o3));
+                        idx += 4;
+                        continue;
+                    }
+                    break;
+                }
+                while (idx < n) {
+                    PyObject *obj = items[idx];
+                    if (Py_IS_TYPE(obj, &PyFloat_Type)) {
+                        re_sum = cs_add(re_sum, PyFloat_AS_DOUBLE(obj));
+                        idx++;
+                        continue;
+                    }
+                    break;
+                }
+                if (is_tuple) {
+                    ((_PyTupleIterObject *)iter)->it_index = idx;
+                }
+                else {
+                    ((_PyListIterObject *)iter)->it_index = idx;
+                }
+                if (idx == n) {
+                    Py_DECREF(iter);
+                    return PyFloat_FromDouble(cs_to_double(re_sum));
+                }
+            }
+        }
         while(result == NULL) {
             item = PyIter_Next(iter);
             if (item == NULL) {

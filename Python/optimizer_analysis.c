@@ -831,6 +831,515 @@ remove_unneeded_uops(_PyUOpInstruction *buffer, int buffer_size)
     Py_UNREACHABLE();
 }
 
+static int
+hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stacklen)
+{
+    (void)curr_stacklen;
+    if (length < 4 ||
+        output[0].opcode != _START_EXECUTOR ||
+        output[1].opcode != _MAKE_WARM ||
+        output[length - 1].opcode != _JUMP_TO_TOP)
+    {
+        return length;
+    }
+
+    int first_idx = -1;
+    int non_nop_count = 0;
+    int type_guard_count = 0;
+    int pop_top_count = 0;
+    bool has_iter_check = false;
+    bool has_compare_op = false;
+    bool has_arith_binop = false;
+    bool can_peel_body = true;
+
+    bool written[64] = {0};
+    bool store_only_int[64];
+    bool store_only_float[64];
+    bool guarded_int[64] = {0};
+    bool guarded_float[64] = {0};
+    for (int v = 0; v < 64; v++) {
+        store_only_int[v] = true;
+        store_only_float[v] = true;
+    }
+
+    for (int i = 2; i < length - 1; i++) {
+        uint16_t op = output[i].opcode;
+        if (op == _NOP) {
+            continue;
+        }
+        if (first_idx < 0) {
+            first_idx = i;
+        }
+        non_nop_count++;
+        switch (op) {
+            case _ITER_CHECK_RANGE:
+            case _ITER_CHECK_LIST:
+            case _ITER_CHECK_TUPLE:
+                has_iter_check = true;
+                break;
+            case _COMPARE_OP_INT:
+            case _COMPARE_OP_FLOAT:
+                has_compare_op = true;
+                break;
+            case _GUARD_TOS_INT:
+            case _GUARD_NOS_INT:
+            case _GUARD_TOS_FLOAT:
+            case _GUARD_NOS_FLOAT:
+                type_guard_count++;
+                break;
+            case _LOAD_FAST:
+            case _LOAD_FAST_BORROW:
+                if (output[i].oparg >= 64) {
+                    can_peel_body = false;
+                }
+                break;
+            case _LOAD_FAST_0:
+            case _LOAD_FAST_1:
+            case _LOAD_FAST_2:
+            case _LOAD_FAST_3:
+            case _LOAD_FAST_4:
+            case _LOAD_FAST_5:
+            case _LOAD_FAST_6:
+            case _LOAD_FAST_7:
+            case _LOAD_FAST_BORROW_0:
+            case _LOAD_FAST_BORROW_1:
+            case _LOAD_FAST_BORROW_2:
+            case _LOAD_FAST_BORROW_3:
+            case _LOAD_FAST_BORROW_4:
+            case _LOAD_FAST_BORROW_5:
+            case _LOAD_FAST_BORROW_6:
+            case _LOAD_FAST_BORROW_7:
+                break;
+            case _SWAP_FAST:
+                if (output[i].oparg >= 64) {
+                    can_peel_body = false;
+                }
+                else {
+                    written[output[i].oparg] = true;
+                }
+                break;
+            case _SWAP_FAST_0:
+            case _SWAP_FAST_1:
+            case _SWAP_FAST_2:
+            case _SWAP_FAST_3:
+            case _SWAP_FAST_4:
+            case _SWAP_FAST_5:
+            case _SWAP_FAST_6:
+            case _SWAP_FAST_7:
+                written[op - _SWAP_FAST_0] = true;
+                break;
+            case _BINARY_OP_ADD_INT:
+            case _BINARY_OP_ADD_INT_INPLACE:
+            case _BINARY_OP_ADD_INT_INPLACE_RIGHT:
+            case _BINARY_OP_SUBTRACT_INT:
+            case _BINARY_OP_SUBTRACT_INT_INPLACE:
+            case _BINARY_OP_SUBTRACT_INT_INPLACE_RIGHT:
+            case _BINARY_OP_MULTIPLY_INT:
+            case _BINARY_OP_MULTIPLY_INT_INPLACE:
+            case _BINARY_OP_MULTIPLY_INT_INPLACE_RIGHT:
+            case _BINARY_OP_ADD_FLOAT:
+            case _BINARY_OP_ADD_FLOAT_INPLACE:
+            case _BINARY_OP_ADD_FLOAT_INPLACE_RIGHT:
+            case _BINARY_OP_SUBTRACT_FLOAT:
+            case _BINARY_OP_SUBTRACT_FLOAT_INPLACE:
+            case _BINARY_OP_SUBTRACT_FLOAT_INPLACE_RIGHT:
+            case _BINARY_OP_MULTIPLY_FLOAT:
+            case _BINARY_OP_MULTIPLY_FLOAT_INPLACE:
+            case _BINARY_OP_MULTIPLY_FLOAT_INPLACE_RIGHT:
+            case _BINARY_OP_TRUEDIV_FLOAT:
+            case _BINARY_OP_TRUEDIV_FLOAT_INPLACE:
+            case _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT:
+                has_arith_binop = true;
+                break;
+            case _SET_IP:
+            case _CHECK_PERIODIC:
+            case _CHECK_PERIODIC_IF_NOT_YIELD_FROM:
+            case _CHECK_VALIDITY:
+            case _TIER2_RESUME_CHECK:
+            case _GUARD_NOT_EXHAUSTED_RANGE:
+            case _GUARD_NOT_EXHAUSTED_LIST:
+            case _GUARD_NOT_EXHAUSTED_TUPLE:
+            case _ITER_NEXT_RANGE:
+            case _ITER_NEXT_LIST:
+            case _ITER_NEXT_LIST_TIER_TWO:
+            case _ITER_NEXT_TUPLE:
+            case _LOAD_SMALL_INT:
+            case _LOAD_CONST_INLINE:
+            case _LOAD_CONST_INLINE_BORROW:
+            case _UNARY_NEGATIVE_FLOAT_INPLACE:
+                break;
+            case _POP_TOP:
+                pop_top_count++;
+                break;
+            case _POP_TOP_NOP:
+            case _POP_TOP_INT:
+            case _POP_TOP_FLOAT:
+            case _GUARD_IS_TRUE_POP:
+            case _GUARD_IS_FALSE_POP:
+            case _GUARD_BIT_IS_SET_POP:
+            case _GUARD_BIT_IS_UNSET_POP:
+                break;
+            default:
+                can_peel_body = false;
+                break;
+        }
+    }
+
+    if (first_idx < 0) {
+        return length;
+    }
+
+    /* Try full Pre-Header guard peeling for pure arithmetic loops where all
+     * int/float type guards are on loop-invariant or inductive locals. */
+    if (can_peel_body &&
+        has_arith_binop &&
+        type_guard_count > 0 &&
+        pop_top_count <= 1 &&
+        non_nop_count <= 32 &&
+        !(has_iter_check && has_compare_op) &&
+        length + non_nop_count <= UOP_MAX_TRACE_LENGTH)
+    {
+        /* Stack tags:
+         * >= 0 : local variable index (0..63)
+         * -2   : proven compact PyLong_CheckExact value
+         * -3   : proven PyFloat_CheckExact value
+         * -1   : other / unknown value
+         */
+        int stk[32];
+        int sp = 0;
+        bool all_guards_hoistable = true;
+
+        for (int i = 2; i < length - 1 && all_guards_hoistable; i++) {
+            _PyUOpInstruction *inst = &output[i];
+            uint16_t op = inst->opcode;
+            if (op == _NOP) {
+                continue;
+            }
+            switch (op) {
+                case _SET_IP:
+                case _CHECK_PERIODIC:
+                case _CHECK_PERIODIC_IF_NOT_YIELD_FROM:
+                case _CHECK_VALIDITY:
+                case _TIER2_RESUME_CHECK:
+                case _ITER_CHECK_RANGE:
+                case _ITER_CHECK_LIST:
+                case _ITER_CHECK_TUPLE:
+                case _GUARD_NOT_EXHAUSTED_RANGE:
+                case _GUARD_NOT_EXHAUSTED_LIST:
+                case _GUARD_NOT_EXHAUSTED_TUPLE:
+                    break;
+                case _ITER_NEXT_RANGE:
+                    if (sp >= 32) { all_guards_hoistable = false; break; }
+                    stk[sp++] = -2;
+                    break;
+                case _ITER_NEXT_LIST:
+                case _ITER_NEXT_LIST_TIER_TWO:
+                case _ITER_NEXT_TUPLE:
+                    if (sp >= 32) { all_guards_hoistable = false; break; }
+                    stk[sp++] = -1;
+                    break;
+                case _LOAD_FAST:
+                case _LOAD_FAST_BORROW:
+                    if (sp >= 32) { all_guards_hoistable = false; break; }
+                    stk[sp++] = (int)inst->oparg;
+                    break;
+                case _LOAD_FAST_0:
+                case _LOAD_FAST_1:
+                case _LOAD_FAST_2:
+                case _LOAD_FAST_3:
+                case _LOAD_FAST_4:
+                case _LOAD_FAST_5:
+                case _LOAD_FAST_6:
+                case _LOAD_FAST_7:
+                    if (sp >= 32) { all_guards_hoistable = false; break; }
+                    stk[sp++] = (int)(op - _LOAD_FAST_0);
+                    break;
+                case _LOAD_FAST_BORROW_0:
+                case _LOAD_FAST_BORROW_1:
+                case _LOAD_FAST_BORROW_2:
+                case _LOAD_FAST_BORROW_3:
+                case _LOAD_FAST_BORROW_4:
+                case _LOAD_FAST_BORROW_5:
+                case _LOAD_FAST_BORROW_6:
+                case _LOAD_FAST_BORROW_7:
+                    if (sp >= 32) { all_guards_hoistable = false; break; }
+                    stk[sp++] = (int)(op - _LOAD_FAST_BORROW_0);
+                    break;
+                case _LOAD_SMALL_INT:
+                    if (sp >= 32) { all_guards_hoistable = false; break; }
+                    stk[sp++] = -2;
+                    break;
+                case _LOAD_CONST_INLINE:
+                case _LOAD_CONST_INLINE_BORROW: {
+                    if (sp >= 32) { all_guards_hoistable = false; break; }
+                    PyObject *c = (PyObject *)inst->operand0;
+                    if (c != NULL && _PyLong_CheckExactAndCompact(c)) {
+                        stk[sp++] = -2;
+                    }
+                    else if (c != NULL && PyFloat_CheckExact(c)) {
+                        stk[sp++] = -3;
+                    }
+                    else {
+                        stk[sp++] = -1;
+                    }
+                    break;
+                }
+                case _GUARD_TOS_INT:
+                    if (sp < 1) { all_guards_hoistable = false; break; }
+                    if (stk[sp - 1] >= 0) {
+                        guarded_int[stk[sp - 1]] = true;
+                    }
+                    else if (stk[sp - 1] != -2) {
+                        all_guards_hoistable = false;
+                    }
+                    break;
+                case _GUARD_NOS_INT:
+                    if (sp < 2) { all_guards_hoistable = false; break; }
+                    if (stk[sp - 2] >= 0) {
+                        guarded_int[stk[sp - 2]] = true;
+                    }
+                    else if (stk[sp - 2] != -2) {
+                        all_guards_hoistable = false;
+                    }
+                    break;
+                case _GUARD_TOS_FLOAT:
+                    if (sp < 1) { all_guards_hoistable = false; break; }
+                    if (stk[sp - 1] >= 0) {
+                        guarded_float[stk[sp - 1]] = true;
+                    }
+                    else if (stk[sp - 1] != -3) {
+                        all_guards_hoistable = false;
+                    }
+                    break;
+                case _GUARD_NOS_FLOAT:
+                    if (sp < 2) { all_guards_hoistable = false; break; }
+                    if (stk[sp - 2] >= 0) {
+                        guarded_float[stk[sp - 2]] = true;
+                    }
+                    else if (stk[sp - 2] != -3) {
+                        all_guards_hoistable = false;
+                    }
+                    break;
+                case _BINARY_OP_ADD_INT:
+                case _BINARY_OP_ADD_INT_INPLACE:
+                case _BINARY_OP_ADD_INT_INPLACE_RIGHT:
+                case _BINARY_OP_SUBTRACT_INT:
+                case _BINARY_OP_SUBTRACT_INT_INPLACE:
+                case _BINARY_OP_SUBTRACT_INT_INPLACE_RIGHT:
+                case _BINARY_OP_MULTIPLY_INT:
+                case _BINARY_OP_MULTIPLY_INT_INPLACE:
+                case _BINARY_OP_MULTIPLY_INT_INPLACE_RIGHT:
+                    if (sp < 2 || sp >= 32) { all_guards_hoistable = false; break; }
+                    stk[sp - 2] = -2;
+                    stk[sp - 1] = -1;
+                    stk[sp++] = -1;
+                    break;
+                case _BINARY_OP_ADD_FLOAT:
+                case _BINARY_OP_ADD_FLOAT_INPLACE:
+                case _BINARY_OP_ADD_FLOAT_INPLACE_RIGHT:
+                case _BINARY_OP_SUBTRACT_FLOAT:
+                case _BINARY_OP_SUBTRACT_FLOAT_INPLACE:
+                case _BINARY_OP_SUBTRACT_FLOAT_INPLACE_RIGHT:
+                case _BINARY_OP_MULTIPLY_FLOAT:
+                case _BINARY_OP_MULTIPLY_FLOAT_INPLACE:
+                case _BINARY_OP_MULTIPLY_FLOAT_INPLACE_RIGHT:
+                case _BINARY_OP_TRUEDIV_FLOAT:
+                case _BINARY_OP_TRUEDIV_FLOAT_INPLACE:
+                case _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT:
+                    if (sp < 2 || sp >= 32) { all_guards_hoistable = false; break; }
+                    stk[sp - 2] = -3;
+                    stk[sp - 1] = -1;
+                    stk[sp++] = -1;
+                    break;
+                case _UNARY_NEGATIVE_FLOAT_INPLACE:
+                    if (sp < 1 || sp >= 32) { all_guards_hoistable = false; break; }
+                    stk[sp - 1] = -3;
+                    stk[sp++] = -1;
+                    break;
+                case _COMPARE_OP_INT:
+                case _COMPARE_OP_FLOAT:
+                    if (sp < 2 || sp >= 32) { all_guards_hoistable = false; break; }
+                    stk[sp - 2] = -1;
+                    stk[sp - 1] = -1;
+                    stk[sp++] = -1;
+                    break;
+                case _POP_TOP:
+                case _POP_TOP_NOP:
+                case _POP_TOP_INT:
+                case _POP_TOP_FLOAT:
+                case _GUARD_IS_TRUE_POP:
+                case _GUARD_IS_FALSE_POP:
+                case _GUARD_BIT_IS_SET_POP:
+                case _GUARD_BIT_IS_UNSET_POP:
+                    if (sp < 1) { all_guards_hoistable = false; break; }
+                    sp--;
+                    break;
+                case _SWAP_FAST:
+                case _SWAP_FAST_0:
+                case _SWAP_FAST_1:
+                case _SWAP_FAST_2:
+                case _SWAP_FAST_3:
+                case _SWAP_FAST_4:
+                case _SWAP_FAST_5:
+                case _SWAP_FAST_6:
+                case _SWAP_FAST_7: {
+                    if (sp < 1) { all_guards_hoistable = false; break; }
+                    int val = stk[sp - 1];
+                    int v = (op == _SWAP_FAST) ? (int)inst->oparg : (int)(op - _SWAP_FAST_0);
+                    stk[sp - 1] = -1;
+                    bool is_int = (val == -2) || (val >= 0 && guarded_int[val]);
+                    bool is_float = (val == -3) || (val >= 0 && guarded_float[val]);
+                    if (!is_int) {
+                        store_only_int[v] = false;
+                    }
+                    if (!is_float) {
+                        store_only_float[v] = false;
+                    }
+                    break;
+                }
+                default:
+                    all_guards_hoistable = false;
+                    break;
+            }
+        }
+
+        if (sp != 0) {
+            all_guards_hoistable = false;
+        }
+        for (int v = 0; v < 64 && all_guards_hoistable; v++) {
+            if (guarded_int[v] && written[v] && !store_only_int[v]) {
+                all_guards_hoistable = false;
+            }
+            if (guarded_float[v] && written[v] && !store_only_float[v]) {
+                all_guards_hoistable = false;
+            }
+        }
+
+        if (all_guards_hoistable) {
+            _PyUOpInstruction body[32];
+            int b_len = 0;
+            for (int i = 2; i < length - 1; i++) {
+                if (output[i].opcode != _NOP) {
+                    body[b_len++] = output[i];
+                }
+            }
+            _PyUOpInstruction make_warm_inst = output[1];
+            _PyUOpInstruction jump_inst = output[length - 1];
+            int out_idx = 1;
+            /* Emit Pre-Header (Iteration 1 with all type and iterator guards) */
+            for (int i = 0; i < b_len; i++) {
+                uint16_t op = body[i].opcode;
+                if (op == _CHECK_PERIODIC ||
+                    op == _CHECK_PERIODIC_IF_NOT_YIELD_FROM)
+                {
+                    continue;
+                }
+                output[out_idx++] = body[i];
+            }
+            /* Loop Header */
+            output[out_idx++] = make_warm_inst;
+            /* Emit Steady-State Loop Body with hoisted guards removed */
+            for (int i = 0; i < b_len; i++) {
+                uint16_t op = body[i].opcode;
+                if (op == _ITER_CHECK_RANGE ||
+                    op == _ITER_CHECK_LIST ||
+                    op == _ITER_CHECK_TUPLE ||
+                    op == _GUARD_TOS_INT ||
+                    op == _GUARD_NOS_INT ||
+                    op == _GUARD_TOS_FLOAT ||
+                    op == _GUARD_NOS_FLOAT)
+                {
+                    continue;
+                }
+                output[out_idx++] = body[i];
+            }
+            output[out_idx++] = jump_inst;
+            return out_idx;
+        }
+    }
+
+    /* Fallback: Hoist leading _ITER_CHECK_{RANGE,LIST,TUPLE} before _MAKE_WARM
+     * without duplicating the loop body. */
+    int lead_set_ip_idx = -1;
+    int lead_check_val_idx = -1;
+    int iter_check_idx = -1;
+    for (int i = 2; i < length - 1; i++) {
+        uint16_t op = output[i].opcode;
+        if (op == _NOP ||
+            op == _CHECK_PERIODIC ||
+            op == _CHECK_PERIODIC_IF_NOT_YIELD_FROM ||
+            op == _TIER2_RESUME_CHECK)
+        {
+            continue;
+        }
+        if (op == _SET_IP) {
+            lead_set_ip_idx = i;
+            continue;
+        }
+        if (op == _CHECK_VALIDITY) {
+            lead_check_val_idx = i;
+            continue;
+        }
+        if (op == _ITER_CHECK_RANGE ||
+            op == _ITER_CHECK_LIST ||
+            op == _ITER_CHECK_TUPLE)
+        {
+            iter_check_idx = i;
+        }
+        break;
+    }
+
+    if (iter_check_idx >= 0 && length + 2 <= UOP_MAX_TRACE_LENGTH) {
+        uint16_t first_op = output[iter_check_idx].opcode;
+        bool safe_to_hoist_iter = true;
+        for (int i = iter_check_idx + 1; i < length - 1; i++) {
+            uint16_t op = output[i].opcode;
+            if (op == _NOP) {
+                continue;
+            }
+            if (op == _RETURN_VALUE ||
+                op == _RETURN_GENERATOR ||
+                op == _YIELD_VALUE ||
+                op == _DYNAMIC_EXIT)
+            {
+                safe_to_hoist_iter = false;
+                break;
+            }
+#ifdef Py_GIL_DISABLED
+            if (first_op == _ITER_CHECK_LIST &&
+                (_PyUop_Flags[op] & HAS_ESCAPES_FLAG))
+            {
+                safe_to_hoist_iter = false;
+                break;
+            }
+#endif
+        }
+        if (safe_to_hoist_iter) {
+            _PyUOpInstruction temp[UOP_MAX_TRACE_LENGTH];
+            int out_idx = 0;
+            temp[out_idx++] = output[0]; /* _START_EXECUTOR */
+            if (lead_set_ip_idx >= 0) {
+                temp[out_idx++] = output[lead_set_ip_idx];
+            }
+            if (lead_check_val_idx >= 0) {
+                temp[out_idx++] = output[lead_check_val_idx];
+            }
+            temp[out_idx++] = output[iter_check_idx];
+            temp[out_idx++] = output[1]; /* _MAKE_WARM */
+            for (int i = 2; i < length; i++) {
+                if (i == iter_check_idx || output[i].opcode == _NOP) {
+                    continue;
+                }
+                temp[out_idx++] = output[i];
+            }
+            memcpy(output, temp, out_idx * sizeof(_PyUOpInstruction));
+            return out_idx;
+        }
+    }
+
+    return length;
+}
+
 //  0 - failure, no error raised, just fall back to Tier 1
 // -1 - failure, and raise error
 //  > 0 - length of optimized trace
@@ -857,6 +1366,8 @@ _Py_uop_analyze_and_optimize(
 
     length = remove_unneeded_uops(output, length);
     assert(length > 0);
+
+    length = hoist_loop_preheader_guards(output, length, curr_stacklen);
 
     OPT_STAT_INC(optimizer_successes);
     return length;

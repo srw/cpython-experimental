@@ -757,12 +757,117 @@ list_length(PyObject *a)
     return PyList_GET_SIZE(a);
 }
 
+static inline int
+list_can_read_items_fast(PyListObject *self)
+{
+#ifdef Py_GIL_DISABLED
+    return _Py_IsOwnedByCurrentThread((PyObject *)self) ||
+           !_PyObject_GC_IS_SHARED((PyObject *)self);
+#else
+    (void)self;
+    return 1;
+#endif
+}
+
 static int
 list_contains(PyObject *aa, PyObject *el)
 {
+    PyListObject *self = (PyListObject *)aa;
+    Py_ssize_t i = 0;
 
-    for (Py_ssize_t i = 0; ; i++) {
-        PyObject *item = list_get_item_ref((PyListObject *)aa, i);
+    if (list_can_read_items_fast(self)) {
+        Py_ssize_t n = Py_SIZE(self);
+        PyObject **items = self->ob_item;
+        if (Py_IS_TYPE(el, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)el)) {
+            Py_ssize_t target = _PyLong_CompactValue((PyLongObject *)el);
+            for (; i + 4 <= n; i += 4) {
+                PyObject *o0 = items[i];
+                PyObject *o1 = items[i + 1];
+                PyObject *o2 = items[i + 2];
+                PyObject *o3 = items[i + 3];
+                if (o0 == el || o1 == el || o2 == el || o3 == el) {
+                    return 1;
+                }
+                if (Py_IS_TYPE(o0, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)o0) &&
+                    Py_IS_TYPE(o1, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)o1) &&
+                    Py_IS_TYPE(o2, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)o2) &&
+                    Py_IS_TYPE(o3, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)o3))
+                {
+                    if (_PyLong_CompactValue((PyLongObject *)o0) == target ||
+                        _PyLong_CompactValue((PyLongObject *)o1) == target ||
+                        _PyLong_CompactValue((PyLongObject *)o2) == target ||
+                        _PyLong_CompactValue((PyLongObject *)o3) == target)
+                    {
+                        return 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+            for (; i < n; i++) {
+                PyObject *obj = items[i];
+                if (obj == el) {
+                    return 1;
+                }
+                if (Py_IS_TYPE(obj, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)obj)) {
+                    if (_PyLong_CompactValue((PyLongObject *)obj) == target) {
+                        return 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+            if (i == n) {
+                return 0;
+            }
+        }
+        else if (Py_IS_TYPE(el, &PyFloat_Type)) {
+            double target = PyFloat_AS_DOUBLE(el);
+            for (; i + 4 <= n; i += 4) {
+                PyObject *o0 = items[i];
+                PyObject *o1 = items[i + 1];
+                PyObject *o2 = items[i + 2];
+                PyObject *o3 = items[i + 3];
+                if (o0 == el || o1 == el || o2 == el || o3 == el) {
+                    return 1;
+                }
+                if (Py_IS_TYPE(o0, &PyFloat_Type) &&
+                    Py_IS_TYPE(o1, &PyFloat_Type) &&
+                    Py_IS_TYPE(o2, &PyFloat_Type) &&
+                    Py_IS_TYPE(o3, &PyFloat_Type))
+                {
+                    if (PyFloat_AS_DOUBLE(o0) == target ||
+                        PyFloat_AS_DOUBLE(o1) == target ||
+                        PyFloat_AS_DOUBLE(o2) == target ||
+                        PyFloat_AS_DOUBLE(o3) == target)
+                    {
+                        return 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+            for (; i < n; i++) {
+                PyObject *obj = items[i];
+                if (obj == el) {
+                    return 1;
+                }
+                if (Py_IS_TYPE(obj, &PyFloat_Type)) {
+                    if (PyFloat_AS_DOUBLE(obj) == target) {
+                        return 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+            if (i == n) {
+                return 0;
+            }
+        }
+    }
+
+    for (; ; i++) {
+        PyObject *item = list_get_item_ref(self, i);
         if (item == NULL) {
             // out-of-bounds
             return 0;
@@ -3511,7 +3616,47 @@ list_index_impl(PyListObject *self, PyObject *value, Py_ssize_t start,
         if (stop < 0)
             stop = 0;
     }
-    for (Py_ssize_t i = start; i < stop; i++) {
+    Py_ssize_t i = start;
+    if (list_can_read_items_fast(self)) {
+        Py_ssize_t n = Py_SIZE(self);
+        if (stop < n) {
+            n = stop;
+        }
+        PyObject **items = self->ob_item;
+        if (Py_IS_TYPE(value, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)value)) {
+            Py_ssize_t target = _PyLong_CompactValue((PyLongObject *)value);
+            for (; i < n; i++) {
+                PyObject *obj = items[i];
+                if (obj == value) {
+                    return PyLong_FromSsize_t(i);
+                }
+                if (Py_IS_TYPE(obj, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)obj)) {
+                    if (_PyLong_CompactValue((PyLongObject *)obj) == target) {
+                        return PyLong_FromSsize_t(i);
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        else if (Py_IS_TYPE(value, &PyFloat_Type)) {
+            double target = PyFloat_AS_DOUBLE(value);
+            for (; i < n; i++) {
+                PyObject *obj = items[i];
+                if (obj == value) {
+                    return PyLong_FromSsize_t(i);
+                }
+                if (Py_IS_TYPE(obj, &PyFloat_Type)) {
+                    if (PyFloat_AS_DOUBLE(obj) == target) {
+                        return PyLong_FromSsize_t(i);
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    for (; i < stop; i++) {
         PyObject *obj = list_get_item_ref(self, i);
         if (obj == NULL) {
             // out-of-bounds
@@ -3542,7 +3687,68 @@ list_count_impl(PyListObject *self, PyObject *value)
 /*[clinic end generated code: output=eff66f14aef2df86 input=3bdc3a5e6f749565]*/
 {
     Py_ssize_t count = 0;
-    for (Py_ssize_t i = 0; ; i++) {
+    Py_ssize_t i = 0;
+
+    if (list_can_read_items_fast(self)) {
+        Py_ssize_t n = Py_SIZE(self);
+        PyObject **items = self->ob_item;
+        if (Py_IS_TYPE(value, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)value)) {
+            Py_ssize_t target = _PyLong_CompactValue((PyLongObject *)value);
+            for (; i + 4 <= n; i += 4) {
+                PyObject *o0 = items[i];
+                PyObject *o1 = items[i + 1];
+                PyObject *o2 = items[i + 2];
+                PyObject *o3 = items[i + 3];
+                if (Py_IS_TYPE(o0, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)o0) &&
+                    Py_IS_TYPE(o1, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)o1) &&
+                    Py_IS_TYPE(o2, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)o2) &&
+                    Py_IS_TYPE(o3, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)o3))
+                {
+                    count += (_PyLong_CompactValue((PyLongObject *)o0) == target) +
+                             (_PyLong_CompactValue((PyLongObject *)o1) == target) +
+                             (_PyLong_CompactValue((PyLongObject *)o2) == target) +
+                             (_PyLong_CompactValue((PyLongObject *)o3) == target);
+                    continue;
+                }
+                break;
+            }
+            for (; i < n; i++) {
+                PyObject *obj = items[i];
+                if (obj == value) {
+                    count++;
+                    continue;
+                }
+                if (Py_IS_TYPE(obj, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)obj)) {
+                    count += (_PyLong_CompactValue((PyLongObject *)obj) == target);
+                    continue;
+                }
+                break;
+            }
+            if (i == n) {
+                return PyLong_FromSsize_t(count);
+            }
+        }
+        else if (Py_IS_TYPE(value, &PyFloat_Type)) {
+            double target = PyFloat_AS_DOUBLE(value);
+            for (; i < n; i++) {
+                PyObject *obj = items[i];
+                if (obj == value) {
+                    count++;
+                    continue;
+                }
+                if (Py_IS_TYPE(obj, &PyFloat_Type)) {
+                    count += (PyFloat_AS_DOUBLE(obj) == target);
+                    continue;
+                }
+                break;
+            }
+            if (i == n) {
+                return PyLong_FromSsize_t(count);
+            }
+        }
+    }
+
+    for (; ; i++) {
         PyObject *obj = list_get_item_ref(self, i);
         if (obj == NULL) {
             // out-of-bounds

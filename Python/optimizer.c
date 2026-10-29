@@ -1450,9 +1450,13 @@ prepare_for_execution(_PyUOpInstruction *buffer, int length)
     }
     length = (int)(copy_to - buffer);
     int next_spare = length;
+    int32_t make_warm_index = 1;
     for (int i = 0; i < length; i++) {
         _PyUOpInstruction *inst = &buffer[i];
         int base_opcode = _PyUop_Uncached[inst->opcode];
+        if (base_opcode == _MAKE_WARM) {
+            make_warm_index = i;
+        }
         assert(inst->opcode != _NOP);
         int32_t target = (int32_t)uop_get_target(inst);
         uint16_t exit_flags = _PyUop_Flags[base_opcode] & (HAS_EXIT_FLAG | HAS_DEOPT_FLAG | HAS_PERIODIC_FLAG);
@@ -1502,7 +1506,7 @@ prepare_for_execution(_PyUOpInstruction *buffer, int length)
         if (base_opcode == _JUMP_TO_TOP) {
             assert(_PyUop_Uncached[buffer[0].opcode] == _START_EXECUTOR);
             buffer[i].format = UOP_FORMAT_JUMP;
-            buffer[i].jump_target = 1;
+            buffer[i].jump_target = make_warm_index;
         }
     }
     return next_spare;
@@ -1722,7 +1726,7 @@ stack_allocate(_PyUOpInstruction *buffer, _PyUOpInstruction *output, int length)
         if (uop == _NOP) {
             continue;
         }
-        int new_depth = _PyUop_Caching[uop].best[depth];
+        int new_depth = (uop == _MAKE_WARM) ? 0 : _PyUop_Caching[uop].best[depth];
         if (new_depth != depth) {
             write->opcode = _PyUop_SpillsAndReloads[depth][new_depth];
             assert(write->opcode != 0);

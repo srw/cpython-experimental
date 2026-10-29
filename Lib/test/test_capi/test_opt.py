@@ -2729,7 +2729,8 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertIn("_UNPACK_SEQUENCE_TUPLE", uops)
         self.assertIn("_UNPACK_SEQUENCE_TWO_TUPLE", uops)
         self.assertNotIn("_GUARD_NOS_TUPLE", uops)
-        self.assertIn("_BINARY_OP_SUBSCR_TUPLE_INT", uops)
+        # _BINARY_OP_SUBSCR_TUPLE_INT is constant-folded away for constant tuple items
+        self.assertIn("_LOAD_CONST_INLINE_BORROW", uops)
 
     def test_remove_guard_for_known_type_slice(self):
         def f(n):
@@ -2761,7 +2762,7 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertIsNotNone(ex)
         uops = get_opnames(ex)
         self.assertNotIn("_GUARD_BINARY_OP_SUBSCR_TUPLE_INT_BOUNDS", uops)
-        self.assertIn("_BINARY_OP_SUBSCR_TUPLE_INT", uops)
+        self.assertIn("_LOAD_CONST_INLINE_BORROW", uops)
 
     def test_binary_subcsr_str_int_narrows_to_str(self):
         def testfunc(n):
@@ -3753,7 +3754,7 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertEqual(res, TIER2_THRESHOLD)
         self.assertIsNotNone(ex)
         uops = get_opnames(ex)
-        self.assertIn("_BINARY_OP_SUBSCR_TUPLE_INT", uops)
+        self.assertIn("_LOAD_CONST_INLINE_BORROW", uops)
         self.assertNotIn("_COMPARE_OP_INT", uops)
         self.assertNotIn(self.guard_is_true, uops)
 
@@ -6721,6 +6722,45 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertNotIn("_GUARD_DORV_NO_DICT", uops)
         self.assertNotIn("_CHECK_MANAGED_OBJECT_HAS_VALUES", uops)
         self.assertNotIn("_EXIT_INIT_CHECK", uops)
+
+    def test_loop_preheader_guard_hoisting(self):
+        def f_int(n):
+            total = 0
+            for i in range(n):
+                total = total + i
+            return total
+
+        res, ex = self._run_with_optimizer(f_int, TIER2_THRESHOLD)
+        self.assertEqual(res, TIER2_THRESHOLD * (TIER2_THRESHOLD - 1) // 2)
+        self.assertIsNotNone(ex)
+        uops = get_opnames(ex)
+        make_warm_idx = uops.index("_MAKE_WARM")
+        jump_idx = uops.index("_JUMP_TO_TOP")
+        preheader = uops[:make_warm_idx]
+        loop_body = uops[make_warm_idx:jump_idx]
+        self.assertIn("_ITER_CHECK_RANGE", preheader)
+        self.assertIn("_GUARD_NOS_INT", preheader)
+        self.assertNotIn("_ITER_CHECK_RANGE", loop_body)
+        self.assertNotIn("_GUARD_NOS_INT", loop_body)
+        self.assertNotIn("_GUARD_TOS_INT", loop_body)
+
+        def f_float(n):
+            a = 1.0
+            for _ in range(n):
+                a = a + 0.25
+            return a
+
+        res_f, ex_f = self._run_with_optimizer(f_float, TIER2_THRESHOLD)
+        self.assertAlmostEqual(res_f, 1.0 + 0.25 * TIER2_THRESHOLD)
+        self.assertIsNotNone(ex_f)
+        uops_f = get_opnames(ex_f)
+        mw_f = uops_f.index("_MAKE_WARM")
+        jmp_f = uops_f.index("_JUMP_TO_TOP")
+        self.assertIn("_ITER_CHECK_RANGE", uops_f[:mw_f])
+        self.assertIn("_GUARD_NOS_FLOAT", uops_f[:mw_f])
+        self.assertNotIn("_ITER_CHECK_RANGE", uops_f[mw_f:jmp_f])
+        self.assertNotIn("_GUARD_NOS_FLOAT", uops_f[mw_f:jmp_f])
+        self.assertNotIn("_GUARD_TOS_FLOAT", uops_f[mw_f:jmp_f])
 
 def global_identity(x):
     return x
