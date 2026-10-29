@@ -2830,8 +2830,8 @@
                 }
                 else {
                     sym_set_const(owner, type);
-                    watch_type((PyTypeObject *)type, dependencies);
                 }
+                watch_type((PyTypeObject *)type, dependencies);
             }
             break;
         }

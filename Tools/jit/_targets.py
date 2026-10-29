@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pathlib
+import pickle
 import re
 import sys
 import tempfile
@@ -95,20 +96,27 @@ class _Target(typing.Generic[_S, _R]):
             raise ValueError(f"NOP not defined for {self.triple}")
         return nop
 
-    def _compute_digest(self) -> str:
+    def _compute_env_digest(self) -> str:
         hasher = hashlib.sha256()
         hasher.update(self.triple.encode())
         hasher.update(self.debug.to_bytes())
         hasher.update(self.cflags.encode())
-        # These dependencies are also reflected in _JITSources in regen.targets:
-        hasher.update(PYTHON_EXECUTOR_CASES_C_H.read_bytes())
         hasher.update((self.pyconfig_dir / "pyconfig.h").read_bytes())
+        ceval_macros = CPYTHON / "Python" / "ceval_macros.h"
+        if ceval_macros.exists():
+            hasher.update(ceval_macros.read_bytes())
         for dirpath, _, filenames in sorted(os.walk(TOOLS_JIT)):
-            # Exclude cache files from digest computation to ensure reproducible builds.
             if dirpath.endswith("__pycache__"):
                 continue
             for filename in sorted(filenames):
                 hasher.update(pathlib.Path(dirpath, filename).read_bytes())
+        return hasher.hexdigest()
+
+    def _compute_digest(self) -> str:
+        hasher = hashlib.sha256()
+        hasher.update(self._compute_env_digest().encode())
+        # These dependencies are also reflected in _JITSources in regen.targets:
+        hasher.update(PYTHON_EXECUTOR_CASES_C_H.read_bytes())
         return hasher.hexdigest()
 
     def _write_generated_header(
@@ -312,7 +320,11 @@ class _Target(typing.Generic[_S, _R]):
                 r"\n {8}(case (\w+): \{\n.*?\n {8}\})", generated_cases, flags=re.DOTALL
             )
         )
-        tasks = []
+        cache_dir = self.pyconfig_dir / ".jit_stencil_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        env_digest = self._compute_env_digest()
+        stencil_groups: dict[str, _stencils.StencilGroup] = {}
+        tasks: list[tuple[str, pathlib.Path, asyncio.Task[_stencils.StencilGroup]]] = []
         # If you need to see the generated assembly files,
         # uncomment line below (and comment out line below that)
         #   with tempfile.TemporaryDirectory("-stencils-assembly", delete=False) as tempdir:
@@ -321,16 +333,34 @@ class _Target(typing.Generic[_S, _R]):
             async with asyncio.TaskGroup() as group:
                 template = TOOLS_JIT_TEMPLATE_C.read_text()
                 for case, opname in cases_and_opnames:
+                    case_text = template.replace("CASE", case)
+                    key_hash = hashlib.sha256(
+                        f"{env_digest}:{opname}:".encode() + case_text.encode()
+                    ).hexdigest()
+                    cache_file = cache_dir / f"{opname}_{key_hash[:16]}.pkl"
+                    if cache_file.exists():
+                        try:
+                            stencil_groups[opname] = pickle.loads(cache_file.read_bytes())
+                            continue
+                        except Exception:
+                            pass
                     # Write out a copy of the template with *only* this case
                     # inserted. This is about twice as fast as #include'ing all
                     # of executor_cases.c.h each time we compile (since the C
                     # compiler wastes a bunch of time parsing the dead code for
                     # all of the other cases):
                     c = work / f"{opname}.c"
-                    c.write_text(template.replace("CASE", case))
+                    c.write_text(case_text)
                     coro = self._build_stencil_group(opname, c, work)
-                    tasks.append(group.create_task(coro, name=opname))
-        stencil_groups = {task.get_name(): task.result() for task in tasks}
+                    tasks.append((opname, cache_file, group.create_task(coro, name=opname)))
+        for opname, cache_file, task in tasks:
+            res = task.result()
+            stencil_groups[opname] = res
+            try:
+                cache_file.write_bytes(pickle.dumps(res, protocol=pickle.HIGHEST_PROTOCOL))
+            except Exception:
+                pass
+        stencil_groups = {k: stencil_groups[k] for k in sorted(stencil_groups)}
         for stencil_group in stencil_groups.values():
             stencil_group.convert_labels_to_relocations()
             stencil_group.process_relocations(self.known_symbols)

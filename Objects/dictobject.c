@@ -1217,6 +1217,37 @@ unicodekeys_lookup_unicode(PyDictKeysObject* dk, PyObject *key, Py_hash_t hash)
     return do_lookup(NULL, dk, key, hash, compare_unicode_unicode);
 }
 
+static inline Py_ALWAYS_INLINE Py_ssize_t
+unicodekeys_lookup_or_empty_slot(PyDictKeysObject *dk, PyObject *key,
+                                 Py_hash_t hash, Py_ssize_t *hashpos_out,
+                                 bool reuse_dummy)
+{
+    void *ep0 = _DK_ENTRIES(dk);
+    size_t mask = DK_MASK(dk);
+    size_t perturb = (size_t)hash;
+    size_t i = mask & (size_t)hash;
+    Py_ssize_t first_dummy = -1;
+
+    for (;;) {
+        Py_ssize_t ix = dictkeys_get_index(dk, i);
+        if (ix >= 0) {
+            if (compare_unicode_unicode(NULL, dk, ep0, ix, key, hash)) {
+                return ix;
+            }
+        }
+        else if (ix == DKIX_EMPTY) {
+            *hashpos_out = (reuse_dummy && first_dummy >= 0) ? first_dummy : (Py_ssize_t)i;
+            return DKIX_EMPTY;
+        }
+        else if (reuse_dummy && first_dummy < 0) {
+            first_dummy = (Py_ssize_t)i;
+        }
+        perturb >>= PERTURB_SHIFT;
+        i = mask & (i*5 + perturb + 1);
+    }
+    Py_UNREACHABLE();
+}
+
 static inline int
 compare_generic(PyDictObject *mp, PyDictKeysObject *dk,
                 void *ep0, Py_ssize_t ix, PyObject *key, Py_hash_t hash)
@@ -1228,6 +1259,13 @@ compare_generic(PyDictObject *mp, PyDictKeysObject *dk,
     }
     if (ep->me_hash == hash) {
         PyObject *startkey = ep->me_key;
+        if (PyLong_CheckExact(startkey) && PyLong_CheckExact(key) &&
+            _PyLong_IsCompact((PyLongObject *)startkey) &&
+            _PyLong_IsCompact((PyLongObject *)key))
+        {
+            return _PyLong_CompactValue((PyLongObject *)startkey) ==
+                   _PyLong_CompactValue((PyLongObject *)key);
+        }
         Py_INCREF(startkey);
         int cmp = PyObject_RichCompareBool(startkey, key, Py_EQ);
         Py_DECREF(startkey);
@@ -1651,6 +1689,13 @@ compare_generic_unshared(PyDictObject *mp, PyDictKeysObject *dk,
     if (ep->me_hash == hash) {
         if (PyUnicode_CheckExact(startkey) && PyUnicode_CheckExact(key)) {
             return unicode_eq(startkey, key);
+        }
+        if (PyLong_CheckExact(startkey) && PyLong_CheckExact(key) &&
+            _PyLong_IsCompact((PyLongObject *)startkey) &&
+            _PyLong_IsCompact((PyLongObject *)key))
+        {
+            return _PyLong_CompactValue((PyLongObject *)startkey) ==
+                   _PyLong_CompactValue((PyLongObject *)key);
         }
         Py_INCREF(startkey);
         int cmp = PyObject_RichCompareBool(startkey, key, Py_EQ);
@@ -2079,6 +2124,33 @@ insert_combined_dict(PyDictObject *mp,
         STORE_VALUE(ep, value);
         STORE_HASH(ep, hash);
     }
+    STORE_KEYS_USABLE(mp->ma_keys, mp->ma_keys->dk_usable - 1);
+    STORE_KEYS_NENTRIES(mp->ma_keys, mp->ma_keys->dk_nentries + 1);
+    assert(mp->ma_keys->dk_usable >= 0);
+    return 0;
+}
+
+static inline Py_ALWAYS_INLINE int
+insert_combined_unicode_at_slot(PyDictObject *mp, Py_hash_t hash,
+                                PyObject *key, PyObject *value,
+                                Py_ssize_t hashpos)
+{
+    assert(DK_IS_UNICODE(mp->ma_keys));
+    assert(PyUnicode_CheckExact(key));
+    if (mp->ma_keys->dk_usable <= 0) {
+        if (insertion_resize(mp, 1) < 0) {
+            return -1;
+        }
+        hashpos = find_empty_slot(mp->ma_keys, hash, !IS_DICT_SHARED(mp));
+    }
+
+    _PyDict_NotifyEvent(PyDict_EVENT_ADDED, mp, key, value);
+    FT_ATOMIC_STORE_UINT32_RELAXED(mp->ma_keys->dk_version, 0);
+
+    dictkeys_set_index(mp->ma_keys, hashpos, mp->ma_keys->dk_nentries);
+    PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(mp->ma_keys)[mp->ma_keys->dk_nentries];
+    STORE_KEY(ep, key);
+    STORE_VALUE(ep, value);
     STORE_KEYS_USABLE(mp->ma_keys, mp->ma_keys->dk_usable - 1);
     STORE_KEYS_NENTRIES(mp->ma_keys, mp->ma_keys->dk_nentries + 1);
     assert(mp->ma_keys->dk_usable >= 0);
@@ -2531,11 +2603,17 @@ _PyDict_NewPresized(Py_ssize_t minused)
     return dict_new_presized(minused, false);
 }
 
+static int
+setitem_take2_lock_held(PyDictObject *mp, PyObject *key, PyObject *value);
+
 PyObject *
 _PyDict_FromItems(PyObject *const *keys, Py_ssize_t keys_offset,
                   PyObject *const *values, Py_ssize_t values_offset,
                   Py_ssize_t length)
 {
+    if (length == 0) {
+        return PyDict_New();
+    }
     bool unicode = true;
     PyObject *const *ks = keys;
 
@@ -2547,23 +2625,228 @@ _PyDict_FromItems(PyObject *const *keys, Py_ssize_t keys_offset,
         ks += keys_offset;
     }
 
-    PyObject *dict = dict_new_presized(length, unicode);
+    const uint8_t log2_max_presize = 17;
+    const Py_ssize_t max_presize = ((Py_ssize_t)1) << log2_max_presize;
+    uint8_t log2_newsize;
+    if (length <= USABLE_FRACTION(PyDict_MINSIZE)) {
+        log2_newsize = PyDict_LOG_MINSIZE;
+    }
+    else if (length > USABLE_FRACTION(max_presize)) {
+        log2_newsize = log2_max_presize;
+    }
+    else {
+        log2_newsize = estimate_log2_keysize(length);
+    }
+
+    PyDictKeysObject *new_keys = new_keys_object(log2_newsize, unicode);
+    if (new_keys == NULL) {
+        return NULL;
+    }
+    PyObject *dict = new_dict(new_keys, NULL, 0, 0);
     if (dict == NULL) {
         return NULL;
     }
+    PyDictObject *mp = (PyDictObject *)dict;
 
     ks = keys;
     PyObject *const *vs = values;
 
+    if (unicode) {
+        for (Py_ssize_t i = 0; i < length; i++) {
+            PyObject *key = *ks;
+            PyObject *value = *vs;
+            ks += keys_offset;
+            vs += values_offset;
+            Py_hash_t hash = ((PyASCIIObject *)key)->hash;
+            if (hash == -1) {
+                hash = PyUnicode_Type.tp_hash(key);
+                assert(hash != -1);
+            }
+            PyDictKeysObject *dk = mp->ma_keys;
+            if (i == 0) {
+                size_t hashpos = (size_t)hash & DK_MASK(dk);
+                dictkeys_set_index(dk, hashpos, 0);
+                PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(dk)[0];
+                ep->me_key = Py_NewRef(key);
+                ep->me_value = Py_NewRef(value);
+                dk->dk_usable--;
+                dk->dk_nentries = 1;
+                mp->ma_used = 1;
+                continue;
+            }
+            Py_ssize_t hashpos;
+            Py_ssize_t ix = unicodekeys_lookup_or_empty_slot(
+                dk, key, hash, &hashpos, true);
+            if (ix >= 0) {
+                PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(dk)[ix];
+                PyObject *old_value = ep->me_value;
+                ep->me_value = Py_NewRef(value);
+                Py_DECREF(old_value);
+                continue;
+            }
+            if (dk->dk_usable <= 0) {
+                if (insertion_resize(mp, 1) < 0) {
+                    Py_DECREF(dict);
+                    return NULL;
+                }
+                dk = mp->ma_keys;
+                hashpos = find_empty_slot(dk, hash, true);
+            }
+            Py_ssize_t nentries = dk->dk_nentries;
+            dictkeys_set_index(dk, hashpos, nentries);
+            PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(dk)[nentries];
+            ep->me_key = Py_NewRef(key);
+            ep->me_value = Py_NewRef(value);
+            dk->dk_usable--;
+            dk->dk_nentries = nentries + 1;
+            mp->ma_used++;
+        }
+        ASSERT_CONSISTENT(mp);
+        return dict;
+    }
+
     for (Py_ssize_t i = 0; i < length; i++) {
         PyObject *key = *ks;
         PyObject *value = *vs;
-        if (setitem_lock_held((PyDictObject *)dict, key, value) < 0) {
+        if (setitem_lock_held(mp, key, value) < 0) {
             Py_DECREF(dict);
             return NULL;
         }
         ks += keys_offset;
         vs += values_offset;
+    }
+
+    return dict;
+}
+
+PyObject *
+_PyDict_FromStackRefsSteal(_PyStackRef *arguments, Py_ssize_t length)
+{
+    if (length == 0) {
+        return PyDict_New();
+    }
+    bool unicode = true;
+    for (Py_ssize_t i = 0; i < length; i++) {
+        PyObject *k = PyStackRef_AsPyObjectBorrow(arguments[2 * i]);
+        if (!PyUnicode_CheckExact(k)) {
+            unicode = false;
+            break;
+        }
+    }
+
+    const uint8_t log2_max_presize = 17;
+    const Py_ssize_t max_presize = ((Py_ssize_t)1) << log2_max_presize;
+    uint8_t log2_newsize;
+    if (length <= USABLE_FRACTION(PyDict_MINSIZE)) {
+        log2_newsize = PyDict_LOG_MINSIZE;
+    }
+    else if (length > USABLE_FRACTION(max_presize)) {
+        log2_newsize = log2_max_presize;
+    }
+    else {
+        log2_newsize = estimate_log2_keysize(length);
+    }
+
+    PyDictKeysObject *new_keys = new_keys_object(log2_newsize, unicode);
+    if (new_keys == NULL) {
+        for (Py_ssize_t i = 2 * length - 1; i >= 0; i--) {
+            _PyStackRef tmp = arguments[i];
+            arguments[i] = PyStackRef_NULL;
+            PyStackRef_CLOSE(tmp);
+        }
+        return NULL;
+    }
+    PyObject *dict = new_dict(new_keys, NULL, 0, 0);
+    if (dict == NULL) {
+        for (Py_ssize_t i = 2 * length - 1; i >= 0; i--) {
+            _PyStackRef tmp = arguments[i];
+            arguments[i] = PyStackRef_NULL;
+            PyStackRef_CLOSE(tmp);
+        }
+        return NULL;
+    }
+    PyDictObject *mp = (PyDictObject *)dict;
+
+    if (unicode) {
+        for (Py_ssize_t i = 0; i < length; i++) {
+            _PyStackRef key_ref = arguments[2 * i];
+            _PyStackRef val_ref = arguments[2 * i + 1];
+            arguments[2 * i] = PyStackRef_NULL;
+            arguments[2 * i + 1] = PyStackRef_NULL;
+            PyObject *key = PyStackRef_AsPyObjectSteal(key_ref);
+            PyObject *value = PyStackRef_AsPyObjectSteal(val_ref);
+            Py_hash_t hash = ((PyASCIIObject *)key)->hash;
+            if (hash == -1) {
+                hash = PyUnicode_Type.tp_hash(key);
+                assert(hash != -1);
+            }
+            PyDictKeysObject *dk = mp->ma_keys;
+            if (i == 0) {
+                size_t hashpos = (size_t)hash & DK_MASK(dk);
+                dictkeys_set_index(dk, hashpos, 0);
+                PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(dk)[0];
+                ep->me_key = key;
+                ep->me_value = value;
+                dk->dk_usable--;
+                dk->dk_nentries = 1;
+                mp->ma_used = 1;
+                continue;
+            }
+            Py_ssize_t hashpos;
+            Py_ssize_t ix = unicodekeys_lookup_or_empty_slot(
+                dk, key, hash, &hashpos, true);
+            if (ix >= 0) {
+                PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(dk)[ix];
+                PyObject *old_value = ep->me_value;
+                ep->me_value = value;
+                Py_DECREF(old_value);
+                Py_DECREF(key);
+                continue;
+            }
+            if (dk->dk_usable <= 0) {
+                if (insertion_resize(mp, 1) < 0) {
+                    Py_DECREF(key);
+                    Py_DECREF(value);
+                    for (Py_ssize_t j = 2 * length - 1; j >= 2 * (i + 1); j--) {
+                        _PyStackRef tmp = arguments[j];
+                        arguments[j] = PyStackRef_NULL;
+                        PyStackRef_CLOSE(tmp);
+                    }
+                    Py_DECREF(dict);
+                    return NULL;
+                }
+                dk = mp->ma_keys;
+                hashpos = find_empty_slot(dk, hash, true);
+            }
+            Py_ssize_t nentries = dk->dk_nentries;
+            dictkeys_set_index(dk, hashpos, nentries);
+            PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(dk)[nentries];
+            ep->me_key = key;
+            ep->me_value = value;
+            dk->dk_usable--;
+            dk->dk_nentries = nentries + 1;
+            mp->ma_used++;
+        }
+        ASSERT_CONSISTENT(mp);
+        return dict;
+    }
+
+    for (Py_ssize_t i = 0; i < length; i++) {
+        _PyStackRef key_ref = arguments[2 * i];
+        _PyStackRef val_ref = arguments[2 * i + 1];
+        arguments[2 * i] = PyStackRef_NULL;
+        arguments[2 * i + 1] = PyStackRef_NULL;
+        PyObject *key = PyStackRef_AsPyObjectSteal(key_ref);
+        PyObject *value = PyStackRef_AsPyObjectSteal(val_ref);
+        if (setitem_take2_lock_held(mp, key, value) < 0) {
+            for (Py_ssize_t j = 2 * length - 1; j >= 2 * (i + 1); j--) {
+                _PyStackRef tmp = arguments[j];
+                arguments[j] = PyStackRef_NULL;
+                PyStackRef_CLOSE(tmp);
+            }
+            Py_DECREF(dict);
+            return NULL;
+        }
     }
 
     return dict;
@@ -2957,7 +3240,9 @@ _PyDict_SetItem_Take2(PyDictObject *mp, PyObject *key, PyObject *value)
         if (PyUnicode_CheckExact(key) && DK_IS_UNICODE(mp->ma_keys)) {
             Py_hash_t hash = ((PyASCIIObject *)key)->hash;
             if (hash != -1 && mp->ma_keys != Py_EMPTY_KEYS) {
-                Py_ssize_t ix = unicodekeys_lookup_unicode(mp->ma_keys, key, hash);
+                Py_ssize_t hashpos;
+                Py_ssize_t ix = unicodekeys_lookup_or_empty_slot(
+                    mp->ma_keys, key, hash, &hashpos, true);
                 if (ix >= 0) {
                     PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(mp->ma_keys)[ix];
                     PyObject *old_value = ep->me_value;
@@ -2971,7 +3256,7 @@ _PyDict_SetItem_Take2(PyDictObject *mp, PyObject *key, PyObject *value)
                     ASSERT_CONSISTENT(mp);
                     return 0;
                 }
-                if (insert_combined_dict(mp, hash, key, value) < 0) {
+                if (insert_combined_unicode_at_slot(mp, hash, key, value, hashpos) < 0) {
                     Py_DECREF(value);
                     Py_DECREF(key);
                     return -1;
@@ -3034,7 +3319,9 @@ setitems_take2_lock_held(PyDictObject *mp, PyObject **items, Py_ssize_t n_pairs,
                 }
                 continue;
             }
-            Py_ssize_t ix = unicodekeys_lookup_unicode(mp->ma_keys, key, hash);
+            Py_ssize_t hashpos;
+            Py_ssize_t ix = unicodekeys_lookup_or_empty_slot(
+                mp->ma_keys, key, hash, &hashpos, !IS_DICT_SHARED(mp));
             if (ix >= 0) {
                 PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(mp->ma_keys)[ix];
                 PyObject *old_value = ep->me_value;
@@ -3048,7 +3335,7 @@ setitems_take2_lock_held(PyDictObject *mp, PyObject **items, Py_ssize_t n_pairs,
                 ASSERT_CONSISTENT(mp);
                 continue;
             }
-            if (insert_combined_dict(mp, hash, key, value) < 0) {
+            if (insert_combined_unicode_at_slot(mp, hash, key, value, hashpos) < 0) {
                 Py_DECREF(key);
                 Py_DECREF(value);
                 for (Py_ssize_t j = 2 * (i + 1); j < 2 * n_pairs; j++) {
@@ -3106,6 +3393,32 @@ _PyDict_SetItem_Take2_KnownHash(PyDictObject *mp, PyObject *key, PyObject *value
         DK_IS_UNICODE(mp->ma_keys) &&
         mp->ma_values == NULL)
     {
+        if (mp->ma_keys != Py_EMPTY_KEYS) {
+            Py_ssize_t hashpos;
+            Py_ssize_t ix = unicodekeys_lookup_or_empty_slot(
+                mp->ma_keys, key, hash, &hashpos, true);
+            if (ix >= 0) {
+                PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(mp->ma_keys)[ix];
+                PyObject *old_value = ep->me_value;
+                assert(old_value != NULL);
+                if (old_value != value) {
+                    _PyDict_NotifyEvent(PyDict_EVENT_MODIFIED, mp, key, value);
+                    ep->me_value = value;
+                }
+                Py_DECREF(old_value);
+                Py_DECREF(key);
+                ASSERT_CONSISTENT(mp);
+                return 0;
+            }
+            if (insert_combined_unicode_at_slot(mp, hash, key, value, hashpos) < 0) {
+                Py_DECREF(value);
+                Py_DECREF(key);
+                return -1;
+            }
+            STORE_USED(mp, mp->ma_used + 1);
+            ASSERT_CONSISTENT(mp);
+            return 0;
+        }
         return setitem_take2_lock_held_known_hash(mp, key, value, hash);
     }
 #endif

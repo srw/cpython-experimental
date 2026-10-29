@@ -957,27 +957,8 @@ _Py_BuildMap_StackRefSteal(
     _PyStackRef *arguments,
     int half_args)
 {
-    PyObject *res;
-    STACKREFS_TO_PYOBJECTS(arguments, half_args*2, args_o);
-    if (CONVERSION_FAILED(args_o)) {
-        res = NULL;
-        goto cleanup;
-    }
-    res = _PyDict_FromItems(
-        args_o, 2,
-        args_o+1, 2,
-        half_args
-    );
-    STACKREFS_TO_PYOBJECTS_CLEANUP(args_o);
+    PyObject *res = _PyDict_FromStackRefsSteal(arguments, half_args);
     assert((res != NULL) ^ (PyErr_Occurred() != NULL));
-cleanup:
-    // arguments is a pointer into the GC visible stack,
-    // so we must NULL out values as we clear them.
-    for (int i = half_args*2-1; i >= 0; i--) {
-        _PyStackRef tmp = arguments[i];
-        arguments[i] = PyStackRef_NULL;
-        PyStackRef_CLOSE(tmp);
-    }
     return res;
 }
 

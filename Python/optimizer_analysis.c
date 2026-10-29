@@ -742,8 +742,6 @@ const uint16_t op_without_push[MAX_UOP_ID + 1] = {
 
 const bool op_skip[MAX_UOP_ID + 1] = {
     [_NOP] = true,
-    [_CHECK_VALIDITY] = true,
-    [_CHECK_PERIODIC] = true,
     [_SET_IP] = true,
 };
 
