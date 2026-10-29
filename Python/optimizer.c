@@ -1720,6 +1720,7 @@ stack_allocate(_PyUOpInstruction *buffer, _PyUOpInstruction *output, int length)
         assert(output + UOP_MAX_TRACE_LENGTH == buffer);
     }
     int depth = 0;
+    int prev_uop = _NOP;
     _PyUOpInstruction *write = output;
     for (int i = 0; i < length; i++) {
         int uop = buffer[i].opcode;
@@ -1727,6 +1728,48 @@ stack_allocate(_PyUOpInstruction *buffer, _PyUOpInstruction *output, int length)
             continue;
         }
         int new_depth = (uop == _MAKE_WARM) ? 0 : _PyUop_Caching[uop].best[depth];
+        if (depth == 3 && new_depth == 3 &&
+            (uop == _POP_TOP_INT || uop == _POP_TOP_FLOAT ||
+             uop == _POP_TOP_UNICODE || uop == _POP_TOP_NOP) &&
+            (prev_uop >= _SWAP_FAST && prev_uop <= _SWAP_FAST_7))
+        {
+            new_depth = 1;
+        }
+        else if (depth == 3 && new_depth == 2 &&
+                 _PyUop_Caching[uop].entries[1].opcode > 0 &&
+                 _PyUop_Caching[uop].entries[1].output == 2)
+        {
+            int next1 = _NOP;
+            int next2 = _NOP;
+            for (int j = i + 1; j < length; j++) {
+                if (buffer[j].opcode == _NOP) {
+                    continue;
+                }
+                if (next1 == _NOP) {
+                    next1 = buffer[j].opcode;
+                }
+                else {
+                    next2 = buffer[j].opcode;
+                    break;
+                }
+            }
+            if (next1 != _NOP &&
+                _PyUop_Caching[next1].best[3] == 2 &&
+                _PyUop_Caching[next1].entries[2].output == 3)
+            {
+                new_depth = 1;
+                if (next2 != _NOP &&
+                    _PyUop_Caching[next2].best[3] == 2 &&
+                    _PyUop_Caching[next2].entries[2].output == 3 &&
+                    _PyUop_Caching[uop].entries[0].opcode > 0 &&
+                    _PyUop_Caching[uop].entries[0].output == 1 &&
+                    _PyUop_Caching[next1].entries[1].opcode > 0 &&
+                    _PyUop_Caching[next1].entries[1].output == 2)
+                {
+                    new_depth = 0;
+                }
+            }
+        }
         if (new_depth != depth) {
             write->opcode = _PyUop_SpillsAndReloads[depth][new_depth];
             assert(write->opcode != 0);
@@ -1742,6 +1785,7 @@ stack_allocate(_PyUOpInstruction *buffer, _PyUOpInstruction *output, int length)
         write->opcode = new_opcode;
         write++;
         depth = _PyUop_Caching[uop].entries[depth].output;
+        prev_uop = uop;
     }
     return (int)(write - output);
 }

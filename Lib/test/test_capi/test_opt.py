@@ -6761,6 +6761,37 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertNotIn("_ITER_CHECK_RANGE", uops_f[mw_f:jmp_f])
         self.assertNotIn("_GUARD_NOS_FLOAT", uops_f[mw_f:jmp_f])
         self.assertNotIn("_GUARD_TOS_FLOAT", uops_f[mw_f:jmp_f])
+        self.assertIn("_LOAD_FAST_AND_CLEAR", uops_f[mw_f:jmp_f])
+        self.assertNotIn("_POP_TOP", uops_f[mw_f:jmp_f])
+        self.assertIn("_LOAD_FAST_AND_CLEAR", loop_body)
+        self.assertNotIn("_POP_TOP", loop_body)
+
+    def test_inlined_call_loop_guard_and_recursion_hoisting(self):
+        def step1(x):
+            return x + 1
+
+        def step2(x):
+            return x + 2
+
+        def f_calls(n, s1=step1, s2=step2):
+            s = 0
+            for _ in range(n):
+                s = s2(s1(s))
+            return s
+
+        res, ex = self._run_with_optimizer(f_calls, TIER2_THRESHOLD)
+        self.assertEqual(res, 3 * TIER2_THRESHOLD)
+        self.assertIsNotNone(ex)
+        uops = get_opnames(ex)
+        mw_idx = uops.index("_MAKE_WARM")
+        jmp_idx = uops.index("_JUMP_TO_TOP")
+        preheader = uops[:mw_idx]
+        loop_body = uops[mw_idx:jmp_idx]
+        self.assertIn("_ITER_CHECK_RANGE", preheader)
+        self.assertIn("_CHECK_RECURSION_REMAINING", preheader)
+        self.assertNotIn("_ITER_CHECK_RANGE", loop_body)
+        self.assertNotIn("_CHECK_RECURSION_REMAINING", loop_body)
+        self.assertEqual(loop_body.count("_PUSH_FRAME"), 2)
 
 def global_identity(x):
     return x

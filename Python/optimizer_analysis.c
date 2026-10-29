@@ -763,10 +763,18 @@ remove_unneeded_uops(_PyUOpInstruction *buffer, int buffer_size)
      * instruction could have escaped. */
     int last_set_ip = -1;
     bool may_have_escaped = true;
+    int call_depth = 0;
+    int max_checked_recursion_depth = -1;
     for (int pc = 0; pc < buffer_size; pc++) {
         int opcode = buffer[pc].opcode;
         switch (opcode) {
             case _START_EXECUTOR:
+                may_have_escaped = false;
+                call_depth = 0;
+                max_checked_recursion_depth = -1;
+                break;
+            case _MAKE_WARM:
+                last_set_ip = -1;
                 may_have_escaped = false;
                 break;
             case _SET_IP:
@@ -784,6 +792,27 @@ remove_unneeded_uops(_PyUOpInstruction *buffer, int buffer_size)
             case _EXIT_TRACE:
             default:
             {
+                if (opcode == _CHECK_RECURSION_REMAINING) {
+                    if (call_depth >= 0 && call_depth <= max_checked_recursion_depth) {
+                        buffer[pc].opcode = _NOP;
+                        break;
+                    }
+                    max_checked_recursion_depth = call_depth;
+                }
+                else if (opcode == _PUSH_FRAME || opcode == _CREATE_INIT_FRAME) {
+                    call_depth++;
+                }
+                else if (opcode == _RETURN_VALUE ||
+                         opcode == _RETURN_GENERATOR ||
+                         opcode == _YIELD_VALUE)
+                {
+                    if (call_depth > 0) {
+                        call_depth--;
+                    }
+                    else {
+                        max_checked_recursion_depth = -1;
+                    }
+                }
                 // Cancel out pushes and pops, repeatedly. So:
                 //     _LOAD_FAST + _POP_TOP + _POP_TOP + _LOAD_CONST_INLINE_BORROW + _POP_TOP
                 // ...becomes:
@@ -811,6 +840,14 @@ remove_unneeded_uops(_PyUOpInstruction *buffer, int buffer_size)
                 if (_PyUop_Flags[opcode] & HAS_ESCAPES_FLAG) {
                     needs_ip = true;
                     may_have_escaped = true;
+                    if (opcode != _CHECK_PERIODIC &&
+                        opcode != _CHECK_PERIODIC_IF_NOT_YIELD_FROM &&
+                        opcode != _TIER2_RESUME_CHECK &&
+                        opcode != _RETURN_VALUE &&
+                        opcode != _POP_TOP)
+                    {
+                        max_checked_recursion_depth = -1;
+                    }
                 }
                 if (needs_ip && last_set_ip >= 0) {
                     assert(buffer[last_set_ip].opcode == _NOP);
@@ -1218,8 +1255,19 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
         if (all_guards_hoistable) {
             _PyUOpInstruction body[32];
             int b_len = 0;
+            int load_count[64] = {0};
+            int store_count[64] = {0};
             for (int i = 2; i < length - 1; i++) {
                 if (output[i].opcode != _NOP) {
+                    uint16_t bop = output[i].opcode;
+                    if ((bop == _LOAD_FAST || bop == _LOAD_FAST_BORROW) &&
+                        output[i].oparg < 64)
+                    {
+                        load_count[output[i].oparg]++;
+                    }
+                    else if (bop == _SWAP_FAST && output[i].oparg < 64) {
+                        store_count[output[i].oparg]++;
+                    }
                     body[b_len++] = output[i];
                 }
             }
@@ -1238,7 +1286,9 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             }
             /* Loop Header */
             output[out_idx++] = make_warm_inst;
-            /* Emit Steady-State Loop Body with hoisted guards removed */
+            /* Build Steady-State Loop Body with hoisted guards removed */
+            _PyUOpInstruction sbody[32];
+            int s_len = 0;
             for (int i = 0; i < b_len; i++) {
                 uint16_t op = body[i].opcode;
                 if (op == _ITER_CHECK_RANGE ||
@@ -1251,15 +1301,140 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 {
                     continue;
                 }
-                output[out_idx++] = body[i];
+                sbody[s_len++] = body[i];
+            }
+            /* Specialize _SWAP_FAST v + _POP_TOP in steady-state loop body:
+             * after Iteration 1 (Pre-Header), any local v written in the loop
+             * holds a known int (if store_only_int[v]) or float (if store_only_float[v]). */
+            for (int i = 0; i + 1 < s_len; i++) {
+                if (sbody[i].opcode == _SWAP_FAST &&
+                    sbody[i + 1].opcode == _POP_TOP)
+                {
+                    int v = (int)sbody[i].oparg;
+                    if (v >= 0 && v < 64 && written[v]) {
+                        if (store_only_int[v]) {
+                            sbody[i + 1].opcode = _POP_TOP_INT;
+                        }
+                        else if (store_only_float[v]) {
+                            sbody[i + 1].opcode = _POP_TOP_FLOAT;
+                        }
+                    }
+                }
+            }
+            /* In-place ownership transfer for int/float accumulators in steady-state
+             * loop body: after Iteration 1 creates and stores a uniquely-owned
+             * PyLongObject/PyFloatObject into locals[v], use _LOAD_FAST_AND_CLEAR v
+             * so _BINARY_OP_{ADD,SUBTRACT,MULTIPLY}_{INT,FLOAT} mutates locals[v]
+             * in place on iterations 2..N without allocating or touching the freelist. */
+            for (int i = 0; i + 6 < s_len; i++) {
+                if (sbody[i].opcode != _LOAD_FAST_BORROW) {
+                    continue;
+                }
+                int v = (int)sbody[i].oparg;
+                if (v < 0 || v >= 64 ||
+                    !written[v] ||
+                    load_count[v] != 1 ||
+                    store_count[v] != 1)
+                {
+                    continue;
+                }
+                if (store_only_float[v]) {
+                    bool rhs_ok =
+                        (sbody[i + 1].opcode == _LOAD_FAST_BORROW &&
+                         (int)sbody[i + 1].oparg != v) ||
+                        sbody[i + 1].opcode == _LOAD_CONST_INLINE_BORROW;
+                    uint16_t binop = sbody[i + 2].opcode;
+                    bool binop_ok =
+                        binop == _BINARY_OP_ADD_FLOAT ||
+                        binop == _BINARY_OP_SUBTRACT_FLOAT ||
+                        binop == _BINARY_OP_MULTIPLY_FLOAT;
+                    bool pops_ok =
+                        (sbody[i + 3].opcode == _POP_TOP_NOP ||
+                         sbody[i + 3].opcode == _POP_TOP_FLOAT) &&
+                        sbody[i + 4].opcode == _POP_TOP_NOP;
+                    if (!rhs_ok || !binop_ok || !pops_ok) {
+                        continue;
+                    }
+                    int k = i + 5;
+                    while (k + 3 < s_len &&
+                           ((sbody[k].opcode == _LOAD_FAST_BORROW &&
+                             (int)sbody[k].oparg != v) ||
+                            sbody[k].opcode == _LOAD_CONST_INLINE_BORROW) &&
+                           (sbody[k + 1].opcode == _BINARY_OP_ADD_FLOAT_INPLACE ||
+                            sbody[k + 1].opcode == _BINARY_OP_SUBTRACT_FLOAT_INPLACE ||
+                            sbody[k + 1].opcode == _BINARY_OP_MULTIPLY_FLOAT_INPLACE) &&
+                           (sbody[k + 2].opcode == _POP_TOP_NOP ||
+                            sbody[k + 2].opcode == _POP_TOP_FLOAT) &&
+                           sbody[k + 3].opcode == _POP_TOP_NOP)
+                    {
+                        k += 4;
+                    }
+                    if (k + 1 < s_len &&
+                        sbody[k].opcode == _SWAP_FAST &&
+                        (int)sbody[k].oparg == v &&
+                        sbody[k + 1].opcode == _POP_TOP_FLOAT)
+                    {
+                        sbody[i].opcode = _LOAD_FAST_AND_CLEAR;
+                        sbody[i + 4].opcode = _POP_TOP_FLOAT;
+                        sbody[k + 1].opcode = _POP_TOP_NOP;
+                    }
+                }
+                else if (store_only_int[v]) {
+                    bool rhs_ok =
+                        (sbody[i + 1].opcode == _LOAD_FAST_BORROW &&
+                         (int)sbody[i + 1].oparg != v) ||
+                        sbody[i + 1].opcode == _LOAD_CONST_INLINE_BORROW ||
+                        sbody[i + 1].opcode == _LOAD_SMALL_INT;
+                    uint16_t binop = sbody[i + 2].opcode;
+                    bool binop_ok =
+                        binop == _BINARY_OP_ADD_INT ||
+                        binop == _BINARY_OP_SUBTRACT_INT ||
+                        binop == _BINARY_OP_MULTIPLY_INT;
+                    bool pops_ok =
+                        (sbody[i + 3].opcode == _POP_TOP_NOP ||
+                         sbody[i + 3].opcode == _POP_TOP_INT) &&
+                        sbody[i + 4].opcode == _POP_TOP_NOP;
+                    if (!rhs_ok || !binop_ok || !pops_ok) {
+                        continue;
+                    }
+                    int k = i + 5;
+                    while (k + 3 < s_len &&
+                           ((sbody[k].opcode == _LOAD_FAST_BORROW &&
+                             (int)sbody[k].oparg != v) ||
+                            sbody[k].opcode == _LOAD_CONST_INLINE_BORROW ||
+                            sbody[k].opcode == _LOAD_SMALL_INT) &&
+                           (sbody[k + 1].opcode == _BINARY_OP_ADD_INT_INPLACE ||
+                            sbody[k + 1].opcode == _BINARY_OP_SUBTRACT_INT_INPLACE ||
+                            sbody[k + 1].opcode == _BINARY_OP_MULTIPLY_INT_INPLACE) &&
+                           (sbody[k + 2].opcode == _POP_TOP_NOP ||
+                            sbody[k + 2].opcode == _POP_TOP_INT) &&
+                           (sbody[k + 3].opcode == _POP_TOP_NOP ||
+                            sbody[k + 3].opcode == _POP_TOP_INT))
+                    {
+                        k += 4;
+                    }
+                    if (k + 1 < s_len &&
+                        sbody[k].opcode == _SWAP_FAST &&
+                        (int)sbody[k].oparg == v &&
+                        sbody[k + 1].opcode == _POP_TOP_INT)
+                    {
+                        sbody[i].opcode = _LOAD_FAST_AND_CLEAR;
+                        sbody[i + 4].opcode = _POP_TOP_INT;
+                        sbody[k + 1].opcode = _POP_TOP_NOP;
+                    }
+                }
+            }
+            for (int i = 0; i < s_len; i++) {
+                output[out_idx++] = sbody[i];
             }
             output[out_idx++] = jump_inst;
-            return out_idx;
+            return remove_unneeded_uops(output, out_idx);
         }
     }
 
-    /* Fallback: Hoist leading _ITER_CHECK_{RANGE,LIST,TUPLE} before _MAKE_WARM
-     * without duplicating the loop body. */
+    /* Fallback: Hoist leading _ITER_CHECK_{RANGE,LIST,TUPLE} (and depth-0
+     * _CHECK_RECURSION_REMAINING across balanced inlined calls) before
+     * _MAKE_WARM without duplicating the loop body. */
     int lead_set_ip_idx = -1;
     int lead_check_val_idx = -1;
     int iter_check_idx = -1;
@@ -1289,21 +1464,54 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
         break;
     }
 
-    if (iter_check_idx >= 0 && length + 2 <= UOP_MAX_TRACE_LENGTH) {
+    if (iter_check_idx >= 0 && length + 3 <= UOP_MAX_TRACE_LENGTH) {
         uint16_t first_op = output[iter_check_idx].opcode;
         bool safe_to_hoist_iter = true;
+        int inline_depth = 0;
+        int first_recursion_check_idx = -1;
+        bool can_hoist_recursion_check = true;
         for (int i = iter_check_idx + 1; i < length - 1; i++) {
             uint16_t op = output[i].opcode;
             if (op == _NOP) {
                 continue;
             }
-            if (op == _RETURN_VALUE ||
-                op == _RETURN_GENERATOR ||
+            if (op == _PUSH_FRAME || op == _CREATE_INIT_FRAME) {
+                inline_depth++;
+                continue;
+            }
+            if (op == _RETURN_VALUE) {
+                inline_depth--;
+                if (inline_depth < 0) {
+                    safe_to_hoist_iter = false;
+                    break;
+                }
+                continue;
+            }
+            if (op == _RETURN_GENERATOR ||
                 op == _YIELD_VALUE ||
                 op == _DYNAMIC_EXIT)
             {
                 safe_to_hoist_iter = false;
                 break;
+            }
+            if (op == _CHECK_RECURSION_REMAINING) {
+                if (inline_depth == 0) {
+                    if (first_recursion_check_idx < 0) {
+                        first_recursion_check_idx = i;
+                    }
+                }
+                else {
+                    can_hoist_recursion_check = false;
+                }
+            }
+            if ((_PyUop_Flags[op] & HAS_ESCAPES_FLAG) &&
+                op != _CHECK_PERIODIC &&
+                op != _CHECK_PERIODIC_IF_NOT_YIELD_FROM &&
+                op != _TIER2_RESUME_CHECK &&
+                op != _POP_TOP &&
+                op != _RETURN_VALUE)
+            {
+                can_hoist_recursion_check = false;
             }
 #ifdef Py_GIL_DISABLED
             if (first_op == _ITER_CHECK_LIST &&
@@ -1313,6 +1521,9 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 break;
             }
 #endif
+        }
+        if (inline_depth != 0) {
+            safe_to_hoist_iter = false;
         }
         if (safe_to_hoist_iter) {
             _PyUOpInstruction temp[UOP_MAX_TRACE_LENGTH];
@@ -1325,6 +1536,11 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 temp[out_idx++] = output[lead_check_val_idx];
             }
             temp[out_idx++] = output[iter_check_idx];
+            if (can_hoist_recursion_check && first_recursion_check_idx >= 0) {
+                _PyUOpInstruction rec_inst = output[first_recursion_check_idx];
+                rec_inst.target = output[iter_check_idx].target;
+                temp[out_idx++] = rec_inst;
+            }
             temp[out_idx++] = output[1]; /* _MAKE_WARM */
             for (int i = 2; i < length; i++) {
                 if (i == iter_check_idx || output[i].opcode == _NOP) {
@@ -1333,7 +1549,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 temp[out_idx++] = output[i];
             }
             memcpy(output, temp, out_idx * sizeof(_PyUOpInstruction));
-            return out_idx;
+            return remove_unneeded_uops(output, out_idx);
         }
     }
 
