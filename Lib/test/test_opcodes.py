@@ -136,6 +136,34 @@ class OpcodeTest(unittest.TestCase):
                 return 42
         self.assertEqual(MyString() % 3, 42)
 
+    def test_specialized_float_and_local_container_ops(self):
+        # Exercise specialized float arithmetic in-place reuse and confirm
+        # aliased floats are never mutated in place.
+        acc = 1.5
+        saved = acc
+        for i in range(100):
+            acc = (acc + 0.5) * 1.0 - 0.25
+        self.assertEqual(saved, 1.5)
+        self.assertEqual(acc, 1.5 + 100 * 0.25)
+
+        # Exercise thread-local list subscript, store, append, and iteration.
+        items = [i for i in range(64)]
+        for i in range(64):
+            items[i] = items[i] + 1
+        total = 0
+        for x in items:
+            total += x
+        self.assertEqual(total, sum(range(1, 65)))
+
+        # Exercise thread-local unicode-keyed dict lookup and store.
+        d = {}
+        for i in range(64):
+            k = f"k_{i}"
+            d[k] = i
+            d[k] = d[k] + 10
+        self.assertEqual(d["k_0"], 10)
+        self.assertEqual(d["k_63"], 73)
+
 
 if __name__ == '__main__':
     unittest.main()

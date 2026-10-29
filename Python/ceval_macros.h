@@ -316,9 +316,26 @@ GETITEM(PyObject *v, Py_ssize_t i) {
 // avoid any potentially escaping calls (like PyStackRef_CLOSE) while the
 // object is locked.
 #ifdef Py_GIL_DISABLED
-#  define LOCK_OBJECT(op) PyMutex_LockFast(&(_PyObject_CAST(op))->ob_mutex)
-#  define UNLOCK_OBJECT(op) PyMutex_Unlock(&(_PyObject_CAST(op))->ob_mutex)
+#  define IS_UNSHARED_LOCAL_OBJECT(op) \
+    _PyObject_IsUnsharedLocal(_PyObject_CAST(op))
+#  define LOCK_SHARED_OBJECT(op) \
+    PyMutex_LockFast(&(_PyObject_CAST(op))->ob_mutex)
+#  define UNLOCK_SHARED_OBJECT(op) \
+    PyMutex_Unlock(&(_PyObject_CAST(op))->ob_mutex)
+#  define LOCK_OBJECT(op) \
+    (_PyObject_IsUnsharedLocal(_PyObject_CAST(op)) || \
+     PyMutex_LockFast(&(_PyObject_CAST(op))->ob_mutex))
+#  define UNLOCK_OBJECT(op) \
+    do { \
+        PyObject *_op = _PyObject_CAST(op); \
+        if (PyMutex_IsLocked(&_op->ob_mutex)) { \
+            PyMutex_Unlock(&_op->ob_mutex); \
+        } \
+    } while (0)
 #else
+#  define IS_UNSHARED_LOCAL_OBJECT(op) (1)
+#  define LOCK_SHARED_OBJECT(op) (1)
+#  define UNLOCK_SHARED_OBJECT(op) ((void)0)
 #  define LOCK_OBJECT(op) (1)
 #  define UNLOCK_OBJECT(op) ((void)0)
 #endif
@@ -538,7 +555,7 @@ do {                                                   \
 
 #define IS_PEP523_HOOKED(tstate) (tstate->interp->eval_frame != NULL)
 
-static inline int
+static inline Py_ALWAYS_INLINE int
 check_periodics(PyThreadState *tstate) {
     _Py_CHECK_EMSCRIPTEN_SIGNALS_PERIODICALLY();
     QSBR_QUIESCENT_STATE(tstate);
@@ -548,7 +565,7 @@ check_periodics(PyThreadState *tstate) {
     return 0;
 }
 
-static inline int
+static inline Py_ALWAYS_INLINE int
 check_periodics_at_end(PyThreadState *tstate, _PyInterpreterFrame *frame) {
     _Py_CHECK_EMSCRIPTEN_SIGNALS_PERIODICALLY();
     QSBR_QUIESCENT_STATE(tstate);
@@ -570,7 +587,7 @@ static inline bool
 gen_try_set_executing(PyGenObject *gen)
 {
 #ifdef Py_GIL_DISABLED
-    if (!_PyObject_IsUniquelyReferenced((PyObject *)gen)) {
+    if (!_PyObject_IsUnsharedLocal((PyObject *)gen)) {
         int8_t frame_state = _Py_atomic_load_int8_relaxed(&gen->gi_frame_state);
         while (frame_state < FRAME_SUSPENDED_YIELD_FROM_LOCKED) {
             if (_Py_atomic_compare_exchange_int8(&gen->gi_frame_state,
@@ -585,7 +602,7 @@ gen_try_set_executing(PyGenObject *gen)
     }
 #endif
     // Use faster non-atomic modifications in the GIL-enabled build and when
-    // the object is uniquely referenced in the free-threaded build.
+    // the object is unshared thread-local in the free-threaded build.
     if (gen->gi_frame_state < FRAME_EXECUTING) {
         assert(gen->gi_frame_state != FRAME_SUSPENDED_YIELD_FROM_LOCKED);
         gen->gi_frame_state = FRAME_EXECUTING;
@@ -681,3 +698,311 @@ gen_try_set_executing(PyGenObject *gen)
 
 #define CALL_TP_ITERITEM_NO_ESCAPE(ITER, INDEX) \
     Py_TYPE(ITER)->_tp_iteritem((ITER), (INDEX))
+
+#include "pycore_freelist.h"
+
+static inline Py_ALWAYS_INLINE PyObject *
+_PyFloat_FromDouble_Fast(double fval)
+{
+    PyFloatObject *op = _Py_FREELIST_POP(PyFloatObject, floats);
+    if (__builtin_expect(op != NULL, 1)) {
+        op->ob_fval = fval;
+        return (PyObject *)op;
+    }
+    return PyFloat_FromDouble(fval);
+}
+
+static inline Py_ALWAYS_INLINE _PyStackRef
+_PyLong_FromLong_StackRef(long x)
+{
+    if (_PY_IS_SMALL_INT(x)) {
+        return PyStackRef_FromPyObjectBorrow(
+            (PyObject *)&_PyLong_SMALL_INTS[_PY_NSMALLNEGINTS + x]);
+    }
+    if (((twodigits)x + PyLong_MASK) < ((twodigits)PyLong_MASK + PyLong_BASE)) {
+        PyLongObject *v = _Py_FREELIST_POP(PyLongObject, ints);
+        if (__builtin_expect(v != NULL, 1)) {
+            _PyLong_SetSignAndDigitCount(v, x < 0 ? -1 : 1, 1);
+            v->long_value.ob_digit[0] = (digit)(x < 0 ? -(twodigits)x : (twodigits)x);
+            return PyStackRef_FromPyObjectStealMortal((PyObject *)v);
+        }
+    }
+    PyObject *res = PyLong_FromLong(x);
+    if (res == NULL) {
+        return PyStackRef_NULL;
+    }
+    return PyStackRef_FromPyObjectSteal(res);
+}
+
+static inline Py_ALWAYS_INLINE stwodigits
+_PyLong_AsSTwoDigits_Fast(const PyLongObject *op)
+{
+    assert(op->long_value.lv_tag < (3 << _PyLong_NON_SIZE_BITS));
+    if (__builtin_expect(_PyLong_IsCompact(op), 1)) {
+        return _PyLong_CompactValue(op);
+    }
+    twodigits mag = ((twodigits)op->long_value.ob_digit[1] << PyLong_SHIFT) |
+                    op->long_value.ob_digit[0];
+    return (op->long_value.lv_tag & _PyLong_SIGN_MASK) == 0
+           ? (stwodigits)mag
+           : -(stwodigits)mag;
+}
+
+static inline Py_ALWAYS_INLINE _PyStackRef
+_PyLong_FromNonNegativeSsize_t_StackRef(Py_ssize_t x)
+{
+    assert(x >= 0);
+    if (x < _PY_NSMALLPOSINTS) {
+        return PyStackRef_FromPyObjectBorrow(
+            (PyObject *)&_PyLong_SMALL_INTS[_PY_NSMALLNEGINTS + x]);
+    }
+    if (__builtin_expect(x < PyLong_BASE, 1)) {
+        PyLongObject *v = _Py_FREELIST_POP(PyLongObject, ints);
+        if (__builtin_expect(v != NULL, 1)) {
+            _PyLong_SetSignAndDigitCount(v, 1, 1);
+            v->long_value.ob_digit[0] = (digit)x;
+            return PyStackRef_FromPyObjectStealMortal((PyObject *)v);
+        }
+    }
+    PyObject *res_o = PyLong_FromSsize_t(x);
+    if (res_o == NULL) {
+        return PyStackRef_NULL;
+    }
+    return PyStackRef_FromPyObjectSteal(res_o);
+}
+
+static inline Py_ALWAYS_INLINE _PyStackRef
+_PyLong_FromSTwoDigitsInPlace2(
+    _PyStackRef *pleft, _PyStackRef *pright,
+    PyLongObject *a, PyLongObject *b, stwodigits x)
+{
+    if (_PY_IS_SMALL_INT(x)) {
+        return PyStackRef_FromPyObjectBorrow(
+            (PyObject *)&_PyLong_SMALL_INTS[_PY_NSMALLNEGINTS + x]);
+    }
+    twodigits abs_x = x < 0 ? 0U - (twodigits)x : (twodigits)x;
+    int sign = x < 0 ? -1 : 1;
+    Py_ssize_t ndigits = (abs_x >> PyLong_SHIFT) == 0 ? 1 : 2;
+    if (PyStackRef_RefcountOnObject(*pleft) &&
+        _PyObject_IsUniquelyReferenced((PyObject *)a))
+    {
+        _PyLong_SetSignAndDigitCount(a, sign, ndigits);
+        a->long_value.ob_digit[0] = (digit)(abs_x & PyLong_MASK);
+        if (ndigits == 2) {
+            a->long_value.ob_digit[1] = (digit)(abs_x >> PyLong_SHIFT);
+        }
+        _PyStackRef res = *pleft;
+        *pleft = PyStackRef_FromPyObjectBorrow((PyObject *)a);
+        return res;
+    }
+    if (PyStackRef_RefcountOnObject(*pright) &&
+        _PyObject_IsUniquelyReferenced((PyObject *)b))
+    {
+        _PyLong_SetSignAndDigitCount(b, sign, ndigits);
+        b->long_value.ob_digit[0] = (digit)(abs_x & PyLong_MASK);
+        if (ndigits == 2) {
+            b->long_value.ob_digit[1] = (digit)(abs_x >> PyLong_SHIFT);
+        }
+        _PyStackRef res = *pright;
+        *pright = PyStackRef_FromPyObjectBorrow((PyObject *)b);
+        return res;
+    }
+    PyLongObject *v = _Py_FREELIST_POP(PyLongObject, ints);
+    if (__builtin_expect(v != NULL, 1)) {
+        _PyLong_SetSignAndDigitCount(v, sign, ndigits);
+        v->long_value.ob_digit[0] = (digit)(abs_x & PyLong_MASK);
+        if (ndigits == 2) {
+            v->long_value.ob_digit[1] = (digit)(abs_x >> PyLong_SHIFT);
+        }
+        return PyStackRef_FromPyObjectStealMortal((PyObject *)v);
+    }
+    PyObject *res_o = PyLong_FromSsize_t((Py_ssize_t)x);
+    if (res_o == NULL) {
+        return PyStackRef_NULL;
+    }
+    return PyStackRef_FromPyObjectSteal(res_o);
+}
+
+static inline Py_ALWAYS_INLINE _PyStackRef
+_PyCompactLong_FromSTwoDigitsInPlace(
+    _PyStackRef *pleft, _PyStackRef *pright,
+    PyLongObject *a, PyLongObject *b, stwodigits x,
+    _PyStackRef (*fallback)(PyLongObject *, PyLongObject *))
+{
+    if (_PY_IS_SMALL_INT(x)) {
+        return PyStackRef_FromPyObjectBorrow(
+            (PyObject *)&_PyLong_SMALL_INTS[_PY_NSMALLNEGINTS + x]);
+    }
+    if (__builtin_expect(((twodigits)x + PyLong_MASK) < ((twodigits)PyLong_MASK + PyLong_BASE), 1)) {
+        if (PyStackRef_RefcountOnObject(*pleft) &&
+            _PyObject_IsUniquelyReferenced((PyObject *)a))
+        {
+            _PyLong_SetSignAndDigitCount(a, x < 0 ? -1 : 1, 1);
+            a->long_value.ob_digit[0] = (digit)(x < 0 ? -(twodigits)x : (twodigits)x);
+            _PyStackRef res = *pleft;
+            *pleft = PyStackRef_FromPyObjectBorrow((PyObject *)a);
+            return res;
+        }
+        if (PyStackRef_RefcountOnObject(*pright) &&
+            _PyObject_IsUniquelyReferenced((PyObject *)b))
+        {
+            _PyLong_SetSignAndDigitCount(b, x < 0 ? -1 : 1, 1);
+            b->long_value.ob_digit[0] = (digit)(x < 0 ? -(twodigits)x : (twodigits)x);
+            _PyStackRef res = *pright;
+            *pright = PyStackRef_FromPyObjectBorrow((PyObject *)b);
+            return res;
+        }
+        PyLongObject *v = _Py_FREELIST_POP(PyLongObject, ints);
+        if (__builtin_expect(v != NULL, 1)) {
+            _PyLong_SetSignAndDigitCount(v, x < 0 ? -1 : 1, 1);
+            v->long_value.ob_digit[0] = (digit)(x < 0 ? -(twodigits)x : (twodigits)x);
+            return PyStackRef_FromPyObjectStealMortal((PyObject *)v);
+        }
+    }
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, x);
+#else
+    return fallback(a, b);
+#endif
+}
+
+static inline Py_ALWAYS_INLINE _PyStackRef
+_PyCompactLong_AddInPlace(
+    _PyStackRef *pleft, _PyStackRef *pright,
+    PyLongObject *a, PyLongObject *b)
+{
+    if (__builtin_expect(_PyLong_BothAreCompact(a, b), 1)) {
+        stwodigits x = _PyLong_CompactValue(a) + _PyLong_CompactValue(b);
+        return _PyCompactLong_FromSTwoDigitsInPlace(
+            pleft, pright, a, b, x, _PyCompactLong_Add);
+    }
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    stwodigits x = _PyLong_AsSTwoDigits_Fast(a) + _PyLong_AsSTwoDigits_Fast(b);
+    const stwodigits max_2digit = ((stwodigits)1 << (2 * PyLong_SHIFT)) - 1;
+    if (__builtin_expect(x >= -max_2digit && x <= max_2digit, 1)) {
+        return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, x);
+    }
+#endif
+    return PyStackRef_NULL;
+}
+
+static inline Py_ALWAYS_INLINE _PyStackRef
+_PyCompactLong_SubtractInPlace(
+    _PyStackRef *pleft, _PyStackRef *pright,
+    PyLongObject *a, PyLongObject *b)
+{
+    if (__builtin_expect(_PyLong_BothAreCompact(a, b), 1)) {
+        stwodigits x = _PyLong_CompactValue(a) - _PyLong_CompactValue(b);
+        return _PyCompactLong_FromSTwoDigitsInPlace(
+            pleft, pright, a, b, x, _PyCompactLong_Subtract);
+    }
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    stwodigits x = _PyLong_AsSTwoDigits_Fast(a) - _PyLong_AsSTwoDigits_Fast(b);
+    const stwodigits max_2digit = ((stwodigits)1 << (2 * PyLong_SHIFT)) - 1;
+    if (__builtin_expect(x >= -max_2digit && x <= max_2digit, 1)) {
+        return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, x);
+    }
+#endif
+    return PyStackRef_NULL;
+}
+
+static inline Py_ALWAYS_INLINE _PyStackRef
+_PyCompactLong_MultiplyInPlace(
+    _PyStackRef *pleft, _PyStackRef *pright,
+    PyLongObject *a, PyLongObject *b)
+{
+    if (__builtin_expect(_PyLong_BothAreCompact(a, b), 1)) {
+        stwodigits x = _PyLong_CompactValue(a) * _PyLong_CompactValue(b);
+        return _PyCompactLong_FromSTwoDigitsInPlace(
+            pleft, pright, a, b, x, _PyCompactLong_Multiply);
+    }
+#if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+    __int128 prod = (__int128)_PyLong_AsSTwoDigits_Fast(a) *
+                    (__int128)_PyLong_AsSTwoDigits_Fast(b);
+    const stwodigits max_2digit = ((stwodigits)1 << (2 * PyLong_SHIFT)) - 1;
+    if (__builtin_expect(prod >= -max_2digit && prod <= max_2digit, 1)) {
+        return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, (stwodigits)prod);
+    }
+#endif
+    return PyStackRef_NULL;
+}
+
+static inline Py_ALWAYS_INLINE int
+_PyEval_BinaryOpExtendGuardFast(_PyBinaryOpSpecializationDescr *d,
+                                PyObject *left_o, PyObject *right_o)
+{
+    if (d->guard == NULL) {
+        return Py_TYPE(left_o) == d->lhs_type && Py_TYPE(right_o) == d->rhs_type;
+    }
+    return d->guard(left_o, right_o);
+}
+
+static inline Py_ALWAYS_INLINE _PyStackRef
+_PyEval_BinaryOpInPlace(_PyStackRef *plhs, _PyStackRef *prhs,
+                        PyObject *lhs_o, PyObject *rhs_o, int oparg)
+{
+    if ((oparg == NB_TRUE_DIVIDE || oparg == NB_INPLACE_TRUE_DIVIDE) &&
+        PyFloat_CheckExact(lhs_o) && PyFloat_CheckExact(rhs_o))
+    {
+        double rval = ((PyFloatObject *)rhs_o)->ob_fval;
+        if (__builtin_expect(rval != 0.0, 1)) {
+            double dres = ((PyFloatObject *)lhs_o)->ob_fval / rval;
+            if (PyStackRef_RefcountOnObject(*plhs) &&
+                _PyObject_IsUniquelyReferenced(lhs_o))
+            {
+                ((PyFloatObject *)lhs_o)->ob_fval = dres;
+                _PyStackRef res = *plhs;
+                *plhs = PyStackRef_FromPyObjectBorrow(lhs_o);
+                return res;
+            }
+            if (PyStackRef_RefcountOnObject(*prhs) &&
+                _PyObject_IsUniquelyReferenced(rhs_o))
+            {
+                ((PyFloatObject *)rhs_o)->ob_fval = dres;
+                _PyStackRef res = *prhs;
+                *prhs = PyStackRef_FromPyObjectBorrow(rhs_o);
+                return res;
+            }
+            PyObject *d = _PyFloat_FromDouble_Fast(dres);
+            if (d == NULL) {
+                return PyStackRef_NULL;
+            }
+            return PyStackRef_FromPyObjectSteal(d);
+        }
+    }
+    PyObject *res_o = _PyEval_BinaryOps[oparg](lhs_o, rhs_o);
+    if (res_o == NULL) {
+        return PyStackRef_NULL;
+    }
+    return PyStackRef_FromPyObjectSteal(res_o);
+}
+
+static inline Py_ALWAYS_INLINE void
+_PyEval_FrameClearAndPopFast(PyThreadState *tstate, _PyInterpreterFrame *dying)
+{
+    if (__builtin_expect(
+            dying->owner == FRAME_OWNED_BY_THREAD &&
+            FT_ATOMIC_LOAD_PTR_RELAXED(dying->frame_obj) == NULL &&
+            dying->f_locals == NULL &&
+            (PyObject **)dying != &tstate->datastack_chunk->data[0], 1))
+    {
+        _PyThreadState_UpdateLastProfiledFrame(tstate, dying, tstate->current_frame);
+        assert((PyObject **)dying + _PyFrame_GetCode(dying)->co_framesize ==
+               tstate->datastack_top);
+        assert(_PyThreadState_GET()->current_frame != dying);
+        assert(dying->stackpointer != NULL);
+        _PyStackRef *sp = dying->stackpointer;
+        _PyStackRef *locals = dying->localsplus;
+        dying->stackpointer = locals;
+        while (sp > locals) {
+            sp--;
+            PyStackRef_XCLOSE(*sp);
+        }
+        PyStackRef_CLEAR(dying->f_funcobj);
+        PyStackRef_CLEAR(dying->f_executable);
+        assert(tstate->datastack_top >= (PyObject **)dying);
+        tstate->datastack_top = (PyObject **)dying;
+        return;
+    }
+    _PyEval_FrameClearAndPop(tstate, dying);
+}

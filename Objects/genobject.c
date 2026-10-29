@@ -41,6 +41,11 @@ static PyObject* async_gen_athrow_new(PyAsyncGenObject *, PyObject *);
 static bool
 gen_try_set_frame_state(PyGenObject *gen, int8_t *expected, int8_t state)
 {
+    if (_PyObject_IsUnsharedLocal((PyObject *)gen)) {
+        assert(*expected != FRAME_SUSPENDED_YIELD_FROM_LOCKED);
+        gen->gi_frame_state = state;
+        return true;
+    }
     if (*expected == FRAME_SUSPENDED_YIELD_FROM_LOCKED) {
         // Wait for the in-progress gi_yieldfrom read to complete
         _Py_yield();
@@ -170,9 +175,14 @@ gen_clear_frame(PyGenObject *gen)
     _PyInterpreterFrame *frame = &gen->gi_iframe;
     _PyThreadState_UpdateLastProfiledFrame(_PyThreadState_GET(), frame, frame->previous);
     frame->previous = NULL;
-    Py_BEGIN_CRITICAL_SECTION(gen);
-    _PyFrame_ClearExceptCode(frame);
-    Py_END_CRITICAL_SECTION();
+    if (_PyObject_IsUnsharedLocal((PyObject *)gen)) {
+        _PyFrame_ClearExceptCode(frame);
+    }
+    else {
+        Py_BEGIN_CRITICAL_SECTION(gen);
+        _PyFrame_ClearExceptCode(frame);
+        Py_END_CRITICAL_SECTION();
+    }
     _PyErr_ClearExcState(&gen->gi_exc_state);
 }
 

@@ -632,9 +632,14 @@
                 PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);
                 assert(PyLong_CheckExact(left_o));
                 assert(PyLong_CheckExact(right_o));
-                assert(_PyLong_BothAreCompact((PyLongObject *)left_o, (PyLongObject *)right_o));
                 STAT_INC(BINARY_OP, hit);
+                #if defined(TIER_ONE)
+                res_stackref = _PyCompactLong_MultiplyInPlace(
+                    &left, &right, (PyLongObject *)left_o, (PyLongObject *)right_o);
+                #else
+                assert(_PyLong_BothAreCompact((PyLongObject *)left_o, (PyLongObject *)right_o));
                 res_stackref = _PyCompactLong_Multiply((PyLongObject *)left_o, (PyLongObject *)right_o);
+                #endif
                 if (PyStackRef_IsNull(res_stackref )) {
                     ctx->done = true;
                     break;
@@ -703,9 +708,14 @@
                 PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);
                 assert(PyLong_CheckExact(left_o));
                 assert(PyLong_CheckExact(right_o));
-                assert(_PyLong_BothAreCompact((PyLongObject *)left_o, (PyLongObject *)right_o));
                 STAT_INC(BINARY_OP, hit);
+                #if defined(TIER_ONE)
+                res_stackref = _PyCompactLong_AddInPlace(
+                    &left, &right, (PyLongObject *)left_o, (PyLongObject *)right_o);
+                #else
+                assert(_PyLong_BothAreCompact((PyLongObject *)left_o, (PyLongObject *)right_o));
                 res_stackref = _PyCompactLong_Add((PyLongObject *)left_o, (PyLongObject *)right_o);
+                #endif
                 if (PyStackRef_IsNull(res_stackref )) {
                     ctx->done = true;
                     break;
@@ -774,9 +784,14 @@
                 PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);
                 assert(PyLong_CheckExact(left_o));
                 assert(PyLong_CheckExact(right_o));
-                assert(_PyLong_BothAreCompact((PyLongObject *)left_o, (PyLongObject *)right_o));
                 STAT_INC(BINARY_OP, hit);
+                #if defined(TIER_ONE)
+                res_stackref = _PyCompactLong_SubtractInPlace(
+                    &left, &right, (PyLongObject *)left_o, (PyLongObject *)right_o);
+                #else
+                assert(_PyLong_BothAreCompact((PyLongObject *)left_o, (PyLongObject *)right_o));
                 res_stackref = _PyCompactLong_Subtract((PyLongObject *)left_o, (PyLongObject *)right_o);
+                #endif
                 if (PyStackRef_IsNull(res_stackref )) {
                     ctx->done = true;
                     break;
@@ -2854,22 +2869,7 @@
             break;
         }
 
-        case _STORE_ATTR_INSTANCE_VALUE: {
-            JitOptRef owner;
-            JitOptRef value;
-            JitOptRef o;
-            owner = stack_pointer[-1];
-            value = stack_pointer[-2];
-            uint16_t offset = (uint16_t)this_instr->operand0;
-            (void)offset;
-            (void)value;
-            o = owner;
-            CHECK_STACK_BOUNDS(-1);
-            stack_pointer[-2] = o;
-            stack_pointer += -1;
-            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
-            break;
-        }
+        /* _STORE_ATTR_INSTANCE_VALUE is not a viable micro-op for tier 2 */
 
         case _LOCK_OBJECT: {
             break;
@@ -3077,13 +3077,19 @@
                 /* Start of uop copied from bytecodes for constant evaluation */
                 PyObject *left_o = PyStackRef_AsPyObjectBorrow(left);
                 PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);
+                STAT_INC(COMPARE_OP, hit);
+                #if defined(TIER_ONE) && PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
+                Py_ssize_t ileft = _PyLong_AsSTwoDigits_Fast((PyLongObject *)left_o);
+                Py_ssize_t iright = _PyLong_AsSTwoDigits_Fast((PyLongObject *)right_o);
+                #else
                 assert(_PyLong_IsCompact((PyLongObject *)left_o));
                 assert(_PyLong_IsCompact((PyLongObject *)right_o));
-                STAT_INC(COMPARE_OP, hit);
                 assert(_PyLong_DigitCount((PyLongObject *)left_o) <= 1 &&
                    _PyLong_DigitCount((PyLongObject *)right_o) <= 1);
                 Py_ssize_t ileft = _PyLong_CompactValue((PyLongObject *)left_o);
                 Py_ssize_t iright = _PyLong_CompactValue((PyLongObject *)right_o);
+                #endif
+
                 int sign_ish = COMPARISON_BIT(ileft, iright);
                 l_stackref = left;
                 r_stackref = right;
@@ -5325,11 +5331,18 @@
                 PyObject *lhs_o = PyStackRef_AsPyObjectBorrow(lhs);
                 PyObject *rhs_o = PyStackRef_AsPyObjectBorrow(rhs);
                 assert(_PyEval_BinaryOps[oparg]);
+                #if defined(TIER_ONE)
+                res_stackref = _PyEval_BinaryOpInPlace(&lhs, &rhs, lhs_o, rhs_o, oparg);
+                if (PyStackRef_IsNull(res)) {
+                    JUMP_TO_LABEL(error);
+                }
+                #else
                 PyObject *res_o = _PyEval_BinaryOps[oparg](lhs_o, rhs_o);
                 if (res_o == NULL) {
                     JUMP_TO_LABEL(error);
                 }
                 res_stackref = PyStackRef_FromPyObjectSteal(res_o);
+                #endif
                 l_stackref = lhs;
                 r_stackref = rhs;
                 /* End of uop copied from bytecodes for constant evaluation */
