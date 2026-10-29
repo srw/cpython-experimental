@@ -255,7 +255,7 @@
                 res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
             }
             else if (sym_is_compact_int(value)) {
-                res = sym_new_compact_int(ctx);
+                res = PyJitRef_MakeUnique(sym_new_compact_int(ctx));
             }
             else {
                 PyTypeObject *type = sym_get_type(value);
@@ -5467,12 +5467,15 @@
             bool rhs_int = sym_matches_type(rhs, &PyLong_Type);
             bool lhs_float = sym_matches_type(lhs, &PyFloat_Type);
             bool rhs_float = sym_matches_type(rhs, &PyFloat_Type);
+            bool is_add = (oparg == NB_ADD || oparg == NB_INPLACE_ADD);
+            bool is_sub = (oparg == NB_SUBTRACT || oparg == NB_INPLACE_SUBTRACT);
+            bool is_mul = (oparg == NB_MULTIPLY || oparg == NB_INPLACE_MULTIPLY);
             bool is_truediv = (oparg == NB_TRUE_DIVIDE
                            || oparg == NB_INPLACE_TRUE_DIVIDE);
             bool is_remainder = (oparg == NB_REMAINDER
                              || oparg == NB_INPLACE_REMAINDER);
             int emit_op = _BINARY_OP;
-            if (is_truediv || is_remainder) {
+            if (is_add || is_sub || is_mul || is_truediv || is_remainder) {
                 if (!sym_has_type(rhs)
                     && sym_get_probable_type(rhs) == &PyFloat_Type) {
                     ADD_OP(_GUARD_TOS_FLOAT, 0, 0);
@@ -5486,23 +5489,51 @@
                     lhs_float = true;
                 }
             }
-            if (is_truediv && lhs_float && rhs_float) {
+            if ((is_add || is_sub || is_mul || is_truediv) && lhs_float && rhs_float) {
                 if (PyJitRef_IsUnique(lhs)) {
-                    emit_op = _BINARY_OP_TRUEDIV_FLOAT_INPLACE;
-                    l = sym_new_null(ctx);
+                    emit_op = is_add ? _BINARY_OP_ADD_FLOAT_INPLACE :
+                    is_sub ? _BINARY_OP_SUBTRACT_FLOAT_INPLACE :
+                    is_mul ? _BINARY_OP_MULTIPLY_FLOAT_INPLACE :
+                    _BINARY_OP_TRUEDIV_FLOAT_INPLACE;
+                    l = PyJitRef_Borrow(sym_new_null(ctx));
                     r = rhs;
                 }
                 else if (PyJitRef_IsUnique(rhs)) {
-                    emit_op = _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT;
+                    emit_op = is_add ? _BINARY_OP_ADD_FLOAT_INPLACE_RIGHT :
+                    is_sub ? _BINARY_OP_SUBTRACT_FLOAT_INPLACE_RIGHT :
+                    is_mul ? _BINARY_OP_MULTIPLY_FLOAT_INPLACE_RIGHT :
+                    _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT;
                     l = lhs;
-                    r = sym_new_null(ctx);
+                    r = PyJitRef_Borrow(sym_new_null(ctx));
                 }
                 else {
-                    emit_op = _BINARY_OP_TRUEDIV_FLOAT;
+                    emit_op = is_add ? _BINARY_OP_ADD_FLOAT :
+                    is_sub ? _BINARY_OP_SUBTRACT_FLOAT :
+                    is_mul ? _BINARY_OP_MULTIPLY_FLOAT :
+                    _BINARY_OP_TRUEDIV_FLOAT;
                     l = lhs;
                     r = rhs;
                 }
                 res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
+            }
+            else if ((is_add || is_sub || is_mul)
+                 && sym_is_compact_int(lhs) && sym_is_compact_int(rhs)) {
+                if (PyJitRef_IsUnique(lhs)) {
+                    emit_op = is_add ? _BINARY_OP_ADD_INT_INPLACE :
+                    is_sub ? _BINARY_OP_SUBTRACT_INT_INPLACE :
+                    _BINARY_OP_MULTIPLY_INT_INPLACE;
+                }
+                else if (PyJitRef_IsUnique(rhs)) {
+                    emit_op = is_add ? _BINARY_OP_ADD_INT_INPLACE_RIGHT :
+                    is_sub ? _BINARY_OP_SUBTRACT_INT_INPLACE_RIGHT :
+                    _BINARY_OP_MULTIPLY_INT_INPLACE_RIGHT;
+                }
+                else {
+                    emit_op = is_add ? _BINARY_OP_ADD_INT :
+                    is_sub ? _BINARY_OP_SUBTRACT_INT :
+                    _BINARY_OP_MULTIPLY_INT;
+                }
+                res = PyJitRef_MakeUnique(sym_new_compact_int(ctx));
             }
             else if (is_truediv
                  && (lhs_int || lhs_float) && (rhs_int || rhs_float)) {

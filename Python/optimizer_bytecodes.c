@@ -297,6 +297,9 @@ dummy_func(void) {
         bool rhs_int = sym_matches_type(rhs, &PyLong_Type);
         bool lhs_float = sym_matches_type(lhs, &PyFloat_Type);
         bool rhs_float = sym_matches_type(rhs, &PyFloat_Type);
+        bool is_add = (oparg == NB_ADD || oparg == NB_INPLACE_ADD);
+        bool is_sub = (oparg == NB_SUBTRACT || oparg == NB_INPLACE_SUBTRACT);
+        bool is_mul = (oparg == NB_MULTIPLY || oparg == NB_INPLACE_MULTIPLY);
         bool is_truediv = (oparg == NB_TRUE_DIVIDE
                            || oparg == NB_INPLACE_TRUE_DIVIDE);
         bool is_remainder = (oparg == NB_REMAINDER
@@ -305,13 +308,12 @@ dummy_func(void) {
         // Promote probable-float operands to known floats via speculative
         // guards. _RECORD_TOS_TYPE / _RECORD_NOS_TYPE in the BINARY_OP macro
         // record the observed operand type during tracing, which
-        // sym_get_probable_type reads here. Applied only to ops where
-        // narrowing unlocks a meaningful downstream win:
-        //   - NB_TRUE_DIVIDE: enables the specialized float path below.
-        //   - NB_REMAINDER: lets the float result type propagate.
+        // sym_get_probable_type reads here. Applied to float arithmetic ops
+        // where narrowing unlocks specialized/in-place float uops or float
+        // result type propagation.
         // NB_POWER is excluded: speculative guards there regressed
         // test_power_type_depends_on_input_values (GH-127844).
-        if (is_truediv || is_remainder) {
+        if (is_add || is_sub || is_mul || is_truediv || is_remainder) {
             if (!sym_has_type(rhs)
                     && sym_get_probable_type(rhs) == &PyFloat_Type) {
                 ADD_OP(_GUARD_TOS_FLOAT, 0, 0);
@@ -325,23 +327,51 @@ dummy_func(void) {
                 lhs_float = true;
             }
         }
-        if (is_truediv && lhs_float && rhs_float) {
+        if ((is_add || is_sub || is_mul || is_truediv) && lhs_float && rhs_float) {
             if (PyJitRef_IsUnique(lhs)) {
-                emit_op = _BINARY_OP_TRUEDIV_FLOAT_INPLACE;
-                l = sym_new_null(ctx);
+                emit_op = is_add ? _BINARY_OP_ADD_FLOAT_INPLACE :
+                          is_sub ? _BINARY_OP_SUBTRACT_FLOAT_INPLACE :
+                          is_mul ? _BINARY_OP_MULTIPLY_FLOAT_INPLACE :
+                                   _BINARY_OP_TRUEDIV_FLOAT_INPLACE;
+                l = PyJitRef_Borrow(sym_new_null(ctx));
                 r = rhs;
             }
             else if (PyJitRef_IsUnique(rhs)) {
-                emit_op = _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT;
+                emit_op = is_add ? _BINARY_OP_ADD_FLOAT_INPLACE_RIGHT :
+                          is_sub ? _BINARY_OP_SUBTRACT_FLOAT_INPLACE_RIGHT :
+                          is_mul ? _BINARY_OP_MULTIPLY_FLOAT_INPLACE_RIGHT :
+                                   _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT;
                 l = lhs;
-                r = sym_new_null(ctx);
+                r = PyJitRef_Borrow(sym_new_null(ctx));
             }
             else {
-                emit_op = _BINARY_OP_TRUEDIV_FLOAT;
+                emit_op = is_add ? _BINARY_OP_ADD_FLOAT :
+                          is_sub ? _BINARY_OP_SUBTRACT_FLOAT :
+                          is_mul ? _BINARY_OP_MULTIPLY_FLOAT :
+                                   _BINARY_OP_TRUEDIV_FLOAT;
                 l = lhs;
                 r = rhs;
             }
             res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
+        }
+        else if ((is_add || is_sub || is_mul)
+                 && sym_is_compact_int(lhs) && sym_is_compact_int(rhs)) {
+            if (PyJitRef_IsUnique(lhs)) {
+                emit_op = is_add ? _BINARY_OP_ADD_INT_INPLACE :
+                          is_sub ? _BINARY_OP_SUBTRACT_INT_INPLACE :
+                                   _BINARY_OP_MULTIPLY_INT_INPLACE;
+            }
+            else if (PyJitRef_IsUnique(rhs)) {
+                emit_op = is_add ? _BINARY_OP_ADD_INT_INPLACE_RIGHT :
+                          is_sub ? _BINARY_OP_SUBTRACT_INT_INPLACE_RIGHT :
+                                   _BINARY_OP_MULTIPLY_INT_INPLACE_RIGHT;
+            }
+            else {
+                emit_op = is_add ? _BINARY_OP_ADD_INT :
+                          is_sub ? _BINARY_OP_SUBTRACT_INT :
+                                   _BINARY_OP_MULTIPLY_INT;
+            }
+            res = PyJitRef_MakeUnique(sym_new_compact_int(ctx));
         }
         else if (is_truediv
                 && (lhs_int || lhs_float) && (rhs_int || rhs_float)) {
@@ -782,7 +812,7 @@ dummy_func(void) {
             res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
         }
         else if (sym_is_compact_int(value)) {
-            res = sym_new_compact_int(ctx);
+            res = PyJitRef_MakeUnique(sym_new_compact_int(ctx));
         }
         else {
             PyTypeObject *type = sym_get_type(value);
