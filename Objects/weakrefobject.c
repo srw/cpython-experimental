@@ -203,16 +203,21 @@ static Py_hash_t
 weakref_hash_impl(PyWeakReference *self)
 /*[clinic end generated code: output=4904eacaabf902c9 input=f248ec0b25c064e0]*/
 {
-    if (self->hash != -1)
-        return self->hash;
+    Py_hash_t h = FT_ATOMIC_LOAD_SSIZE_RELAXED(self->hash);
+    if (h != -1) {
+        return h;
+    }
     PyObject* obj = _PyWeakref_GET_REF((PyObject*)self);
     if (obj == NULL) {
         PyErr_SetString(PyExc_TypeError, "weak object has gone away");
         return -1;
     }
-    self->hash = PyObject_Hash(obj);
+    h = PyObject_Hash(obj);
     Py_DECREF(obj);
-    return self->hash;
+    if (h != -1) {
+        FT_ATOMIC_STORE_SSIZE_RELAXED(self->hash, h);
+    }
+    return h;
 }
 
 static PyObject *
@@ -257,6 +262,25 @@ weakref_richcompare(PyObject* self, PyObject* other, int op)
         Py_RETURN_NOTIMPLEMENTED;
     }
     PyObject* obj = _PyWeakref_GET_REF(self);
+    if (obj != NULL &&
+        FT_ATOMIC_LOAD_PTR_RELAXED(_PyWeakref_CAST(other)->wr_object) == obj)
+    {
+        /* Both weakrefs point to the same live referent 'obj', which is kept
+           alive by our strong reference in 'obj'. Avoid a second atomic
+           _PyWeakref_GET_REF + Py_DECREF round-trip on the shared referent. */
+        if (Py_TYPE(obj)->tp_richcompare == PyBaseObject_Type.tp_richcompare ||
+            PyType_Check(obj) || PyFunction_Check(obj))
+        {
+            Py_DECREF(obj);
+            if (op == Py_EQ) {
+                Py_RETURN_TRUE;
+            }
+            Py_RETURN_FALSE;
+        }
+        PyObject *res = PyObject_RichCompare(obj, obj, op);
+        Py_DECREF(obj);
+        return res;
+    }
     PyObject* other_obj = _PyWeakref_GET_REF(other);
     if (obj == NULL || other_obj == NULL) {
         Py_XDECREF(obj);
@@ -381,8 +405,15 @@ is_basic_ref_or_proxy(PyWeakReference *wr)
 static void
 insert_weakref(PyWeakReference *newref, PyWeakReference **list)
 {
+    PyWeakReference *head = *list;
+    if (head != NULL && newref->hash == -1) {
+        Py_hash_t cached_hash = FT_ATOMIC_LOAD_SSIZE_RELAXED(head->hash);
+        if (cached_hash != -1) {
+            FT_ATOMIC_STORE_SSIZE_RELAXED(newref->hash, cached_hash);
+        }
+    }
     PyWeakReference *ref, *proxy;
-    get_basic_refs(*list, &ref, &proxy);
+    get_basic_refs(head, &ref, &proxy);
 
     PyWeakReference *prev;
     if (is_basic_ref(newref)) {

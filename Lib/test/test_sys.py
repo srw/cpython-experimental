@@ -2527,5 +2527,69 @@ class TestSysJIT(unittest.TestCase):
         assert_python_ok("-c", script.format(enabled=available), PYTHON_JIT="1")
 
 
+class TestSysConcurrentDispatch(unittest.TestCase):
+
+    def test_concurrent_map_basic_and_chunksize(self):
+        self.assertEqual(sys.concurrent_map(lambda x: x + 1, []), [])
+        self.assertEqual(sys.concurrent_map(lambda x: x + 1, [41]), [42])
+        items = list(range(1024))
+        expected = [x * x + 3 for x in items]
+        self.assertEqual(sys.concurrent_map(lambda x: x * x + 3, items), expected)
+        self.assertEqual(sys.concurrent_map(lambda x: x * x + 3, tuple(items), 16), expected)
+        self.assertEqual(sys.concurrent_map(lambda x: x * x + 3, (x for x in items)), expected)
+
+    def test_concurrent_map_closures_and_methods(self):
+        scale = 11
+        bias = 5
+        def transform(v):
+            return v * scale + bias
+        self.assertEqual(
+            sys.concurrent_map(transform, range(300)),
+            [v * 11 + 5 for v in range(300)],
+        )
+
+        class Multiplier:
+            def __init__(self, factor):
+                self.factor = factor
+            def apply(self, x):
+                return x * self.factor
+
+        m = Multiplier(9)
+        self.assertEqual(
+            sys.concurrent_map(m.apply, range(300)),
+            [v * 9 for v in range(300)],
+        )
+
+    def test_concurrent_map_nested_and_exceptions(self):
+        # Nested concurrent_map falls back cleanly when pool is already active
+        res = sys.concurrent_map(
+            lambda n: sum(sys.concurrent_map(lambda k: k + 1, range(8))),
+            range(32),
+        )
+        self.assertEqual(res, [36] * 32)
+
+        def boom(x):
+            if x == 127:
+                raise ZeroDivisionError("boom at 127")
+            return x * 2
+
+        with self.assertRaises(ZeroDivisionError):
+            sys.concurrent_map(boom, range(256))
+
+    def test_concurrent_perform(self):
+        out = [0] * 512
+        sys.concurrent_perform(0, lambda i: out.__setitem__(i, 99))
+        self.assertEqual(out[0], 0)
+
+        def fill(idx):
+            out[idx] = idx * 3 + 1
+
+        sys.concurrent_perform(512, fill)
+        self.assertEqual(out, [i * 3 + 1 for i in range(512)])
+
+        with self.assertRaises(ValueError):
+            sys.concurrent_perform(-1, fill)
+
+
 if __name__ == "__main__":
     unittest.main()

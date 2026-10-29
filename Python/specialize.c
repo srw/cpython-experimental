@@ -1230,7 +1230,9 @@ specialize_class_load_attr(PyObject *owner, _Py_CODEUNIT *instr,
             _Py_FALLTHROUGH;
         case METHOD:
         case NON_DESCRIPTOR:
+#ifdef Py_GIL_DISABLED
             maybe_enable_deferred_ref_count(descr);
+#endif
             write_ptr(cache->descr, descr);
             if (metaclass_check) {
                 write_u32(cache->keys_version, tp_version);

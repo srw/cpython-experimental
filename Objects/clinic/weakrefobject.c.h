@@ -11,7 +11,10 @@ weakref_hash_impl(PyWeakReference *self);
 static Py_hash_t
 weakref_hash(PyObject *self)
 {
-    Py_hash_t return_value = -1;
+    Py_hash_t return_value = FT_ATOMIC_LOAD_SSIZE_RELAXED(((PyWeakReference *)self)->hash);
+    if (return_value != -1) {
+        return return_value;
+    }
 
     Py_BEGIN_CRITICAL_SECTION(self);
     return_value = weakref_hash_impl((PyWeakReference *)self);

@@ -2650,6 +2650,509 @@ sys__is_gil_enabled_impl(PyObject *module)
 #endif
 }
 
+#if defined(Py_GIL_DISABLED) && !defined(MS_WINDOWS)
+#include <pthread.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+
+#define _PY_DISPATCH_MAX_WORKERS 7
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t worker_cv[_PY_DISPATCH_MAX_WORKERS];
+    pthread_cond_t done_cv;
+    uint64_t worker_gen[_PY_DISPATCH_MAX_WORKERS];
+    PyInterpreterState *interp;
+    pid_t owner_pid;
+    int initialized;
+    int num_spawned;
+    int busy;
+
+    /* Current batch state */
+    PyObject *func;
+    PyObject *const *items;     /* NULL for concurrent_perform */
+    PyObject *res_list;         /* NULL for concurrent_perform */
+    Py_ssize_t total_items;
+    Py_ssize_t chunk_size;
+    Py_ssize_t next_idx;        /* Atomic work-stealing cursor */
+    int active_workers;
+    int has_error;
+    PyObject *exc_value;
+} _PyDispatchPool;
+
+static _PyDispatchPool _py_dispatch_pool = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .done_cv = PTHREAD_COND_INITIALIZER,
+    .interp = NULL,
+    .owner_pid = 0,
+    .initialized = 0,
+    .num_spawned = 0,
+    .busy = 0,
+};
+
+typedef struct {
+    PyInterpreterState *interp;
+    int worker_id;
+} _PyDispatchWorkerArg;
+
+static _PyDispatchWorkerArg _py_dispatch_worker_args[_PY_DISPATCH_MAX_WORKERS];
+
+static void
+_py_dispatch_record_error(PyThreadState *tstate)
+{
+    PyObject *exc = _PyErr_GetRaisedException(tstate);
+    pthread_mutex_lock(&_py_dispatch_pool.mutex);
+    if (!_py_dispatch_pool.has_error) {
+        _Py_atomic_store_int_relaxed(&_py_dispatch_pool.has_error, 1);
+        _py_dispatch_pool.exc_value = exc;
+        exc = NULL;
+    }
+    pthread_mutex_unlock(&_py_dispatch_pool.mutex);
+    Py_XDECREF(exc);
+}
+
+static void
+_py_dispatch_prepare_callable(PyObject *func)
+{
+    if (_PyObject_IS_GC(func) && !_PyObject_HasDeferredRefcount(func)) {
+        PyUnstable_Object_EnableDeferredRefcount(func);
+    }
+    if (PyMethod_Check(func)) {
+        PyObject *self = PyMethod_GET_SELF(func);
+        PyObject *inner = PyMethod_GET_FUNCTION(func);
+        if (self != NULL && _PyObject_IS_GC(self) && !_PyObject_HasDeferredRefcount(self)) {
+            PyUnstable_Object_EnableDeferredRefcount(self);
+        }
+        if (inner != NULL) {
+            func = inner;
+            if (_PyObject_IS_GC(func) && !_PyObject_HasDeferredRefcount(func)) {
+                PyUnstable_Object_EnableDeferredRefcount(func);
+            }
+        }
+    }
+    if (PyFunction_Check(func)) {
+        PyObject *closure = PyFunction_GET_CLOSURE(func);
+        if (closure != NULL && PyTuple_CheckExact(closure)) {
+            Py_ssize_t ncells = PyTuple_GET_SIZE(closure);
+            for (Py_ssize_t i = 0; i < ncells; i++) {
+                PyObject *cell = PyTuple_GET_ITEM(closure, i);
+                if (cell != NULL && PyCell_Check(cell)) {
+                    PyObject *ref = PyCell_GET(cell);
+                    if (ref != NULL && _PyObject_IS_GC(ref) &&
+                        !_PyObject_HasDeferredRefcount(ref))
+                    {
+                        PyUnstable_Object_EnableDeferredRefcount(ref);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void
+_py_dispatch_execute_slice(PyThreadState *tstate)
+{
+    PyObject *func = _py_dispatch_pool.func;
+    PyObject *const *items = _py_dispatch_pool.items;
+    PyObject *res_list = _py_dispatch_pool.res_list;
+    Py_ssize_t total = _py_dispatch_pool.total_items;
+    Py_ssize_t fixed_chunk = _py_dispatch_pool.chunk_size;
+
+    for (;;) {
+        if (_Py_atomic_load_int_relaxed(&_py_dispatch_pool.has_error)) {
+            break;
+        }
+        Py_ssize_t chunk = fixed_chunk;
+        if (chunk <= 0) {
+            /* Guided Self-Scheduling (GSS): steal larger chunks when work is
+               plentiful, tapering down to 1 item at the tail so heterogeneous
+               cores (P-cores vs E-cores) never stall at the barrier. */
+            Py_ssize_t cur = _Py_atomic_load_ssize_relaxed(&_py_dispatch_pool.next_idx);
+            Py_ssize_t rem = total - cur;
+            if (rem <= 0) {
+                break;
+            }
+            chunk = (rem <= 256) ? 1 : (rem >> 5);
+            if (chunk > 64) {
+                chunk = 64;
+            }
+        }
+        Py_ssize_t start = _Py_atomic_add_ssize(&_py_dispatch_pool.next_idx, chunk);
+        if (start >= total) {
+            break;
+        }
+        Py_ssize_t end = start + chunk;
+        if (end > total) {
+            end = total;
+        }
+        if (items != NULL) {
+            for (Py_ssize_t i = start; i < end; i++) {
+                PyObject *arg = items[i];
+                PyObject *val = _PyObject_VectorcallTstate(tstate, func, &arg, 1, NULL);
+                if (val == NULL) {
+                    _py_dispatch_record_error(tstate);
+                    return;
+                }
+                PyList_SET_ITEM(res_list, i, val);
+            }
+        }
+        else {
+            for (Py_ssize_t i = start; i < end; i++) {
+                PyObject *idx_obj = PyLong_FromSsize_t(i);
+                if (idx_obj == NULL) {
+                    _py_dispatch_record_error(tstate);
+                    return;
+                }
+                PyObject *val = _PyObject_VectorcallTstate(tstate, func, &idx_obj, 1, NULL);
+                Py_DECREF(idx_obj);
+                if (val == NULL) {
+                    _py_dispatch_record_error(tstate);
+                    return;
+                }
+                Py_DECREF(val);
+            }
+        }
+    }
+}
+
+static void *
+_py_dispatch_worker_main(void *raw_arg)
+{
+    _PyDispatchWorkerArg *warg = (_PyDispatchWorkerArg *)raw_arg;
+    int wid = warg->worker_id;
+    PyInterpreterState *interp = warg->interp;
+
+    PyThreadState *tstate = PyThreadState_New(interp);
+    if (tstate == NULL) {
+        pthread_mutex_lock(&_py_dispatch_pool.mutex);
+        if (--_py_dispatch_pool.active_workers == 0) {
+            pthread_cond_signal(&_py_dispatch_pool.done_cv);
+        }
+        pthread_mutex_unlock(&_py_dispatch_pool.mutex);
+        return NULL;
+    }
+    PyThreadState_Swap(tstate);
+    uint64_t seen_gen = 0;
+
+    Py_BEGIN_ALLOW_THREADS
+    pthread_mutex_lock(&_py_dispatch_pool.mutex);
+    for (;;) {
+        while (_py_dispatch_pool.worker_gen[wid] == seen_gen) {
+            pthread_cond_wait(&_py_dispatch_pool.worker_cv[wid], &_py_dispatch_pool.mutex);
+        }
+        seen_gen = _py_dispatch_pool.worker_gen[wid];
+        pthread_mutex_unlock(&_py_dispatch_pool.mutex);
+
+        PyEval_RestoreThread(_save);
+        _py_dispatch_execute_slice(tstate);
+        _save = PyEval_SaveThread();
+
+        pthread_mutex_lock(&_py_dispatch_pool.mutex);
+        if (--_py_dispatch_pool.active_workers == 0) {
+            pthread_cond_signal(&_py_dispatch_pool.done_cv);
+        }
+    }
+    Py_END_ALLOW_THREADS
+    return NULL;
+}
+
+static void
+_py_dispatch_ensure_workers_locked(PyInterpreterState *interp, int needed)
+{
+    pid_t cur_pid = getpid();
+    if (_py_dispatch_pool.owner_pid != cur_pid) {
+        _py_dispatch_pool.interp = interp;
+        _py_dispatch_pool.owner_pid = cur_pid;
+        _py_dispatch_pool.initialized = 0;
+        _py_dispatch_pool.num_spawned = 0;
+        _py_dispatch_pool.busy = 0;
+        pthread_cond_init(&_py_dispatch_pool.done_cv, NULL);
+        for (int i = 0; i < _PY_DISPATCH_MAX_WORKERS; i++) {
+            pthread_cond_init(&_py_dispatch_pool.worker_cv[i], NULL);
+            _py_dispatch_pool.worker_gen[i] = 0;
+        }
+        _py_dispatch_pool.initialized = 1;
+    }
+    if (needed > _PY_DISPATCH_MAX_WORKERS) {
+        needed = _PY_DISPATCH_MAX_WORKERS;
+    }
+    while (_py_dispatch_pool.num_spawned < needed) {
+        int wid = _py_dispatch_pool.num_spawned;
+        _py_dispatch_worker_args[wid].interp = interp;
+        _py_dispatch_worker_args[wid].worker_id = wid;
+        pthread_t tid;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+#ifdef __APPLE__
+        pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+        int err = pthread_create(&tid, &attr, _py_dispatch_worker_main,
+                                 &_py_dispatch_worker_args[wid]);
+        pthread_attr_destroy(&attr);
+        if (err != 0) {
+            break;
+        }
+        _py_dispatch_pool.num_spawned++;
+    }
+}
+#endif /* Py_GIL_DISABLED && !MS_WINDOWS */
+
+PyDoc_STRVAR(concurrent_map_doc,
+"concurrent_map(func, iterable, /, chunksize=0)\n"
+"--\n"
+"\n"
+"Apply func to every item of iterable using the C-level work-stealing\n"
+"dispatch pool when free-threading is active, returning a list of results.");
+
+static PyObject *
+sys_concurrent_map(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (nargs < 2 || nargs > 3) {
+        PyErr_Format(PyExc_TypeError,
+                     "concurrent_map() takes 2 or 3 positional arguments (%zd given)",
+                     nargs);
+        return NULL;
+    }
+    PyObject *func = args[0];
+    PyObject *iterable = args[1];
+    Py_ssize_t chunksize = 0;
+    if (nargs == 3) {
+        chunksize = PyLong_AsSsize_t(args[2]);
+        if (chunksize == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+        if (chunksize < 0) {
+            PyErr_SetString(PyExc_ValueError, "chunksize must be >= 0");
+            return NULL;
+        }
+    }
+    if (!PyCallable_Check(func)) {
+        PyErr_Format(PyExc_TypeError, "'%.200s' object is not callable",
+                     Py_TYPE(func)->tp_name);
+        return NULL;
+    }
+
+    PyObject *seq = PySequence_Fast(iterable, "concurrent_map() arg 2 must be an iterable");
+    if (seq == NULL) {
+        return NULL;
+    }
+    Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+    PyObject *res_list = PyList_New(n);
+    if (res_list == NULL) {
+        Py_DECREF(seq);
+        return NULL;
+    }
+    if (n == 0) {
+        Py_DECREF(seq);
+        return res_list;
+    }
+
+    PyThreadState *tstate = _PyThreadState_GET();
+    PyObject *const *items = PySequence_Fast_ITEMS(seq);
+
+#if defined(Py_GIL_DISABLED) && !defined(MS_WINDOWS)
+    if (n > 1 && !_PyEval_IsGILEnabled(tstate) && _Py_IsMainInterpreter(tstate->interp)) {
+        _py_dispatch_prepare_callable(func);
+        int acquired = 0;
+        pthread_mutex_lock(&_py_dispatch_pool.mutex);
+        if (!_py_dispatch_pool.busy) {
+            _py_dispatch_pool.busy = 1;
+            acquired = 1;
+            Py_ssize_t csize = chunksize;
+            Py_ssize_t total_chunks = (csize > 0) ? ((n + csize - 1) / csize) : n;
+            int helper_workers = (int)(total_chunks - 1);
+            if (helper_workers > _PY_DISPATCH_MAX_WORKERS) {
+                helper_workers = _PY_DISPATCH_MAX_WORKERS;
+            }
+            if (helper_workers > 0) {
+                _py_dispatch_ensure_workers_locked(tstate->interp, helper_workers);
+                if (helper_workers > _py_dispatch_pool.num_spawned) {
+                    helper_workers = _py_dispatch_pool.num_spawned;
+                }
+            }
+
+            _py_dispatch_pool.func = func;
+            _py_dispatch_pool.items = items;
+            _py_dispatch_pool.res_list = res_list;
+            _py_dispatch_pool.total_items = n;
+            _py_dispatch_pool.chunk_size = csize;
+            _Py_atomic_store_ssize_relaxed(&_py_dispatch_pool.next_idx, 0);
+            _Py_atomic_store_int_relaxed(&_py_dispatch_pool.has_error, 0);
+            _py_dispatch_pool.exc_value = NULL;
+            _py_dispatch_pool.active_workers = helper_workers;
+
+            for (int w = 0; w < helper_workers; w++) {
+                _py_dispatch_pool.worker_gen[w]++;
+                pthread_cond_signal(&_py_dispatch_pool.worker_cv[w]);
+            }
+        }
+        pthread_mutex_unlock(&_py_dispatch_pool.mutex);
+
+        if (acquired) {
+            _py_dispatch_execute_slice(tstate);
+
+            Py_BEGIN_ALLOW_THREADS
+            pthread_mutex_lock(&_py_dispatch_pool.mutex);
+            while (_py_dispatch_pool.active_workers > 0) {
+                pthread_cond_wait(&_py_dispatch_pool.done_cv, &_py_dispatch_pool.mutex);
+            }
+            pthread_mutex_unlock(&_py_dispatch_pool.mutex);
+            Py_END_ALLOW_THREADS
+
+            int had_err = _py_dispatch_pool.has_error;
+            PyObject *exc_val = _py_dispatch_pool.exc_value;
+            _py_dispatch_pool.exc_value = NULL;
+            _py_dispatch_pool.func = NULL;
+            _py_dispatch_pool.items = NULL;
+            _py_dispatch_pool.res_list = NULL;
+
+            pthread_mutex_lock(&_py_dispatch_pool.mutex);
+            _py_dispatch_pool.busy = 0;
+            pthread_mutex_unlock(&_py_dispatch_pool.mutex);
+
+            Py_DECREF(seq);
+            if (had_err) {
+                Py_DECREF(res_list);
+                _PyErr_SetRaisedException(tstate, exc_val);
+                return NULL;
+            }
+            return res_list;
+        }
+    }
+#endif
+
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *arg = items[i];
+        PyObject *val = _PyObject_VectorcallTstate(tstate, func, &arg, 1, NULL);
+        if (val == NULL) {
+            Py_DECREF(res_list);
+            Py_DECREF(seq);
+            return NULL;
+        }
+        PyList_SET_ITEM(res_list, i, val);
+    }
+    Py_DECREF(seq);
+    return res_list;
+}
+
+PyDoc_STRVAR(concurrent_perform_doc,
+"concurrent_perform(count, func, /)\n"
+"--\n"
+"\n"
+"Execute func(0), func(1), ..., func(count - 1) concurrently across the\n"
+"C-level work-stealing dispatch pool (modeled on Grand Central Dispatch's\n"
+"concurrentPerform / dispatch_apply).");
+
+static PyObject *
+sys_concurrent_perform(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (nargs != 2) {
+        PyErr_Format(PyExc_TypeError,
+                     "concurrent_perform() takes exactly 2 positional arguments (%zd given)",
+                     nargs);
+        return NULL;
+    }
+    Py_ssize_t count = PyLong_AsSsize_t(args[0]);
+    if (count == -1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    if (count < 0) {
+        PyErr_SetString(PyExc_ValueError, "count must be >= 0");
+        return NULL;
+    }
+    PyObject *func = args[1];
+    if (!PyCallable_Check(func)) {
+        PyErr_Format(PyExc_TypeError, "'%.200s' object is not callable",
+                     Py_TYPE(func)->tp_name);
+        return NULL;
+    }
+    if (count == 0) {
+        Py_RETURN_NONE;
+    }
+
+    PyThreadState *tstate = _PyThreadState_GET();
+
+#if defined(Py_GIL_DISABLED) && !defined(MS_WINDOWS)
+    if (count > 1 && !_PyEval_IsGILEnabled(tstate) && _Py_IsMainInterpreter(tstate->interp)) {
+        _py_dispatch_prepare_callable(func);
+        int acquired = 0;
+        pthread_mutex_lock(&_py_dispatch_pool.mutex);
+        if (!_py_dispatch_pool.busy) {
+            _py_dispatch_pool.busy = 1;
+            acquired = 1;
+            int helper_workers = (count - 1 > _PY_DISPATCH_MAX_WORKERS)
+                                 ? _PY_DISPATCH_MAX_WORKERS
+                                 : (int)(count - 1);
+            if (helper_workers > 0) {
+                _py_dispatch_ensure_workers_locked(tstate->interp, helper_workers);
+                if (helper_workers > _py_dispatch_pool.num_spawned) {
+                    helper_workers = _py_dispatch_pool.num_spawned;
+                }
+            }
+
+            _py_dispatch_pool.func = func;
+            _py_dispatch_pool.items = NULL;
+            _py_dispatch_pool.res_list = NULL;
+            _py_dispatch_pool.total_items = count;
+            _py_dispatch_pool.chunk_size = 0;
+            _Py_atomic_store_ssize_relaxed(&_py_dispatch_pool.next_idx, 0);
+            _Py_atomic_store_int_relaxed(&_py_dispatch_pool.has_error, 0);
+            _py_dispatch_pool.exc_value = NULL;
+            _py_dispatch_pool.active_workers = helper_workers;
+
+            for (int w = 0; w < helper_workers; w++) {
+                _py_dispatch_pool.worker_gen[w]++;
+                pthread_cond_signal(&_py_dispatch_pool.worker_cv[w]);
+            }
+        }
+        pthread_mutex_unlock(&_py_dispatch_pool.mutex);
+
+        if (acquired) {
+            _py_dispatch_execute_slice(tstate);
+
+            Py_BEGIN_ALLOW_THREADS
+            pthread_mutex_lock(&_py_dispatch_pool.mutex);
+            while (_py_dispatch_pool.active_workers > 0) {
+                pthread_cond_wait(&_py_dispatch_pool.done_cv, &_py_dispatch_pool.mutex);
+            }
+            pthread_mutex_unlock(&_py_dispatch_pool.mutex);
+            Py_END_ALLOW_THREADS
+
+            int had_err = _py_dispatch_pool.has_error;
+            PyObject *exc_val = _py_dispatch_pool.exc_value;
+            _py_dispatch_pool.exc_value = NULL;
+            _py_dispatch_pool.func = NULL;
+
+            pthread_mutex_lock(&_py_dispatch_pool.mutex);
+            _py_dispatch_pool.busy = 0;
+            pthread_mutex_unlock(&_py_dispatch_pool.mutex);
+
+            if (had_err) {
+                _PyErr_SetRaisedException(tstate, exc_val);
+                return NULL;
+            }
+            Py_RETURN_NONE;
+        }
+    }
+#endif
+
+    for (Py_ssize_t i = 0; i < count; i++) {
+        PyObject *idx_obj = PyLong_FromSsize_t(i);
+        if (idx_obj == NULL) {
+            return NULL;
+        }
+        PyObject *val = _PyObject_VectorcallTstate(tstate, func, &idx_obj, 1, NULL);
+        Py_DECREF(idx_obj);
+        if (val == NULL) {
+            return NULL;
+        }
+        Py_DECREF(val);
+    }
+    Py_RETURN_NONE;
+}
+
 
 #ifndef MS_WINDOWS
 static PerfMapState perf_map_state;
@@ -2959,6 +3462,10 @@ static PyMethodDef sys_methods[] = {
     SYS__GET_CPU_COUNT_CONFIG_METHODDEF
     SYS__IS_GIL_ENABLED_METHODDEF
     SYS__DUMP_TRACELETS_METHODDEF
+    {"concurrent_map", _PyCFunction_CAST(sys_concurrent_map),
+     METH_FASTCALL, concurrent_map_doc},
+    {"concurrent_perform", _PyCFunction_CAST(sys_concurrent_perform),
+     METH_FASTCALL, concurrent_perform_doc},
     {NULL, NULL}  // sentinel
 };
 

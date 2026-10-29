@@ -318,6 +318,8 @@ partial_new(PyTypeObject *type, PyObject *args, PyObject *kw)
     }
 
     partial_setvectorcall(pto);
+    PyUnstable_Object_EnableDeferredRefcount((PyObject *)pto);
+    PyUnstable_Object_EnableDeferredRefcount(pto->fn);
     return (PyObject *)pto;
 }
 
@@ -1243,16 +1245,22 @@ lru_cache_make_key(PyObject *kwd_mark, PyObject *args,
     kwds_size = kwds ? PyDict_GET_SIZE(kwds) : 0;
 
     /* short path, key will match args anyway, which is a tuple */
-    if (!typed && !kwds_size) {
+    if (!kwds_size) {
         if (PyTuple_GET_SIZE(args) == 1) {
             key = PyTuple_GET_ITEM(args, 0);
-            if (PyUnicode_CheckExact(key) || PyLong_CheckExact(key)) {
-                /* For common scalar keys, save space by
-                   dropping the enclosing args tuple  */
-                return Py_NewRef(key);
+            if (!typed) {
+                if (PyUnicode_CheckExact(key) || PyLong_CheckExact(key)) {
+                    /* For common scalar keys, save space by
+                       dropping the enclosing args tuple  */
+                    return Py_NewRef(key);
+                }
+                return Py_NewRef(args);
             }
+            return PyTuple_Pack(2, key, (PyObject *)Py_TYPE(key));
         }
-        return Py_NewRef(args);
+        if (!typed) {
+            return Py_NewRef(args);
+        }
     }
 
     key_size = PyTuple_GET_SIZE(args);
@@ -1335,6 +1343,7 @@ infinite_lru_cache_wrapper(lru_cache_object *self, PyObject *args, PyObject *kwd
         Py_DECREF(key);
         return NULL;
     }
+    PyUnstable_Object_EnableDeferredRefcount(result);
     if (_PyDict_SetItem_KnownHash(self->cache, key, result, hash) < 0) {
         Py_DECREF(result);
         Py_DECREF(key);
@@ -1405,28 +1414,32 @@ lru_cache_prepend_link(lru_cache_object *self, lru_list_elem *link)
  */
 
 static int
-bounded_lru_cache_get_lock_held(lru_cache_object *self, PyObject *args, PyObject *kwds,
-                                PyObject **result, PyObject **key, Py_hash_t *hash)
+bounded_lru_cache_get(lru_cache_object *self, PyObject *key_, Py_hash_t hash_,
+                      PyObject **result)
 {
-    _Py_CRITICAL_SECTION_ASSERT_OBJECT_LOCKED(self);
     lru_list_elem *link;
 
-    PyObject *key_ = *key = lru_cache_make_key(self->kwd_mark, args, kwds, self->typed);
-    if (!key_)
-        return -1;
-    Py_hash_t hash_ = *hash = PyObject_Hash(key_);
-    if (hash_ == -1) {
-        Py_DECREF(key_);  /* dead reference left in *key, is not used */
-        return -1;
-    }
-    int res = _PyDict_GetItemRef_KnownHash_LockHeld((PyDictObject *)self->cache, key_, hash_,
-                                                    (PyObject **)&link);
+    int res = _PyDict_GetItemRef_KnownHash((PyDictObject *)self->cache, key_, hash_,
+                                           (PyObject **)&link);
     if (res > 0) {
-        lru_cache_extract_link(link);
-        lru_cache_append_link(self, link);
-        *result = link->result;
+        *result = Py_NewRef(link->result);
+#ifdef Py_GIL_DISABLED
+        if (FT_ATOMIC_LOAD_PTR_RELAXED(link->next) != &self->root &&
+            _PyMutex_LockTimed(&((PyObject *)self)->ob_mutex, 0, 0) == PY_LOCK_ACQUIRED)
+        {
+            if (link->prev != NULL && link->next != NULL && link->next != &self->root) {
+                lru_cache_extract_link(link);
+                lru_cache_append_link(self, link);
+            }
+            _PyMutex_Unlock(&((PyObject *)self)->ob_mutex);
+        }
+#else
+        if (link->next != &self->root) {
+            lru_cache_extract_link(link);
+            lru_cache_append_link(self, link);
+        }
+#endif
         FT_ATOMIC_ADD_SSIZE(self->hits, 1);
-        Py_INCREF(link->result);
         Py_DECREF(link);
         Py_DECREF(key_);
         return 1;
@@ -1452,8 +1465,9 @@ bounded_lru_cache_update_lock_held(lru_cache_object *self,
         Py_DECREF(key);
         return NULL;
     }
-    res = _PyDict_GetItemRef_KnownHash_LockHeld((PyDictObject *)self->cache, key, hash,
-                                                &testresult);
+    PyUnstable_Object_EnableDeferredRefcount(result);
+    res = _PyDict_GetItemRef_KnownHash((PyDictObject *)self->cache, key, hash,
+                                       &testresult);
     if (res > 0) {
         /* Getting here means that this same key was added to the cache
            during the PyObject_Call().  Since the link update is already
@@ -1488,6 +1502,8 @@ bounded_lru_cache_update_lock_held(lru_cache_object *self,
             return NULL;
         }
 
+        link->prev = NULL;
+        link->next = NULL;
         link->hash = hash;
         link->key = key;
         link->result = result;
@@ -1496,8 +1512,8 @@ bounded_lru_cache_update_lock_held(lru_cache_object *self,
            this same key, then this setitem call will update the cache dict
            with this new link, leaving the old link as an orphan (i.e. not
            having a cache dict entry that refers to it). */
-        if (_PyDict_SetItem_KnownHash_LockHeld((PyDictObject *)self->cache, key,
-                                               (PyObject *)link, hash) < 0) {
+        if (_PyDict_SetItem_KnownHash(self->cache, key,
+                                      (PyObject *)link, hash) < 0) {
             Py_DECREF(link);
             return NULL;
         }
@@ -1516,12 +1532,14 @@ bounded_lru_cache_update_lock_held(lru_cache_object *self,
        make sense to reinsert the link, so we leave it out
        and the cache will no longer register as full.
     */
-    PyObject *oldkey, *oldresult, *popresult;
+    PyObject *popresult;
 
     /* Extract the oldest item. */
     assert(self->root.next != &self->root);
     link = self->root.next;
     lru_cache_extract_link(link);
+    link->prev = NULL;
+    link->next = NULL;
     /* Remove it from the cache.
        The cache dict holds one reference to the link.
        We created one other reference when the link was created.
@@ -1550,27 +1568,43 @@ bounded_lru_cache_update_lock_held(lru_cache_object *self,
         return result;
     }
 
-    /* Keep a reference to the old key and old result to prevent their
-       ref counts from going to zero during the update. That will
-       prevent potentially arbitrary object clean-up code (i.e. __del__)
-       from running while we're still adjusting the links. */
     assert(popresult != NULL);
-    oldkey = link->key;
-    oldresult = link->result;
+#ifdef Py_GIL_DISABLED
+    lru_list_elem *new_link = (lru_list_elem *)PyObject_New(lru_list_elem,
+                                                            self->lru_list_elem_type);
+    if (new_link == NULL) {
+        Py_DECREF(popresult);
+        Py_DECREF(link);
+        Py_DECREF(key);
+        Py_DECREF(result);
+        return NULL;
+    }
+    new_link->prev = NULL;
+    new_link->next = NULL;
+    new_link->hash = hash;
+    new_link->key = key;
+    new_link->result = result;
+    if (_PyDict_SetItem_KnownHash(self->cache, key,
+                                  (PyObject *)new_link, hash) < 0) {
+        Py_DECREF(new_link);
+        Py_DECREF(popresult);
+        Py_DECREF(link);
+        return NULL;
+    }
+    lru_cache_append_link(self, new_link);
+    Py_INCREF(result); /* for return */
+    Py_DECREF(popresult);
+    Py_DECREF(link);
+    return result;
+#else
+    PyObject *oldkey = link->key;
+    PyObject *oldresult = link->result;
 
     link->hash = hash;
     link->key = key;
     link->result = result;
-    /* Note:  The link is being added to the cache dict without the
-       prev and next fields set to valid values.   We have to wait
-       for successful insertion in the cache dict before adding the
-       link to the linked list.  Otherwise, the potentially reentrant
-       __eq__ call could cause the then orphan link to be visited. */
-    if (_PyDict_SetItem_KnownHash_LockHeld((PyDictObject *)self->cache, key,
-                                           (PyObject *)link, hash) < 0) {
-        /* Somehow the cache dict update failed.  We no longer can
-           restore the old link.  Let the error propagate upward and
-           leave the cache short one link. */
+    if (_PyDict_SetItem_KnownHash(self->cache, key,
+                                  (PyObject *)link, hash) < 0) {
         Py_DECREF(popresult);
         Py_DECREF(link);
         Py_DECREF(oldkey);
@@ -1583,6 +1617,7 @@ bounded_lru_cache_update_lock_held(lru_cache_object *self,
     Py_DECREF(oldkey);
     Py_DECREF(oldresult);
     return result;
+#endif
 }
 
 static PyObject *
@@ -1592,9 +1627,17 @@ bounded_lru_cache_wrapper(lru_cache_object *self, PyObject *args, PyObject *kwds
     Py_hash_t hash;
     int res;
 
-    Py_BEGIN_CRITICAL_SECTION(self);
-    res = bounded_lru_cache_get_lock_held(self, args, kwds, &result, &key, &hash);
-    Py_END_CRITICAL_SECTION();
+    key = lru_cache_make_key(self->kwd_mark, args, kwds, self->typed);
+    if (!key) {
+        return NULL;
+    }
+    hash = PyObject_Hash(key);
+    if (hash == -1) {
+        Py_DECREF(key);
+        return NULL;
+    }
+
+    res = bounded_lru_cache_get(self, key, hash, &result);
 
     if (res < 0) {
         return NULL;
@@ -1688,6 +1731,8 @@ lru_cache_new(PyTypeObject *type, PyObject *args, PyObject *kw)
     obj->cache_info_type = Py_NewRef(cache_info_type);
     obj->dict = NULL;
     obj->weakreflist = NULL;
+    PyUnstable_Object_EnableDeferredRefcount((PyObject *)obj);
+    PyUnstable_Object_EnableDeferredRefcount(obj->func);
     return (PyObject *)obj;
 }
 
@@ -1708,6 +1753,8 @@ lru_cache_clear_list(lru_list_elem *link)
 {
     while (link != NULL) {
         lru_list_elem *next = link->next;
+        link->prev = NULL;
+        link->next = NULL;
         Py_SETREF(link, next);
     }
 }
@@ -1800,13 +1847,7 @@ _functools__lru_cache_wrapper_cache_clear_impl(PyObject *self)
     lru_list_elem *list = lru_cache_unlink_list(_self);
     FT_ATOMIC_STORE_SSIZE_RELAXED(_self->hits, 0);
     FT_ATOMIC_STORE_SSIZE_RELAXED(_self->misses, 0);
-    if (_self->wrapper == bounded_lru_cache_wrapper) {
-        /* The critical section on the lru cache itself protects the dictionary
-           for bounded_lru_cache instances. */
-        _PyDict_Clear_LockHeld(_self->cache);
-    } else {
-        PyDict_Clear(_self->cache);
-    }
+    PyDict_Clear(_self->cache);
     lru_cache_clear_list(list);
     Py_RETURN_NONE;
 }
