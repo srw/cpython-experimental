@@ -13,6 +13,7 @@
 #include "pycore_pybuffer.h"      // _PyBuffer_ReleaseInInterpreterAndRawFree()
 #include "pycore_pyerrors.h"      // _PyErr_Occurred()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
+#include "pycore_sysmodule.h"     // _PyMap_MaterializeList()
 #include "pycore_tuple.h"         // _PyTuple_FromArraySteal()
 #include "pycore_unionobject.h"   // _PyUnion_Check()
 
@@ -2021,6 +2022,17 @@ PySequence_Tuple(PyObject *v)
     }
     if (PyList_CheckExact(v))
         return PyList_AsTuple(v);
+    if (Py_IS_TYPE(v, &PyMap_Type)) {
+        PyObject *mapped = _PyMap_MaterializeList(v);
+        if (mapped != NULL) {
+            PyObject *res = PyList_AsTuple(mapped);
+            Py_DECREF(mapped);
+            return res;
+        }
+        if (PyErr_Occurred()) {
+            return NULL;
+        }
+    }
 
     /* Get iterator. */
     it = PyObject_GetIter(v);

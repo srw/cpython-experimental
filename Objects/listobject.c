@@ -14,6 +14,7 @@
 #include "pycore_pyatomic_ft_wrappers.h"
 #include "pycore_setobject.h"     // _PySet_NextEntry()
 #include "pycore_stackref.h"      // _Py_TryIncrefCompareStackRef()
+#include "pycore_sysmodule.h"     // _PyMap_MaterializeList()
 #include "pycore_tuple.h"         // _PyTuple_FromArraySteal()
 #include "pycore_typeobject.h"    // _Py_TYPE_VERSION_LIST
 #include <stddef.h>
@@ -1611,6 +1612,20 @@ _list_extend(PyListObject *self, PyObject *iterable)
         Py_BEGIN_CRITICAL_SECTION2(self, dict);
         res = list_extend_dictitems(self, dict);
         Py_END_CRITICAL_SECTION2();
+    }
+    else if (Py_IS_TYPE(iterable, &PyMap_Type)) {
+        PyObject *mapped = _PyMap_MaterializeList(iterable);
+        if (mapped != NULL) {
+            Py_BEGIN_CRITICAL_SECTION(self);
+            res = list_extend_lock_held(self, mapped);
+            Py_END_CRITICAL_SECTION();
+            Py_DECREF(mapped);
+        }
+        else if (!PyErr_Occurred()) {
+            Py_BEGIN_CRITICAL_SECTION(self);
+            res = list_extend_iter_lock_held(self, iterable);
+            Py_END_CRITICAL_SECTION();
+        }
     }
     else {
         Py_BEGIN_CRITICAL_SECTION(self);

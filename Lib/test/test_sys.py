@@ -2590,6 +2590,62 @@ class TestSysConcurrentDispatch(unittest.TestCase):
         with self.assertRaises(ValueError):
             sys.concurrent_perform(-1, fill)
 
+    def test_dispatch_threshold_api_and_cli(self):
+        orig = sys.get_dispatch_threshold()
+        try:
+            sys.set_dispatch_threshold("off")
+            self.assertEqual(sys.get_dispatch_threshold(), 0)
+            self.assertEqual(sys.concurrent_map(lambda x: x + 1, range(64)), list(range(1, 65)))
+
+            sys.set_dispatch_threshold(128)
+            self.assertEqual(sys.get_dispatch_threshold(), 128)
+            self.assertEqual(list(map(lambda x: x * 2, list(range(64)))), [x * 2 for x in range(64)])
+
+            sys.set_dispatch_threshold("auto")
+            self.assertEqual(sys.get_dispatch_threshold(), -1)
+
+            with self.assertRaises(ValueError):
+                sys.set_dispatch_threshold(-2)
+            with self.assertRaises(ValueError):
+                sys.set_dispatch_threshold("invalid")
+            with self.assertRaises(TypeError):
+                sys.set_dispatch_threshold(True)
+        finally:
+            sys.set_dispatch_threshold(orig)
+
+        assert_python_ok(
+            "-X", "dispatch_threshold=256",
+            "-c", "import sys; assert sys.get_dispatch_threshold() == 256",
+        )
+        assert_python_ok(
+            "-X", "dispatch_threshold=off",
+            "-c", "import sys; assert sys.get_dispatch_threshold() == 0",
+        )
+        assert_python_ok(
+            "-c", "import sys; assert sys.get_dispatch_threshold() == 64",
+            PYTHON_DISPATCH_THRESHOLD="64",
+        )
+
+    def test_transparent_map_materialization(self):
+        def heavy_poly(n):
+            acc = 0
+            for i in range(200):
+                acc += (n + i) * (n ^ i)
+            return acc
+
+        inputs = list(range(32))
+        expected = [heavy_poly(x) for x in inputs]
+        self.assertEqual(list(map(heavy_poly, inputs)), expected)
+        self.assertEqual(tuple(map(heavy_poly, tuple(inputs))), tuple(expected))
+        self.assertEqual(sum(map(heavy_poly, inputs)), sum(expected))
+
+        # Partially consumed map iterator must only materialize remaining items
+        m = map(heavy_poly, inputs)
+        first = next(m)
+        self.assertEqual(first, expected[0])
+        self.assertEqual(list(m), expected[1:])
+        self.assertEqual(list(m), [])
+
 
 if __name__ == "__main__":
     unittest.main()

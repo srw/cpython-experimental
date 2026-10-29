@@ -27,6 +27,15 @@ extern void _PySys_FormatV(
     const char *format,
     va_list va);
 
+extern PyObject *_PySys_DispatchMapArray(
+    PyObject *func,
+    PyObject *const *items,
+    Py_ssize_t n,
+    Py_ssize_t chunksize,
+    int is_explicit);
+
+extern PyObject *_PyMap_MaterializeList(PyObject *map_obj);
+
 #ifdef __cplusplus
 }
 #endif

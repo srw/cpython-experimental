@@ -11,12 +11,14 @@
 #include "pycore_interp.h"        // _PyInterpreterState_GetConfig()
 #include "pycore_import.h"        // _PyImport_LazyImportModuleLevelObject  ()
 #include "pycore_iterobject.h"    // _PyCallIter_NewEx()
+#include "pycore_list.h"          // _PyListIterObject
 #include "pycore_long.h"          // _PyLong_CompactValue
 #include "pycore_modsupport.h"    // _PyArg_NoKwnames()
 #include "pycore_object.h"        // _Py_AddToAllObjects()
 #include "pycore_pyerrors.h"      // _PyErr_NoMemory()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
 #include "pycore_pythonrun.h"     // _Py_SourceAsString()
+#include "pycore_sysmodule.h"     // _PySys_DispatchMapArray()
 #include "pycore_tuple.h"         // _PyTuple_Recycle()
 
 #include "clinic/bltinmodule.c.h"
@@ -1583,6 +1585,76 @@ map_traverse(PyObject *self, visitproc visit, void *arg)
     return 0;
 }
 
+static inline int
+_py_map_is_parallelizable_callable(PyObject *func)
+{
+    if (PyFunction_Check(func)) {
+        return 1;
+    }
+    if (PyMethod_Check(func)) {
+        PyObject *inner = PyMethod_GET_FUNCTION(func);
+        return inner != NULL && PyFunction_Check(inner);
+    }
+    return 0;
+}
+
+PyObject *
+_PyMap_MaterializeList(PyObject *map_obj)
+{
+    if (!Py_IS_TYPE(map_obj, &PyMap_Type)) {
+        return NULL;
+    }
+    mapobject *lz = _mapobject_CAST(map_obj);
+    if (lz->strict || lz->iters == NULL || PyTuple_GET_SIZE(lz->iters) != 1) {
+        return NULL;
+    }
+    if (!_py_map_is_parallelizable_callable(lz->func)) {
+        return NULL;
+    }
+    PyObject *it = PyTuple_GET_ITEM(lz->iters, 0);
+    if (Py_IS_TYPE(it, &PyListIter_Type)) {
+        _PyListIterObject *lit = (_PyListIterObject *)it;
+        PyListObject *seq = lit->it_seq;
+        Py_ssize_t idx = lit->it_index;
+        if (seq == NULL) {
+            return PyList_New(0);
+        }
+        Py_ssize_t n = PyList_GET_SIZE(seq);
+        if (idx < 0 || idx >= n) {
+            lit->it_seq = NULL;
+            Py_DECREF(seq);
+            return PyList_New(0);
+        }
+        lit->it_seq = NULL;
+        lit->it_index = -1;
+        PyObject *res = _PySys_DispatchMapArray(
+            lz->func, _PyList_ITEMS(seq) + idx, n - idx, 0, 0);
+        Py_DECREF(seq);
+        return res;
+    }
+    if (Py_IS_TYPE(it, &PyTupleIter_Type)) {
+        _PyTupleIterObject *tit = (_PyTupleIterObject *)it;
+        PyTupleObject *seq = tit->it_seq;
+        Py_ssize_t idx = tit->it_index;
+        if (seq == NULL) {
+            return PyList_New(0);
+        }
+        Py_ssize_t n = PyTuple_GET_SIZE(seq);
+        if (idx < 0 || idx >= n) {
+            tit->it_seq = NULL;
+            Py_DECREF(seq);
+            return PyList_New(0);
+        }
+        tit->it_seq = NULL;
+        tit->it_index = -1;
+        PyObject *res = _PySys_DispatchMapArray(
+            lz->func, _PyTuple_ITEMS(seq) + idx, n - idx, 0, 0);
+        Py_DECREF(seq);
+        return res;
+    }
+    return NULL;
+}
+
 static PyObject *
 map_next(PyObject *self)
 {
@@ -2842,8 +2914,24 @@ builtin_sum_impl(PyObject *module, PyObject *iterable, PyObject *start)
 {
     PyObject *result = start;
     PyObject *temp, *item, *iter;
+    PyObject *mapped_list = NULL;
+
+    if (Py_IS_TYPE(iterable, &PyMap_Type) &&
+        (result == NULL || (!PyUnicode_Check(result) &&
+                            !PyBytes_Check(result) &&
+                            !PyByteArray_Check(result))))
+    {
+        mapped_list = _PyMap_MaterializeList(iterable);
+        if (mapped_list == NULL && PyErr_Occurred()) {
+            return NULL;
+        }
+        if (mapped_list != NULL) {
+            iterable = mapped_list;
+        }
+    }
 
     iter = PyObject_GetIter(iterable);
+    Py_XDECREF(mapped_list);
     if (iter == NULL)
         return NULL;
 
