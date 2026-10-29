@@ -179,6 +179,7 @@ static inline void Py_SET_REFCNT(PyObject *ob, Py_ssize_t refcnt) {
             ob->ob_tid = _Py_UNOWNED_TID;
             ob->ob_ref_local = _Py_IMMORTAL_REFCNT_LOCAL;
             ob->ob_ref_shared = 0;
+            ob->ob_flags |= _Py_IMMORTAL_FLAGS;
         }
         else {
             // Set local refcount to desired refcount and shared refcount
@@ -366,7 +367,7 @@ static inline void Py_DECREF(const char *filename, int lineno, PyObject *op)
 #define Py_DECREF(op) Py_DECREF(__FILE__, __LINE__, _PyObject_CAST(op))
 
 #elif defined(Py_GIL_DISABLED)
-static inline void Py_DECREF(PyObject *op)
+static inline Py_ALWAYS_INLINE void Py_DECREF(PyObject *op)
 {
     uint32_t local = _Py_atomic_load_uint32_relaxed(&op->ob_ref_local);
     if (local == _Py_IMMORTAL_REFCNT_LOCAL) {

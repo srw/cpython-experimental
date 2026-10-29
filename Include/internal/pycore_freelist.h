@@ -12,9 +12,10 @@ extern "C" {
 #include "pycore_interp_structs.h"      // PyInterpreterState
 #include "pycore_pyatomic_ft_wrappers.h" // FT_ATOMIC_STORE_PTR_RELAXED()
 #include "pycore_pystate.h"             // _PyThreadState_GET
+#include "pycore_runtime.h"             // _PyRuntime
 #include "pycore_stats.h"               // OBJECT_STAT_INC
 
-static inline struct _Py_freelists *
+static inline Py_ALWAYS_INLINE struct _Py_freelists *
 _Py_freelists_GET(void)
 {
 #ifdef Py_DEBUG
@@ -49,7 +50,7 @@ _Py_freelists_GET(void)
 
 #define _Py_FREELIST_SIZE(NAME) (int)((_Py_freelists_GET()->NAME).size)
 
-static inline int
+static inline Py_ALWAYS_INLINE int
 _PyFreeList_Push(struct _Py_freelist *fl, void *obj, Py_ssize_t maxsize)
 {
     if (fl->size < maxsize && fl->size >= 0) {
@@ -62,7 +63,7 @@ _PyFreeList_Push(struct _Py_freelist *fl, void *obj, Py_ssize_t maxsize)
     return 0;
 }
 
-static inline void
+static inline Py_ALWAYS_INLINE void
 _PyFreeList_Free(struct _Py_freelist *fl, void *obj, Py_ssize_t maxsize,
                  freefunc dofree)
 {
@@ -71,7 +72,7 @@ _PyFreeList_Free(struct _Py_freelist *fl, void *obj, Py_ssize_t maxsize,
     }
 }
 
-static inline void *
+static inline Py_ALWAYS_INLINE void *
 _PyFreeList_PopNoStats(struct _Py_freelist *fl)
 {
     void *obj = fl->freelist;
@@ -83,18 +84,31 @@ _PyFreeList_PopNoStats(struct _Py_freelist *fl)
     return obj;
 }
 
-static inline PyObject *
+static inline Py_ALWAYS_INLINE PyObject *
 _PyFreeList_Pop(struct _Py_freelist *fl)
 {
     PyObject *op = _PyFreeList_PopNoStats(fl);
     if (op != NULL) {
         OBJECT_STAT_INC(from_freelist);
+#if defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && !defined(Py_TRACE_REFS) && !defined(_Py_THREAD_SANITIZER)
+        op->ob_tid = _Py_ThreadId();
+        op->ob_flags = 0;
+        op->ob_mutex = (PyMutex){ 0 };
+        op->ob_gc_bits = 0;
+        op->ob_ref_local = 1;
+        op->ob_ref_shared = 0;
+        if (__builtin_expect(_PyRuntime.ref_tracer.tracer_func != NULL, 0)) {
+            _PyRuntime.ref_tracer.tracer_func(
+                op, PyRefTracer_CREATE, _PyRuntime.ref_tracer.tracer_data);
+        }
+#else
         _Py_NewReference(op);
+#endif
     }
     return op;
 }
 
-static inline void *
+static inline Py_ALWAYS_INLINE void *
 _PyFreeList_PopMem(struct _Py_freelist *fl)
 {
     void *op = _PyFreeList_PopNoStats(fl);

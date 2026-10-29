@@ -75,7 +75,7 @@ PyAPI_FUNC(int) _PyObject_IsFreed(PyObject *);
 #define _PyObject_HEAD_INIT(type)                   \
     {                                               \
         .ob_ref_local = _Py_IMMORTAL_REFCNT_LOCAL,  \
-        .ob_flags = _Py_STATICALLY_ALLOCATED_FLAG,  \
+        .ob_flags = (_Py_STATICALLY_ALLOCATED_FLAG | _Py_IMMORTAL_FLAGS), \
         .ob_gc_bits = _PyGC_BITS_DEFERRED,          \
         .ob_type = (type)                           \
     }
@@ -111,7 +111,7 @@ PyAPI_FUNC(void) _Py_NO_RETURN _Py_FatalRefcountErrorFunc(
 #define _PyReftracerTrack(obj, operation) \
     do { \
         struct _reftracer_runtime_state *tracer = &_PyRuntime.ref_tracer; \
-        if (tracer->tracer_func != NULL) { \
+        if (__builtin_expect(tracer->tracer_func != NULL, 0)) { \
             void *data = tracer->tracer_data; \
             tracer->tracer_func((obj), (operation), data); \
         } \
@@ -160,6 +160,7 @@ static inline void _Py_RefcntAdd(PyObject* op, Py_ssize_t n)
             // Make the object immortal if the 32-bit local reference count
             // would overflow.
             refcnt = _Py_IMMORTAL_REFCNT_LOCAL;
+            op->ob_flags |= _Py_IMMORTAL_FLAGS;
         }
 #  endif
         _Py_atomic_store_uint32_relaxed(&op->ob_ref_local, (uint32_t)refcnt);
@@ -180,7 +181,7 @@ static inline void _Py_RefcntAdd(PyObject* op, Py_ssize_t n)
 
 // Checks if an object has a single, unique reference. If the caller holds a
 // unique reference, it may be able to safely modify the object in-place.
-static inline int
+static inline Py_ALWAYS_INLINE int
 _PyObject_IsUniquelyReferenced(PyObject *ob)
 {
 #if !defined(Py_GIL_DISABLED)
@@ -192,6 +193,21 @@ _PyObject_IsUniquelyReferenced(PyObject *ob)
     return (_Py_IsOwnedByCurrentThread(ob) &&
             _Py_atomic_load_uint32_relaxed(&ob->ob_ref_local) == 1 &&
             _Py_atomic_load_ssize_relaxed(&ob->ob_ref_shared) == 0);
+#endif
+}
+
+// Checks if an object is owned exclusively by the current thread and has no
+// shared references, shared GC state, or active per-object lock (PEP 805 LOCAL state).
+static inline Py_ALWAYS_INLINE int
+_PyObject_IsUnsharedLocal(PyObject *ob)
+{
+#if !defined(Py_GIL_DISABLED)
+    return 1;
+#else
+    return (_Py_IsOwnedByCurrentThread(ob) &&
+            _Py_atomic_load_ssize_relaxed(&ob->ob_ref_shared) == 0 &&
+            (_Py_atomic_load_uint8_relaxed(&ob->ob_gc_bits) & _PyGC_BITS_SHARED) == 0 &&
+            _Py_atomic_load_uint8_relaxed(&ob->ob_mutex._bits) == 0);
 #endif
 }
 
@@ -208,6 +224,7 @@ static inline void _Py_SetMortal(PyObject *op, short refcnt)
         op->ob_tid = _Py_UNOWNED_TID;
         op->ob_ref_local = 0;
         op->ob_ref_shared = _Py_REF_SHARED(refcnt, _Py_REF_MERGED);
+        op->ob_flags &= ~_Py_IMMORTAL_FLAGS;
 #else
         op->ob_refcnt = refcnt;
 #endif
@@ -253,11 +270,37 @@ _Py_DECREF_SPECIALIZED(PyObject *op, const destructor destruct)
 }
 
 #else
-// TODO: implement Py_DECREF specializations for Py_GIL_DISABLED build
-static inline void
+static inline Py_ALWAYS_INLINE void
 _Py_DECREF_SPECIALIZED(PyObject *op, const destructor destruct)
 {
-    Py_DECREF(op);
+    uint32_t local = _Py_atomic_load_uint32_relaxed(&op->ob_ref_local);
+    if (local == _Py_IMMORTAL_REFCNT_LOCAL) {
+        _Py_DECREF_IMMORTAL_STAT_INC();
+        return;
+    }
+    _Py_DECREF_STAT_INC();
+#ifdef Py_REF_DEBUG
+    _Py_DECREF_DecRefTotal();
+#endif
+    if (_Py_IsOwnedByCurrentThread(op)) {
+        local--;
+        _Py_atomic_store_uint32_relaxed(&op->ob_ref_local, local);
+        if (local == 0) {
+            if (_Py_atomic_load_ssize_acquire(&op->ob_ref_shared) == 0) {
+#ifdef Py_TRACE_REFS
+                _Py_ForgetReference(op);
+#endif
+                _PyReftracerTrack(op, PyRefTracer_DESTROY);
+                destruct(op);
+            }
+            else {
+                _Py_MergeZeroLocalRefcount(op);
+            }
+        }
+    }
+    else {
+        _Py_DecRefShared(op);
+    }
 }
 
 static inline int
@@ -309,7 +352,7 @@ extern bool _PyRefchain_IsTraced(PyInterpreterState *interp, PyObject *obj);
 #  define _Py_INCREF_CODE Py_INCREF
 #  define _Py_DECREF_CODE Py_DECREF
 #else
-static inline void
+static inline Py_ALWAYS_INLINE void
 _Py_THREAD_INCREF_OBJECT(PyObject *obj, Py_ssize_t unique_id)
 {
     _PyThreadStateImpl *tstate = (_PyThreadStateImpl *)_PyThreadState_GET();
@@ -331,7 +374,7 @@ _Py_THREAD_INCREF_OBJECT(PyObject *obj, Py_ssize_t unique_id)
     }
 }
 
-static inline void
+static inline Py_ALWAYS_INLINE void
 _Py_INCREF_TYPE(PyTypeObject *type)
 {
     if (!_PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE)) {
@@ -353,13 +396,13 @@ _Py_INCREF_TYPE(PyTypeObject *type)
 #endif
 }
 
-static inline void
+static inline Py_ALWAYS_INLINE void
 _Py_INCREF_CODE(PyCodeObject *co)
 {
     _Py_THREAD_INCREF_OBJECT((PyObject *)co, co->_co_unique_id);
 }
 
-static inline void
+static inline Py_ALWAYS_INLINE void
 _Py_THREAD_DECREF_OBJECT(PyObject *obj, Py_ssize_t unique_id)
 {
     _PyThreadStateImpl *tstate = (_PyThreadStateImpl *)_PyThreadState_GET();
@@ -381,7 +424,7 @@ _Py_THREAD_DECREF_OBJECT(PyObject *obj, Py_ssize_t unique_id)
     }
 }
 
-static inline void
+static inline Py_ALWAYS_INLINE void
 _Py_DECREF_TYPE(PyTypeObject *type)
 {
     if (!_PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE)) {
@@ -393,7 +436,7 @@ _Py_DECREF_TYPE(PyTypeObject *type)
     _Py_THREAD_DECREF_OBJECT((PyObject *)type, ht->unique_id);
 }
 
-static inline void
+static inline Py_ALWAYS_INLINE void
 _Py_DECREF_CODE(PyCodeObject *co)
 {
     _Py_THREAD_DECREF_OBJECT((PyObject *)co, co->_co_unique_id);
@@ -465,7 +508,7 @@ static inline void Py_DECREF_MORTAL_SPECIALIZED(PyObject *op, destructor destruc
 #endif
 #else  // Py_GIL_DISABLED
 # define Py_DECREF_MORTAL(op) Py_DECREF(op)
-# define Py_DECREF_MORTAL_SPECIALIZED(op, destruct) Py_DECREF(op)
+# define Py_DECREF_MORTAL_SPECIALIZED(op, destruct) _Py_DECREF_SPECIALIZED(_PyObject_CAST(op), destruct)
 #endif
 
 /* Inline functions trading binary compatibility for speed:
@@ -480,7 +523,17 @@ _PyObject_Init(PyObject *op, PyTypeObject *typeobj)
     Py_SET_TYPE(op, typeobj);
     assert(_PyType_HasFeature(typeobj, Py_TPFLAGS_HEAPTYPE) || _Py_IsImmortal(typeobj));
     _Py_INCREF_TYPE(typeobj);
+#if defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && !defined(Py_TRACE_REFS) && !defined(_Py_THREAD_SANITIZER)
+    op->ob_tid = _Py_ThreadId();
+    op->ob_flags = 0;
+    op->ob_mutex = (PyMutex){ 0 };
+    op->ob_gc_bits = 0;
+    op->ob_ref_local = 1;
+    op->ob_ref_shared = 0;
+    _PyReftracerTrack(op, PyRefTracer_CREATE);
+#else
     _Py_NewReference(op);
+#endif
 }
 
 static inline void
@@ -516,7 +569,7 @@ _PyObject_InitVar(PyVarObject *op, PyTypeObject *typeobj, Py_ssize_t size)
  * where the  reference count modification requires an atomic operation. This
  * allows call sites to specialize for the immortal/local case.
  */
-static inline int
+static inline Py_ALWAYS_INLINE int
 _Py_TryIncrefFast(PyObject *op) {
     uint32_t local = _Py_atomic_load_uint32_relaxed(&op->ob_ref_local);
     local += 1;
@@ -561,7 +614,7 @@ _Py_TryIncRefShared(PyObject *op)
 }
 
 /* Tries to incref the object op and ensures that *src still points to it. */
-static inline int
+static inline Py_ALWAYS_INLINE int
 _Py_TryIncrefCompare(PyObject **src, PyObject *op)
 {
     if (_Py_TryIncrefFast(op)) {

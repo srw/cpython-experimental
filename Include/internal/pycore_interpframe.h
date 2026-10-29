@@ -162,21 +162,27 @@ static inline void _PyFrame_Copy(_PyInterpreterFrame *src, _PyInterpreterFrame *
 }
 
 #ifdef Py_GIL_DISABLED
-static inline void
+static inline Py_ALWAYS_INLINE void
 _PyFrame_InitializeTLBC(PyThreadState *tstate, _PyInterpreterFrame *frame,
                         PyCodeObject *code)
 {
-    _Py_CODEUNIT *tlbc = _PyCode_GetTLBCFast(tstate, code);
-    if (tlbc == NULL) {
+    int32_t idx = ((_PyThreadStateImpl *)tstate)->tlbc_index;
+    if (idx == 0) {
+        frame->instr_ptr = _PyCode_CODE(code);
+        frame->tlbc_index = 0;
+        return;
+    }
+    _PyCodeArray *tlbc = _PyCode_GetTLBCArray(code);
+    if (idx < tlbc->size && tlbc->entries[idx] != NULL) {
+        frame->instr_ptr = (_Py_CODEUNIT *)tlbc->entries[idx];
+        frame->tlbc_index = idx;
+    }
+    else {
         // No thread-local bytecode exists for this thread yet; use the main
         // thread's copy, deferring thread-local bytecode creation to the
         // execution of RESUME.
         frame->instr_ptr = _PyCode_CODE(code);
         frame->tlbc_index = 0;
-    }
-    else {
-        frame->instr_ptr = tlbc;
-        frame->tlbc_index = ((_PyThreadStateImpl *)tstate)->tlbc_index;
     }
 }
 #endif
@@ -185,7 +191,7 @@ _PyFrame_InitializeTLBC(PyThreadState *tstate, _PyInterpreterFrame *frame,
    Does not initialize frame->previous, which happens
    when frame is linked into the frame stack.
  */
-static inline void
+static inline Py_ALWAYS_INLINE void
 _PyFrame_Initialize(
     PyThreadState *tstate, _PyInterpreterFrame *frame, _PyStackRef func,
     PyObject *locals, PyCodeObject *code, int null_locals_from, _PyInterpreterFrame *previous)
@@ -400,7 +406,7 @@ PyAPI_FUNC(void) _PyThreadState_PopFrame(PyThreadState *tstate, _PyInterpreterFr
 /* Pushes a frame without checking for space.
  * Must be guarded by _PyThreadState_HasStackSpace()
  * Consumes reference to func. */
-static inline _PyInterpreterFrame *
+static inline Py_ALWAYS_INLINE _PyInterpreterFrame *
 _PyFrame_PushUnchecked(PyThreadState *tstate, _PyStackRef func, int null_locals_from, _PyInterpreterFrame * previous)
 {
     CALL_STAT_INC(frames_pushed);

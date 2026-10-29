@@ -561,11 +561,14 @@ _PyCode_GetTLBCArray(PyCodeObject *co)
 
 // Return a pointer to the thread-local bytecode for the current thread, if it
 // exists.
-static inline _Py_CODEUNIT *
+static inline Py_ALWAYS_INLINE _Py_CODEUNIT *
 _PyCode_GetTLBCFast(PyThreadState *tstate, PyCodeObject *co)
 {
-    _PyCodeArray *code = _PyCode_GetTLBCArray(co);
     int32_t idx = ((_PyThreadStateImpl*) tstate)->tlbc_index;
+    if (idx == 0) {
+        return _PyCode_CODE(co);
+    }
+    _PyCodeArray *code = _PyCode_GetTLBCArray(co);
     if (idx < code->size && code->entries[idx] != NULL) {
         return (_Py_CODEUNIT *) code->entries[idx];
     }

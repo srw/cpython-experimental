@@ -566,18 +566,14 @@ static inline _PyStackRef
 PyStackRef_FromPyObjectSteal(PyObject *obj)
 {
     assert(obj != NULL);
-#ifdef Py_GIL_DISABLED
-    return (_PyStackRef){ .bits = (uintptr_t)obj };
-#else
-#  if SIZEOF_VOID_P > 4
+#if defined(Py_GIL_DISABLED) || SIZEOF_VOID_P > 4
     unsigned int tag = obj->ob_flags & Py_TAG_REFCNT;
-#  else
+#else
     unsigned int tag = _Py_IsImmortal(obj) ? Py_TAG_REFCNT : 0;
-#  endif
+#endif
     _PyStackRef ref = ((_PyStackRef){.bits = ((uintptr_t)(obj)) | tag});
     PyStackRef_CheckValid(ref);
     return ref;
-#endif
 }
 
 static inline _PyStackRef
@@ -590,7 +586,7 @@ PyStackRef_FromPyObjectStealMortal(PyObject *obj)
     return ref;
 }
 
-static inline _PyStackRef
+static inline Py_ALWAYS_INLINE _PyStackRef
 _PyStackRef_FromPyObjectNew(PyObject *obj)
 {
     assert(obj != NULL);
@@ -634,7 +630,7 @@ PyStackRef_FromPyObjectBorrow(PyObject *obj)
 #define PyStackRef_DUP(REF) \
     (PyStackRef_RefcountOnObject(REF) ? (_Py_INCREF_MORTAL(BITS_TO_PTR(REF)), (REF)) : (REF))
 #else
-static inline _PyStackRef
+static inline Py_ALWAYS_INLINE _PyStackRef
 PyStackRef_DUP(_PyStackRef ref)
 {
     assert(!PyStackRef_IsNull(ref));
@@ -654,7 +650,7 @@ PyStackRef_DupImmortal(_PyStackRef ref)
     return ref;
 }
 
-static inline bool
+static inline Py_ALWAYS_INLINE bool
 PyStackRef_IsHeapSafe(_PyStackRef ref)
 {
 #ifdef Py_GIL_DISABLED
@@ -668,7 +664,7 @@ PyStackRef_IsHeapSafe(_PyStackRef ref)
 #endif
 }
 
-static inline _PyStackRef
+static inline Py_ALWAYS_INLINE _PyStackRef
 PyStackRef_MakeHeapSafe(_PyStackRef ref)
 {
     if (PyStackRef_IsHeapSafe(ref)) {
@@ -695,7 +691,7 @@ do { \
     if (PyStackRef_RefcountOnObject(_temp)) Py_DECREF_MORTAL(BITS_TO_PTR(_temp)); \
 } while (0)
 #else
-static inline void
+static inline Py_ALWAYS_INLINE void
 PyStackRef_CLOSE(_PyStackRef ref)
 {
     assert(!PyStackRef_IsNull(ref));
@@ -705,7 +701,7 @@ PyStackRef_CLOSE(_PyStackRef ref)
 }
 #endif
 
-static inline void
+static inline Py_ALWAYS_INLINE void
 PyStackRef_CLOSE_SPECIALIZED(_PyStackRef ref, destructor destruct)
 {
     assert(!PyStackRef_IsNull(ref));
@@ -717,7 +713,7 @@ PyStackRef_CLOSE_SPECIALIZED(_PyStackRef ref, destructor destruct)
 #ifdef _WIN32
 #define PyStackRef_XCLOSE PyStackRef_CLOSE
 #else
-static inline void
+static inline Py_ALWAYS_INLINE void
 PyStackRef_XCLOSE(_PyStackRef ref)
 {
     assert(ref.bits != 0);
@@ -824,7 +820,7 @@ _PyThreadState_PopCStackRefSteal(PyThreadState *tstate, _PyCStackRef *ref)
 
 #ifdef Py_GIL_DISABLED
 
-static inline int
+static inline Py_ALWAYS_INLINE int
 _Py_TryIncrefCompareStackRef(PyObject **src, PyObject *op, _PyStackRef *out)
 {
     if (_PyObject_HasDeferredRefcount(op)) {

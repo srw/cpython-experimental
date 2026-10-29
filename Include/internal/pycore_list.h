@@ -33,7 +33,7 @@ PyAPI_FUNC(int)
 _PyList_AppendTakeRefListResize(PyListObject *self, PyObject *newitem);
 
 // In free-threaded build: self should be locked by the caller, if it should be thread-safe.
-static inline int
+static inline Py_ALWAYS_INLINE int
 _PyList_AppendTakeRef(PyListObject *self, PyObject *newitem)
 {
     assert(self != NULL && newitem != NULL);
@@ -43,7 +43,12 @@ _PyList_AppendTakeRef(PyListObject *self, PyObject *newitem)
     assert((size_t)len + 1 < PY_SSIZE_T_MAX);
     if (allocated > len) {
 #ifdef Py_GIL_DISABLED
-        _Py_atomic_store_ptr_release(&self->ob_item[len], newitem);
+        if (!PyMutex_IsLocked(&((PyObject *)self)->ob_mutex)) {
+            PyList_SET_ITEM(self, len, newitem);
+        }
+        else {
+            _Py_atomic_store_ptr_release(&self->ob_item[len], newitem);
+        }
 #else
         PyList_SET_ITEM(self, len, newitem);
 #endif

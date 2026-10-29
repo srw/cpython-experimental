@@ -440,7 +440,11 @@ _Py_MergeZeroLocalRefcount(PyObject *op)
     assert(op->ob_ref_local == 0);
 
     Py_ssize_t shared = _Py_atomic_load_ssize_acquire(&op->ob_ref_shared);
+#if _Py__has_builtin(__builtin_expect)
+    if (__builtin_expect(shared == 0, 1)) {
+#else
     if (shared == 0) {
+#endif
         // Fast-path: shared refcount is zero (including flags)
         _Py_Dealloc(op);
         return;
@@ -2794,6 +2798,7 @@ _Py_SetImmortalUntracked(PyObject *op)
     _Py_atomic_store_uint32_relaxed(&op->ob_ref_local, _Py_IMMORTAL_REFCNT_LOCAL);
     _Py_atomic_store_ssize_relaxed(&op->ob_ref_shared, 0);
     _Py_atomic_or_uint8(&op->ob_gc_bits, _PyGC_BITS_DEFERRED);
+    op->ob_flags |= _Py_IMMORTAL_FLAGS;
 #elif SIZEOF_VOID_P > 4
     op->ob_flags = _Py_IMMORTAL_FLAGS;
     op->ob_refcnt = _Py_IMMORTAL_INITIAL_REFCNT;
