@@ -103,19 +103,6 @@ _PyCriticalSection_IsActive(uintptr_t tag)
     return tag != 0 && (tag & _Py_CRITICAL_SECTION_INACTIVE) == 0;
 }
 
-static inline void
-_PyCriticalSection_BeginMutex(PyThreadState *tstate, PyCriticalSection *c, PyMutex *m)
-{
-    if (PyMutex_LockFast(m)) {
-        c->_cs_mutex = m;
-        c->_cs_prev = tstate->critical_section;
-        tstate->critical_section = (uintptr_t)c;
-    }
-    else {
-        _PyCriticalSection_BeginSlow(tstate, c, m);
-    }
-}
-
 static inline int
 _PyCriticalSection_IsSingleThreaded(PyThreadState *tstate)
 {
@@ -126,6 +113,26 @@ _PyCriticalSection_IsSingleThreaded(PyThreadState *tstate)
     return (_Py_atomic_load_ptr_relaxed(&tstate->next) == NULL &&
             _Py_atomic_load_ptr_relaxed(&tstate->prev) == NULL);
 #endif
+}
+
+static inline void
+_PyCriticalSection_BeginMutex(PyThreadState *tstate, PyCriticalSection *c, PyMutex *m)
+{
+    if (_PyCriticalSection_IsSingleThreaded(tstate) && m->_bits == _Py_UNLOCKED) {
+        m->_bits = _Py_LOCKED;
+        c->_cs_mutex = m;
+        c->_cs_prev = tstate->critical_section;
+        tstate->critical_section = (uintptr_t)c;
+        return;
+    }
+    if (PyMutex_LockFast(m)) {
+        c->_cs_mutex = m;
+        c->_cs_prev = tstate->critical_section;
+        tstate->critical_section = (uintptr_t)c;
+    }
+    else {
+        _PyCriticalSection_BeginSlow(tstate, c, m);
+    }
 }
 
 static inline void

@@ -775,7 +775,7 @@ list_contains(PyObject *aa, PyObject *el)
     PyListObject *self = (PyListObject *)aa;
     Py_ssize_t i = 0;
 
-    if (list_can_read_items_fast(self)) {
+    if (el != NULL && list_can_read_items_fast(self)) {
         Py_ssize_t n = Py_SIZE(self);
         PyObject **items = self->ob_item;
         if (Py_IS_TYPE(el, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)el)) {
@@ -3617,7 +3617,7 @@ list_index_impl(PyListObject *self, PyObject *value, Py_ssize_t start,
             stop = 0;
     }
     Py_ssize_t i = start;
-    if (list_can_read_items_fast(self)) {
+    if (value != NULL && list_can_read_items_fast(self)) {
         Py_ssize_t n = Py_SIZE(self);
         if (stop < n) {
             n = stop;
@@ -3689,7 +3689,7 @@ list_count_impl(PyListObject *self, PyObject *value)
     Py_ssize_t count = 0;
     Py_ssize_t i = 0;
 
-    if (list_can_read_items_fast(self)) {
+    if (value != NULL && list_can_read_items_fast(self)) {
         Py_ssize_t n = Py_SIZE(self);
         PyObject **items = self->ob_item;
         if (Py_IS_TYPE(value, &PyLong_Type) && _PyLong_IsCompact((PyLongObject *)value)) {

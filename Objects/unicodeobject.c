@@ -11797,6 +11797,18 @@ PyUnicode_Concat(PyObject *left, PyObject *right)
     }
     new_len = left_len + right_len;
 
+    if (PyUnicode_IS_COMPACT_ASCII(left) && PyUnicode_IS_COMPACT_ASCII(right)) {
+        result = PyUnicode_New(new_len, 127);
+        if (result == NULL) {
+            return NULL;
+        }
+        Py_UCS1 *out = PyUnicode_1BYTE_DATA(result);
+        memcpy(out, PyUnicode_1BYTE_DATA(left), left_len);
+        memcpy(out + left_len, PyUnicode_1BYTE_DATA(right), right_len);
+        assert(_PyUnicode_CheckConsistency(result, 1));
+        return result;
+    }
+
     maxchar = PyUnicode_MAX_CHAR_VALUE(left);
     maxchar2 = PyUnicode_MAX_CHAR_VALUE(right);
     maxchar = Py_MAX(maxchar, maxchar2);
@@ -11866,6 +11878,17 @@ PyUnicode_Append(PyObject **p_left, PyObject *right)
 
         /* copy 'right' into the newly allocated area of 'left' */
         _PyUnicode_FastCopyCharacters(*p_left, left_len, right, 0, right_len);
+    }
+    else if (PyUnicode_IS_COMPACT_ASCII(left) && PyUnicode_IS_COMPACT_ASCII(right)) {
+        res = PyUnicode_New(new_len, 127);
+        if (res == NULL) {
+            goto error;
+        }
+        Py_UCS1 *out = PyUnicode_1BYTE_DATA(res);
+        memcpy(out, PyUnicode_1BYTE_DATA(left), left_len);
+        memcpy(out + left_len, PyUnicode_1BYTE_DATA(right), right_len);
+        Py_DECREF(left);
+        *p_left = res;
     }
     else {
         maxchar = PyUnicode_MAX_CHAR_VALUE(left);

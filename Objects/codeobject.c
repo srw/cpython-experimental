@@ -2192,6 +2192,10 @@ void
 _PyCode_Clear_Executors(PyCodeObject *code)
 {
 #ifdef Py_GIL_DISABLED
+    _PyExecutorArray *execs = _Py_atomic_load_ptr_relaxed(&code->co_executors);
+    if (execs == NULL || _Py_atomic_load_int_relaxed(&execs->size) == 0) {
+        return;
+    }
     Py_BEGIN_CRITICAL_SECTION(code);
     if (code->co_executors != NULL) {
         for (int i = 0; i < code->co_executors->size; i++) {
@@ -2200,7 +2204,7 @@ _PyCode_Clear_Executors(PyCodeObject *code)
                 assert(code->co_executors->executors[i] == NULL);
             }
         }
-        code->co_executors->size = 0;
+        _Py_atomic_store_int_relaxed(&code->co_executors->size, 0);
     }
     Py_END_CRITICAL_SECTION();
 #else

@@ -2595,12 +2595,25 @@ _collections__count_elements_impl(PyObject *module, PyObject *mapping,
                 if (_PyDict_SetItem_KnownHash(mapping, key, one, hash) < 0)
                     goto done;
             } else {
-                /* oldval is a borrowed reference.  Keep it alive across
-                   PyNumber_Add(), which can execute arbitrary user code and
-                   mutate (or even clear) the underlying dict. */
-                Py_INCREF(oldval);
-                newval = PyNumber_Add(oldval, one);
-                Py_DECREF(oldval);
+                if (_PyLong_CheckExactAndCompact(oldval)) {
+                    Py_ssize_t count = _PyLong_CompactValue((PyLongObject *)oldval);
+                    if (count < PY_SSIZE_T_MAX) {
+                        newval = PyLong_FromSsize_t(count + 1);
+                    }
+                    else {
+                        Py_INCREF(oldval);
+                        newval = PyNumber_Add(oldval, one);
+                        Py_DECREF(oldval);
+                    }
+                }
+                else {
+                    /* oldval is a borrowed reference.  Keep it alive across
+                       PyNumber_Add(), which can execute arbitrary user code and
+                       mutate (or even clear) the underlying dict. */
+                    Py_INCREF(oldval);
+                    newval = PyNumber_Add(oldval, one);
+                    Py_DECREF(oldval);
+                }
                 if (newval == NULL)
                     goto done;
                 if (_PyDict_SetItem_KnownHash(mapping, key, newval, hash) < 0)

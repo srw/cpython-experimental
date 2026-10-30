@@ -137,6 +137,7 @@ typedef struct {
     Py_UCS4 *field;             /* temporary buffer */
     Py_ssize_t field_size;      /* size of allocated buffer */
     Py_ssize_t field_len;       /* length of current field */
+    Py_UCS4 maxchar;            /* max character in current field */
     bool unquoted_field;        /* true if no quotes around the current field */
     unsigned long line_num;     /* Source-file line number */
 } ReaderObj;
@@ -767,10 +768,27 @@ parse_save_field(ReaderObj *self)
         field = Py_NewRef(Py_None);
     }
     else {
-        field = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND,
-                                        (void *) self->field, self->field_len);
-        if (field == NULL) {
-            return -1;
+        if (self->field_len == 0) {
+            field = Py_GetConstant(Py_CONSTANT_EMPTY_STR);
+        }
+        else if (self->maxchar <= 255) {
+            field = PyUnicode_New(self->field_len,
+                                  self->maxchar <= 127 ? 127 : 255);
+            if (field == NULL) {
+                return -1;
+            }
+            Py_UCS1 *data = PyUnicode_1BYTE_DATA(field);
+            const Py_UCS4 *src = self->field;
+            for (Py_ssize_t i = 0; i < self->field_len; i++) {
+                data[i] = (Py_UCS1)src[i];
+            }
+        }
+        else {
+            field = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND,
+                                              (void *)self->field, self->field_len);
+            if (field == NULL) {
+                return -1;
+            }
         }
         if (self->unquoted_field &&
             self->field_len != 0 &&
@@ -784,6 +802,7 @@ parse_save_field(ReaderObj *self)
             field = tmp;
         }
         self->field_len = 0;
+        self->maxchar = 0;
     }
     if (PyList_Append(self->fields, field) < 0) {
         Py_DECREF(field);
@@ -822,6 +841,9 @@ parse_add_char(ReaderObj *self, _csvstate *module_state, Py_UCS4 c)
     }
     if (self->field_len == self->field_size && !parse_grow_buff(self))
         return -1;
+    if (c > self->maxchar) {
+        self->maxchar = c;
+    }
     self->field[self->field_len++] = c;
     return 0;
 }
@@ -1016,6 +1038,7 @@ parse_reset(ReaderObj *self)
     if (self->fields == NULL)
         return -1;
     self->field_len = 0;
+    self->maxchar = 0;
     self->state = START_RECORD;
     self->unquoted_field = false;
     return 0;
@@ -1078,15 +1101,24 @@ Reader_iternext_impl(ReaderObj *self)
         ++self->line_num;
         kind = PyUnicode_KIND(lineobj);
         data = PyUnicode_DATA(lineobj);
-        pos = 0;
         linelen = PyUnicode_GET_LENGTH(lineobj);
-        while (linelen--) {
-            c = PyUnicode_READ(kind, data, pos);
-            if (parse_process_char(self, module_state, c) < 0) {
-                Py_DECREF(lineobj);
-                goto err;
+        if (kind == PyUnicode_1BYTE_KIND) {
+            const Py_UCS1 *data1 = (const Py_UCS1 *)data;
+            for (pos = 0; pos < linelen; pos++) {
+                if (parse_process_char(self, module_state, data1[pos]) < 0) {
+                    Py_DECREF(lineobj);
+                    goto err;
+                }
             }
-            pos++;
+        }
+        else {
+            for (pos = 0; pos < linelen; pos++) {
+                c = PyUnicode_READ(kind, data, pos);
+                if (parse_process_char(self, module_state, c) < 0) {
+                    Py_DECREF(lineobj);
+                    goto err;
+                }
+            }
         }
         Py_DECREF(lineobj);
         if (parse_process_char(self, module_state, EOL) < 0)

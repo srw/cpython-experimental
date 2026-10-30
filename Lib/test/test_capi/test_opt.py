@@ -6793,6 +6793,72 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertNotIn("_CHECK_RECURSION_REMAINING", loop_body)
         self.assertEqual(loop_body.count("_PUSH_FRAME"), 2)
 
+    def test_container_and_attr_loop_preheader_hoisting(self):
+        def f_list_iter(n):
+            lst = [1, 2, 3, 4] * (n // 4 + 1)
+            total = 0
+            for x in lst:
+                total = total + x
+            return total
+
+        res_li, ex_li = self._run_with_optimizer(f_list_iter, TIER2_THRESHOLD)
+        self.assertIsNotNone(ex_li)
+        uops_li = get_opnames(ex_li)
+        mw_li = uops_li.index("_MAKE_WARM")
+        jmp_li = uops_li.index("_JUMP_TO_TOP")
+        self.assertIn("_ITER_CHECK_LIST", uops_li[:mw_li])
+        self.assertIn("_GUARD_NOS_INT", uops_li[:mw_li])
+        self.assertNotIn("_ITER_CHECK_LIST", uops_li[mw_li:jmp_li])
+        self.assertNotIn("_GUARD_NOS_INT", uops_li[mw_li:jmp_li])
+        self.assertIn("_GUARD_TOS_INT", uops_li[mw_li:jmp_li])
+        self.assertNotIn("_POP_TOP", uops_li[mw_li:jmp_li])
+
+        def f_list_subscr(n):
+            lst = [2] * n
+            total = 0
+            for i in range(n):
+                total = total + lst[i]
+            return total
+
+        res_ls, ex_ls = self._run_with_optimizer(f_list_subscr, TIER2_THRESHOLD)
+        self.assertEqual(res_ls, 2 * TIER2_THRESHOLD)
+        self.assertIsNotNone(ex_ls)
+        uops_ls = get_opnames(ex_ls)
+        mw_ls = uops_ls.index("_MAKE_WARM")
+        jmp_ls = uops_ls.index("_JUMP_TO_TOP")
+        self.assertIn("_ITER_CHECK_RANGE", uops_ls[:mw_ls])
+        self.assertIn("_GUARD_NOS_LIST", uops_ls[:mw_ls])
+        self.assertIn("_GUARD_NOS_INT", uops_ls[:mw_ls])
+        self.assertNotIn("_ITER_CHECK_RANGE", uops_ls[mw_ls:jmp_ls])
+        self.assertNotIn("_GUARD_NOS_LIST", uops_ls[mw_ls:jmp_ls])
+        self.assertNotIn("_GUARD_NOS_INT", uops_ls[mw_ls:jmp_ls])
+        self.assertIn("_GUARD_TOS_INT", uops_ls[mw_ls:jmp_ls])
+        self.assertNotIn("_POP_TOP", uops_ls[mw_ls:jmp_ls])
+
+        class Point:
+            def __init__(self, x):
+                self.x = x
+
+        def f_attr(n):
+            p = Point(3)
+            total = 0
+            for i in range(n):
+                total = total + p.x
+            return total
+
+        res_at, ex_at = self._run_with_optimizer(f_attr, TIER2_THRESHOLD)
+        self.assertEqual(res_at, 3 * TIER2_THRESHOLD)
+        self.assertIsNotNone(ex_at)
+        uops_at = get_opnames(ex_at)
+        mw_at = uops_at.index("_MAKE_WARM")
+        jmp_at = uops_at.index("_JUMP_TO_TOP")
+        self.assertIn("_ITER_CHECK_RANGE", uops_at[:mw_at])
+        self.assertIn("_CHECK_MANAGED_OBJECT_HAS_VALUES", uops_at[:mw_at])
+        self.assertNotIn("_ITER_CHECK_RANGE", uops_at[mw_at:jmp_at])
+        self.assertNotIn("_CHECK_MANAGED_OBJECT_HAS_VALUES", uops_at[mw_at:jmp_at])
+        self.assertNotIn("_GUARD_NOS_INT", uops_at[mw_at:jmp_at])
+        self.assertNotIn("_POP_TOP", uops_at[mw_at:jmp_at])
+
 def global_identity(x):
     return x
 

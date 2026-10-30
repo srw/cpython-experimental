@@ -792,6 +792,11 @@ remove_unneeded_uops(_PyUOpInstruction *buffer, int buffer_size)
             case _EXIT_TRACE:
             default:
             {
+                if (_PyUop_Flags[opcode] & HAS_RECORDS_VALUE_FLAG) {
+                    Py_XDECREF((PyObject *)(uintptr_t)buffer[pc].operand0);
+                    buffer[pc].opcode = _NOP;
+                    break;
+                }
                 if (opcode == _CHECK_RECURSION_REMAINING) {
                     if (call_depth >= 0 && call_depth <= max_checked_recursion_depth) {
                         buffer[pc].opcode = _NOP;
@@ -890,14 +895,8 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
     bool can_peel_body = true;
 
     bool written[64] = {0};
-    bool store_only_int[64];
-    bool store_only_float[64];
-    bool guarded_int[64] = {0};
-    bool guarded_float[64] = {0};
-    for (int v = 0; v < 64; v++) {
-        store_only_int[v] = true;
-        store_only_float[v] = true;
-    }
+    int load_count[64] = {0};
+    int store_count[64] = {0};
 
     for (int i = 2; i < length - 1; i++) {
         uint16_t op = output[i].opcode;
@@ -922,12 +921,32 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             case _GUARD_NOS_INT:
             case _GUARD_TOS_FLOAT:
             case _GUARD_NOS_FLOAT:
+            case _GUARD_TOS_LIST:
+            case _GUARD_NOS_LIST:
+            case _GUARD_TOS_TUPLE:
+            case _GUARD_NOS_TUPLE:
+            case _GUARD_TOS_DICT:
+            case _GUARD_TOS_UNICODE:
+            case _GUARD_NOS_UNICODE:
+            case _GUARD_NOS_COMPACT_ASCII:
+            case _GUARD_TYPE:
+            case _GUARD_TYPE_VERSION:
+            case _CHECK_MANAGED_OBJECT_HAS_VALUES:
                 type_guard_count++;
+                break;
+            case _GUARD_BINARY_OP_SUBSCR_TUPLE_INT_BOUNDS:
+            case _BINARY_OP_SUBSCR_LIST_INT:
+            case _BINARY_OP_SUBSCR_TUPLE_INT:
+            case _LOAD_ATTR_INSTANCE_VALUE:
+            case _LOAD_ATTR_SLOT:
                 break;
             case _LOAD_FAST:
             case _LOAD_FAST_BORROW:
                 if (output[i].oparg >= 64) {
                     can_peel_body = false;
+                }
+                else {
+                    load_count[output[i].oparg]++;
                 }
                 break;
             case _LOAD_FAST_0:
@@ -938,6 +957,8 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             case _LOAD_FAST_5:
             case _LOAD_FAST_6:
             case _LOAD_FAST_7:
+                load_count[op - _LOAD_FAST_0]++;
+                break;
             case _LOAD_FAST_BORROW_0:
             case _LOAD_FAST_BORROW_1:
             case _LOAD_FAST_BORROW_2:
@@ -946,6 +967,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             case _LOAD_FAST_BORROW_5:
             case _LOAD_FAST_BORROW_6:
             case _LOAD_FAST_BORROW_7:
+                load_count[op - _LOAD_FAST_BORROW_0]++;
                 break;
             case _SWAP_FAST:
                 if (output[i].oparg >= 64) {
@@ -953,6 +975,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 }
                 else {
                     written[output[i].oparg] = true;
+                    store_count[output[i].oparg]++;
                 }
                 break;
             case _SWAP_FAST_0:
@@ -964,6 +987,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             case _SWAP_FAST_6:
             case _SWAP_FAST_7:
                 written[op - _SWAP_FAST_0] = true;
+                store_count[op - _SWAP_FAST_0]++;
                 break;
             case _BINARY_OP_ADD_INT:
             case _BINARY_OP_ADD_INT_INPLACE:
@@ -1011,6 +1035,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             case _POP_TOP_NOP:
             case _POP_TOP_INT:
             case _POP_TOP_FLOAT:
+            case _POP_TOP_UNICODE:
             case _GUARD_IS_TRUE_POP:
             case _GUARD_IS_FALSE_POP:
             case _GUARD_BIT_IS_SET_POP:
@@ -1026,60 +1051,95 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
         return length;
     }
 
-    /* Try full Pre-Header guard peeling for pure arithmetic loops where all
-     * int/float type guards are on loop-invariant or inductive locals. */
+    /* Try Pre-Header guard peeling for arithmetic, container-indexing,
+     * list/tuple-iteration, and attribute-reading loops where loop-invariant
+     * or inductive local guards can be hoisted to Iteration 1. */
     if (can_peel_body &&
         has_arith_binop &&
         type_guard_count > 0 &&
-        pop_top_count <= 1 &&
+        pop_top_count <= 2 &&
         non_nop_count <= 32 &&
         !(has_iter_check && has_compare_op) &&
         length + non_nop_count <= UOP_MAX_TRACE_LENGTH)
     {
-        /* Stack tags:
-         * >= 0 : local variable index (0..63)
-         * -2   : proven compact PyLong_CheckExact value
-         * -3   : proven PyFloat_CheckExact value
-         * -1   : other / unknown value
-         */
-        int stk[32];
-        int sp = 0;
-        bool all_guards_hoistable = true;
-
-        for (int i = 2; i < length - 1 && all_guards_hoistable; i++) {
-            _PyUOpInstruction *inst = &output[i];
-            uint16_t op = inst->opcode;
-            if (op == _NOP) {
-                continue;
+        _PyUOpInstruction body[32];
+        int b_len = 0;
+        for (int i = 2; i < length - 1; i++) {
+            if (output[i].opcode != _NOP) {
+                body[b_len++] = output[i];
             }
+        }
+
+        enum {
+            VAL_UNKNOWN = 0,
+            VAL_INT = 1,
+            VAL_FLOAT = 2,
+            VAL_ITER_ITEM = 3,
+        };
+        int stk_type[32];
+        int stk_var[32];
+        bool stk_entry[32];
+        int sp = 0;
+        bool seen_write[64] = {0};
+        int cur_var_type[64] = {0};
+        bool all_stores_int[64];
+        bool all_stores_float[64];
+        for (int v = 0; v < 64; v++) {
+            all_stores_int[v] = true;
+            all_stores_float[v] = true;
+        }
+
+        /* guard_kind[i]:
+         *   0 = not a hoistable guard
+         *   1 = iterator check (_ITER_CHECK_{RANGE,LIST,TUPLE})
+         *   2 = int guard on entry value of local guard_var[i] (or proven int if -2)
+         *   3 = float guard on entry value of local guard_var[i] (or proven float if -2)
+         *   4 = invariant local guard (container/type/managed-values) on guard_var[i]
+         */
+        int guard_kind[32] = {0};
+        int guard_var[32];
+        for (int i = 0; i < 32; i++) {
+            guard_var[i] = -1;
+        }
+        bool body_valid = true;
+
+        for (int i = 0; i < b_len && body_valid; i++) {
+            _PyUOpInstruction *inst = &body[i];
+            uint16_t op = inst->opcode;
             switch (op) {
+                case _ITER_CHECK_RANGE:
+                case _ITER_CHECK_LIST:
+                case _ITER_CHECK_TUPLE:
+                    guard_kind[i] = 1;
+                    break;
                 case _SET_IP:
                 case _CHECK_PERIODIC:
                 case _CHECK_PERIODIC_IF_NOT_YIELD_FROM:
                 case _CHECK_VALIDITY:
                 case _TIER2_RESUME_CHECK:
-                case _ITER_CHECK_RANGE:
-                case _ITER_CHECK_LIST:
-                case _ITER_CHECK_TUPLE:
                 case _GUARD_NOT_EXHAUSTED_RANGE:
                 case _GUARD_NOT_EXHAUSTED_LIST:
                 case _GUARD_NOT_EXHAUSTED_TUPLE:
+                case _GUARD_BINARY_OP_SUBSCR_TUPLE_INT_BOUNDS:
                     break;
                 case _ITER_NEXT_RANGE:
-                    if (sp >= 32) { all_guards_hoistable = false; break; }
-                    stk[sp++] = -2;
+                    if (sp >= 32) { body_valid = false; break; }
+                    stk_type[sp] = VAL_INT;
+                    stk_var[sp] = -1;
+                    stk_entry[sp] = false;
+                    sp++;
                     break;
                 case _ITER_NEXT_LIST:
                 case _ITER_NEXT_LIST_TIER_TWO:
                 case _ITER_NEXT_TUPLE:
-                    if (sp >= 32) { all_guards_hoistable = false; break; }
-                    stk[sp++] = -1;
+                    if (sp >= 32) { body_valid = false; break; }
+                    stk_type[sp] = VAL_ITER_ITEM;
+                    stk_var[sp] = -1;
+                    stk_entry[sp] = false;
+                    sp++;
                     break;
                 case _LOAD_FAST:
                 case _LOAD_FAST_BORROW:
-                    if (sp >= 32) { all_guards_hoistable = false; break; }
-                    stk[sp++] = (int)inst->oparg;
-                    break;
                 case _LOAD_FAST_0:
                 case _LOAD_FAST_1:
                 case _LOAD_FAST_2:
@@ -1088,9 +1148,6 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _LOAD_FAST_5:
                 case _LOAD_FAST_6:
                 case _LOAD_FAST_7:
-                    if (sp >= 32) { all_guards_hoistable = false; break; }
-                    stk[sp++] = (int)(op - _LOAD_FAST_0);
-                    break;
                 case _LOAD_FAST_BORROW_0:
                 case _LOAD_FAST_BORROW_1:
                 case _LOAD_FAST_BORROW_2:
@@ -1098,64 +1155,144 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _LOAD_FAST_BORROW_4:
                 case _LOAD_FAST_BORROW_5:
                 case _LOAD_FAST_BORROW_6:
-                case _LOAD_FAST_BORROW_7:
-                    if (sp >= 32) { all_guards_hoistable = false; break; }
-                    stk[sp++] = (int)(op - _LOAD_FAST_BORROW_0);
+                case _LOAD_FAST_BORROW_7: {
+                    if (sp >= 32) { body_valid = false; break; }
+                    int v;
+                    if (op == _LOAD_FAST || op == _LOAD_FAST_BORROW) {
+                        v = (int)inst->oparg;
+                    }
+                    else if (op >= _LOAD_FAST_0 && op <= _LOAD_FAST_7) {
+                        v = (int)(op - _LOAD_FAST_0);
+                    }
+                    else {
+                        v = (int)(op - _LOAD_FAST_BORROW_0);
+                    }
+                    stk_type[sp] = cur_var_type[v];
+                    stk_var[sp] = v;
+                    stk_entry[sp] = !seen_write[v];
+                    sp++;
                     break;
+                }
                 case _LOAD_SMALL_INT:
-                    if (sp >= 32) { all_guards_hoistable = false; break; }
-                    stk[sp++] = -2;
+                    if (sp >= 32) { body_valid = false; break; }
+                    stk_type[sp] = VAL_INT;
+                    stk_var[sp] = -1;
+                    stk_entry[sp] = false;
+                    sp++;
                     break;
                 case _LOAD_CONST_INLINE:
                 case _LOAD_CONST_INLINE_BORROW: {
-                    if (sp >= 32) { all_guards_hoistable = false; break; }
+                    if (sp >= 32) { body_valid = false; break; }
                     PyObject *c = (PyObject *)inst->operand0;
                     if (c != NULL && _PyLong_CheckExactAndCompact(c)) {
-                        stk[sp++] = -2;
+                        stk_type[sp] = VAL_INT;
                     }
                     else if (c != NULL && PyFloat_CheckExact(c)) {
-                        stk[sp++] = -3;
+                        stk_type[sp] = VAL_FLOAT;
                     }
                     else {
-                        stk[sp++] = -1;
+                        stk_type[sp] = VAL_UNKNOWN;
                     }
+                    stk_var[sp] = -1;
+                    stk_entry[sp] = false;
+                    sp++;
                     break;
                 }
                 case _GUARD_TOS_INT:
-                    if (sp < 1) { all_guards_hoistable = false; break; }
-                    if (stk[sp - 1] >= 0) {
-                        guarded_int[stk[sp - 1]] = true;
+                case _GUARD_NOS_INT: {
+                    int idx = (op == _GUARD_TOS_INT) ? (sp - 1) : (sp - 2);
+                    if (idx < 0) { body_valid = false; break; }
+                    if (stk_type[idx] == VAL_INT) {
+                        guard_kind[i] = 2;
+                        guard_var[i] = -2;
                     }
-                    else if (stk[sp - 1] != -2) {
-                        all_guards_hoistable = false;
+                    else if (stk_entry[idx] && stk_var[idx] >= 0) {
+                        guard_kind[i] = 2;
+                        guard_var[i] = stk_var[idx];
+                    }
+                    stk_type[idx] = VAL_INT;
+                    if (stk_var[idx] >= 0) {
+                        int v = stk_var[idx];
+                        cur_var_type[v] = VAL_INT;
+                        for (int s = 0; s < sp; s++) {
+                            if (stk_var[s] == v) {
+                                stk_type[s] = VAL_INT;
+                            }
+                        }
                     }
                     break;
-                case _GUARD_NOS_INT:
-                    if (sp < 2) { all_guards_hoistable = false; break; }
-                    if (stk[sp - 2] >= 0) {
-                        guarded_int[stk[sp - 2]] = true;
-                    }
-                    else if (stk[sp - 2] != -2) {
-                        all_guards_hoistable = false;
-                    }
-                    break;
+                }
                 case _GUARD_TOS_FLOAT:
-                    if (sp < 1) { all_guards_hoistable = false; break; }
-                    if (stk[sp - 1] >= 0) {
-                        guarded_float[stk[sp - 1]] = true;
+                case _GUARD_NOS_FLOAT: {
+                    int idx = (op == _GUARD_TOS_FLOAT) ? (sp - 1) : (sp - 2);
+                    if (idx < 0) { body_valid = false; break; }
+                    if (stk_type[idx] == VAL_FLOAT) {
+                        guard_kind[i] = 3;
+                        guard_var[i] = -2;
                     }
-                    else if (stk[sp - 1] != -3) {
-                        all_guards_hoistable = false;
+                    else if (stk_entry[idx] && stk_var[idx] >= 0) {
+                        guard_kind[i] = 3;
+                        guard_var[i] = stk_var[idx];
+                    }
+                    stk_type[idx] = VAL_FLOAT;
+                    if (stk_var[idx] >= 0) {
+                        int v = stk_var[idx];
+                        cur_var_type[v] = VAL_FLOAT;
+                        for (int s = 0; s < sp; s++) {
+                            if (stk_var[s] == v) {
+                                stk_type[s] = VAL_FLOAT;
+                            }
+                        }
                     }
                     break;
-                case _GUARD_NOS_FLOAT:
-                    if (sp < 2) { all_guards_hoistable = false; break; }
-                    if (stk[sp - 2] >= 0) {
-                        guarded_float[stk[sp - 2]] = true;
+                }
+                case _GUARD_TOS_LIST:
+                case _GUARD_TOS_TUPLE:
+                case _GUARD_TOS_DICT:
+                case _GUARD_TOS_UNICODE:
+                case _GUARD_TYPE:
+                case _GUARD_TYPE_VERSION:
+                case _CHECK_MANAGED_OBJECT_HAS_VALUES:
+                    if (sp < 1) { body_valid = false; break; }
+                    if (stk_entry[sp - 1] && stk_var[sp - 1] >= 0 && !written[stk_var[sp - 1]]) {
+                        guard_kind[i] = 4;
+                        guard_var[i] = stk_var[sp - 1];
                     }
-                    else if (stk[sp - 2] != -3) {
-                        all_guards_hoistable = false;
+                    break;
+                case _GUARD_NOS_LIST:
+                case _GUARD_NOS_TUPLE:
+                case _GUARD_NOS_UNICODE:
+                case _GUARD_NOS_COMPACT_ASCII:
+                    if (sp < 2) { body_valid = false; break; }
+                    if (stk_entry[sp - 2] && stk_var[sp - 2] >= 0 && !written[stk_var[sp - 2]]) {
+                        guard_kind[i] = 4;
+                        guard_var[i] = stk_var[sp - 2];
                     }
+                    break;
+                case _BINARY_OP_SUBSCR_LIST_INT:
+                case _BINARY_OP_SUBSCR_TUPLE_INT:
+                    if (sp < 2 || sp >= 32) { body_valid = false; break; }
+                    stk_type[sp - 2] = VAL_UNKNOWN;
+                    stk_var[sp - 2] = -1;
+                    stk_entry[sp - 2] = false;
+                    stk_type[sp - 1] = VAL_UNKNOWN;
+                    stk_var[sp - 1] = -1;
+                    stk_entry[sp - 1] = false;
+                    stk_type[sp] = VAL_UNKNOWN;
+                    stk_var[sp] = -1;
+                    stk_entry[sp] = false;
+                    sp++;
+                    break;
+                case _LOAD_ATTR_INSTANCE_VALUE:
+                case _LOAD_ATTR_SLOT:
+                    if (sp < 1 || sp >= 32) { body_valid = false; break; }
+                    stk_type[sp - 1] = VAL_UNKNOWN;
+                    stk_var[sp - 1] = -1;
+                    stk_entry[sp - 1] = false;
+                    stk_type[sp] = VAL_UNKNOWN;
+                    stk_var[sp] = -1;
+                    stk_entry[sp] = false;
+                    sp++;
                     break;
                 case _BINARY_OP_ADD_INT:
                 case _BINARY_OP_ADD_INT_INPLACE:
@@ -1166,10 +1303,17 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _BINARY_OP_MULTIPLY_INT:
                 case _BINARY_OP_MULTIPLY_INT_INPLACE:
                 case _BINARY_OP_MULTIPLY_INT_INPLACE_RIGHT:
-                    if (sp < 2 || sp >= 32) { all_guards_hoistable = false; break; }
-                    stk[sp - 2] = -2;
-                    stk[sp - 1] = -1;
-                    stk[sp++] = -1;
+                    if (sp < 2 || sp >= 32) { body_valid = false; break; }
+                    stk_type[sp - 2] = VAL_INT;
+                    stk_var[sp - 2] = -1;
+                    stk_entry[sp - 2] = false;
+                    stk_type[sp - 1] = VAL_UNKNOWN;
+                    stk_var[sp - 1] = -1;
+                    stk_entry[sp - 1] = false;
+                    stk_type[sp] = VAL_UNKNOWN;
+                    stk_var[sp] = -1;
+                    stk_entry[sp] = false;
+                    sp++;
                     break;
                 case _BINARY_OP_ADD_FLOAT:
                 case _BINARY_OP_ADD_FLOAT_INPLACE:
@@ -1183,32 +1327,52 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _BINARY_OP_TRUEDIV_FLOAT:
                 case _BINARY_OP_TRUEDIV_FLOAT_INPLACE:
                 case _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT:
-                    if (sp < 2 || sp >= 32) { all_guards_hoistable = false; break; }
-                    stk[sp - 2] = -3;
-                    stk[sp - 1] = -1;
-                    stk[sp++] = -1;
+                    if (sp < 2 || sp >= 32) { body_valid = false; break; }
+                    stk_type[sp - 2] = VAL_FLOAT;
+                    stk_var[sp - 2] = -1;
+                    stk_entry[sp - 2] = false;
+                    stk_type[sp - 1] = VAL_UNKNOWN;
+                    stk_var[sp - 1] = -1;
+                    stk_entry[sp - 1] = false;
+                    stk_type[sp] = VAL_UNKNOWN;
+                    stk_var[sp] = -1;
+                    stk_entry[sp] = false;
+                    sp++;
                     break;
                 case _UNARY_NEGATIVE_FLOAT_INPLACE:
-                    if (sp < 1 || sp >= 32) { all_guards_hoistable = false; break; }
-                    stk[sp - 1] = -3;
-                    stk[sp++] = -1;
+                    if (sp < 1 || sp >= 32) { body_valid = false; break; }
+                    stk_type[sp - 1] = VAL_FLOAT;
+                    stk_var[sp - 1] = -1;
+                    stk_entry[sp - 1] = false;
+                    stk_type[sp] = VAL_UNKNOWN;
+                    stk_var[sp] = -1;
+                    stk_entry[sp] = false;
+                    sp++;
                     break;
                 case _COMPARE_OP_INT:
                 case _COMPARE_OP_FLOAT:
-                    if (sp < 2 || sp >= 32) { all_guards_hoistable = false; break; }
-                    stk[sp - 2] = -1;
-                    stk[sp - 1] = -1;
-                    stk[sp++] = -1;
+                    if (sp < 2 || sp >= 32) { body_valid = false; break; }
+                    stk_type[sp - 2] = VAL_UNKNOWN;
+                    stk_var[sp - 2] = -1;
+                    stk_entry[sp - 2] = false;
+                    stk_type[sp - 1] = VAL_UNKNOWN;
+                    stk_var[sp - 1] = -1;
+                    stk_entry[sp - 1] = false;
+                    stk_type[sp] = VAL_UNKNOWN;
+                    stk_var[sp] = -1;
+                    stk_entry[sp] = false;
+                    sp++;
                     break;
                 case _POP_TOP:
                 case _POP_TOP_NOP:
                 case _POP_TOP_INT:
                 case _POP_TOP_FLOAT:
+                case _POP_TOP_UNICODE:
                 case _GUARD_IS_TRUE_POP:
                 case _GUARD_IS_FALSE_POP:
                 case _GUARD_BIT_IS_SET_POP:
                 case _GUARD_BIT_IS_UNSET_POP:
-                    if (sp < 1) { all_guards_hoistable = false; break; }
+                    if (sp < 1) { body_valid = false; break; }
                     sp--;
                     break;
                 case _SWAP_FAST:
@@ -1220,57 +1384,103 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _SWAP_FAST_5:
                 case _SWAP_FAST_6:
                 case _SWAP_FAST_7: {
-                    if (sp < 1) { all_guards_hoistable = false; break; }
-                    int val = stk[sp - 1];
+                    if (sp < 1) { body_valid = false; break; }
                     int v = (op == _SWAP_FAST) ? (int)inst->oparg : (int)(op - _SWAP_FAST_0);
-                    stk[sp - 1] = -1;
-                    bool is_int = (val == -2) || (val >= 0 && guarded_int[val]);
-                    bool is_float = (val == -3) || (val >= 0 && guarded_float[val]);
-                    if (!is_int) {
-                        store_only_int[v] = false;
+                    int val_type = stk_type[sp - 1];
+                    if (val_type != VAL_INT && val_type != VAL_FLOAT && val_type != VAL_ITER_ITEM) {
+                        body_valid = false;
+                        break;
                     }
-                    if (!is_float) {
-                        store_only_float[v] = false;
+                    stk_type[sp - 1] = VAL_UNKNOWN;
+                    stk_var[sp - 1] = -1;
+                    stk_entry[sp - 1] = false;
+                    for (int s = 0; s < sp; s++) {
+                        if (stk_var[s] == v) {
+                            stk_var[s] = -1;
+                            stk_entry[s] = false;
+                        }
+                    }
+                    seen_write[v] = true;
+                    cur_var_type[v] = val_type;
+                    if (val_type != VAL_INT) {
+                        all_stores_int[v] = false;
+                    }
+                    if (val_type != VAL_FLOAT) {
+                        all_stores_float[v] = false;
                     }
                     break;
                 }
                 default:
-                    all_guards_hoistable = false;
+                    body_valid = false;
                     break;
             }
         }
 
         if (sp != 0) {
-            all_guards_hoistable = false;
+            body_valid = false;
         }
-        for (int v = 0; v < 64 && all_guards_hoistable; v++) {
-            if (guarded_int[v] && written[v] && !store_only_int[v]) {
-                all_guards_hoistable = false;
+
+        bool hoist_inst[32] = {0};
+        int hoist_type_guard_count = 0;
+        if (body_valid) {
+            for (int i = 0; i < b_len; i++) {
+                int gk = guard_kind[i];
+                int gv = guard_var[i];
+                if (gk == 1) {
+                    hoist_inst[i] = true;
+                }
+                else if (gk == 2) {
+                    if (gv == -2 || (gv >= 0 && (!written[gv] || all_stores_int[gv]))) {
+                        hoist_inst[i] = true;
+                        hoist_type_guard_count++;
+                    }
+                }
+                else if (gk == 3) {
+                    if (gv == -2 || (gv >= 0 && (!written[gv] || all_stores_float[gv]))) {
+                        hoist_inst[i] = true;
+                        hoist_type_guard_count++;
+                    }
+                }
+                else if (gk == 4) {
+                    if (gv >= 0 && !written[gv]) {
+                        hoist_inst[i] = true;
+                        hoist_type_guard_count++;
+                    }
+                }
             }
-            if (guarded_float[v] && written[v] && !store_only_float[v]) {
-                all_guards_hoistable = false;
+            /* Ensure every _POP_TOP in body can be specialized to _POP_TOP_INT
+             * or _POP_TOP_FLOAT in sbody so sbody has no escaping decrefs. */
+            for (int i = 0; i < b_len; i++) {
+                if (body[i].opcode == _POP_TOP) {
+                    bool pop_specialized = false;
+                    if (i > 0) {
+                        uint16_t prev_op = body[i - 1].opcode;
+                        int v = -1;
+                        if (prev_op == _SWAP_FAST) {
+                            v = (int)body[i - 1].oparg;
+                        }
+                        else if (prev_op >= _SWAP_FAST_0 && prev_op <= _SWAP_FAST_7) {
+                            v = (int)(prev_op - _SWAP_FAST_0);
+                        }
+                        if (v >= 0 && v < 64 && written[v]) {
+                            bool sbody_int = all_stores_int[v] ||
+                                (store_count[v] == 1 && cur_var_type[v] == VAL_INT);
+                            bool sbody_float = all_stores_float[v] ||
+                                (store_count[v] == 1 && cur_var_type[v] == VAL_FLOAT);
+                            if (sbody_int || sbody_float) {
+                                pop_specialized = true;
+                            }
+                        }
+                    }
+                    if (!pop_specialized) {
+                        body_valid = false;
+                        break;
+                    }
+                }
             }
         }
 
-        if (all_guards_hoistable) {
-            _PyUOpInstruction body[32];
-            int b_len = 0;
-            int load_count[64] = {0};
-            int store_count[64] = {0};
-            for (int i = 2; i < length - 1; i++) {
-                if (output[i].opcode != _NOP) {
-                    uint16_t bop = output[i].opcode;
-                    if ((bop == _LOAD_FAST || bop == _LOAD_FAST_BORROW) &&
-                        output[i].oparg < 64)
-                    {
-                        load_count[output[i].oparg]++;
-                    }
-                    else if (bop == _SWAP_FAST && output[i].oparg < 64) {
-                        store_count[output[i].oparg]++;
-                    }
-                    body[b_len++] = output[i];
-                }
-            }
+        if (body_valid && hoist_type_guard_count > 0) {
             _PyUOpInstruction make_warm_inst = output[1];
             _PyUOpInstruction jump_inst = output[length - 1];
             int out_idx = 1;
@@ -1290,34 +1500,35 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             _PyUOpInstruction sbody[32];
             int s_len = 0;
             for (int i = 0; i < b_len; i++) {
-                uint16_t op = body[i].opcode;
-                if (op == _ITER_CHECK_RANGE ||
-                    op == _ITER_CHECK_LIST ||
-                    op == _ITER_CHECK_TUPLE ||
-                    op == _GUARD_TOS_INT ||
-                    op == _GUARD_NOS_INT ||
-                    op == _GUARD_TOS_FLOAT ||
-                    op == _GUARD_NOS_FLOAT)
-                {
+                if (hoist_inst[i]) {
                     continue;
                 }
                 sbody[s_len++] = body[i];
             }
             /* Specialize _SWAP_FAST v + _POP_TOP in steady-state loop body:
              * after Iteration 1 (Pre-Header), any local v written in the loop
-             * holds a known int (if store_only_int[v]) or float (if store_only_float[v]). */
+             * holds a known int or float at the point of _SWAP_FAST. */
             for (int i = 0; i + 1 < s_len; i++) {
-                if (sbody[i].opcode == _SWAP_FAST &&
+                uint16_t sop = sbody[i].opcode;
+                int v = -1;
+                if (sop == _SWAP_FAST) {
+                    v = (int)sbody[i].oparg;
+                }
+                else if (sop >= _SWAP_FAST_0 && sop <= _SWAP_FAST_7) {
+                    v = (int)(sop - _SWAP_FAST_0);
+                }
+                if (v >= 0 && v < 64 && written[v] &&
                     sbody[i + 1].opcode == _POP_TOP)
                 {
-                    int v = (int)sbody[i].oparg;
-                    if (v >= 0 && v < 64 && written[v]) {
-                        if (store_only_int[v]) {
-                            sbody[i + 1].opcode = _POP_TOP_INT;
-                        }
-                        else if (store_only_float[v]) {
-                            sbody[i + 1].opcode = _POP_TOP_FLOAT;
-                        }
+                    if (all_stores_int[v] ||
+                        (store_count[v] == 1 && cur_var_type[v] == VAL_INT))
+                    {
+                        sbody[i + 1].opcode = _POP_TOP_INT;
+                    }
+                    else if (all_stores_float[v] ||
+                             (store_count[v] == 1 && cur_var_type[v] == VAL_FLOAT))
+                    {
+                        sbody[i + 1].opcode = _POP_TOP_FLOAT;
                     }
                 }
             }
@@ -1338,7 +1549,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 {
                     continue;
                 }
-                if (store_only_float[v]) {
+                if (all_stores_float[v]) {
                     bool rhs_ok =
                         (sbody[i + 1].opcode == _LOAD_FAST_BORROW &&
                          (int)sbody[i + 1].oparg != v) ||
@@ -1379,7 +1590,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                         sbody[k + 1].opcode = _POP_TOP_NOP;
                     }
                 }
-                else if (store_only_int[v]) {
+                else if (all_stores_int[v]) {
                     bool rhs_ok =
                         (sbody[i + 1].opcode == _LOAD_FAST_BORROW &&
                          (int)sbody[i + 1].oparg != v) ||
