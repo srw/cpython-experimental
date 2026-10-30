@@ -605,6 +605,7 @@ NON_ESCAPING_FUNCTIONS = (
     "gen_try_set_executing",
     "_PyInterpreterState_GET",
     "_PyList_AppendTakeRef",
+    "_PyList_GetItemRefNoLock",
     "_PyList_ITEMS",
     "_PyLong_CompactValue",
     "_PyLong_DigitCount",

@@ -292,6 +292,9 @@ add_op(JitOptContext *ctx, _PyUOpInstruction *this_instr,
 #define sym_get_type_version _Py_uop_sym_get_type_version
 #define sym_set_unshared_local _Py_uop_sym_set_unshared_local
 #define sym_is_unshared_local _Py_uop_sym_is_unshared_local
+#define sym_set_inline_values _Py_uop_sym_set_inline_values
+#define sym_has_inline_values _Py_uop_sym_has_inline_values
+#define sym_clear_inline_values _Py_uop_sym_clear_inline_values
 #define sym_set_null(SYM) _Py_uop_sym_set_null(ctx, SYM)
 #define sym_set_non_null(SYM) _Py_uop_sym_set_non_null(ctx, SYM)
 #define sym_set_type(SYM, TYPE) _Py_uop_sym_set_type(ctx, SYM, TYPE)
@@ -892,6 +895,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
     bool has_iter_check = false;
     bool has_compare_op = false;
     bool has_arith_binop = false;
+    bool has_comp_append = false;
     bool can_peel_body = true;
 
     bool written[64] = {0};
@@ -1012,6 +1016,10 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             case _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT:
                 has_arith_binop = true;
                 break;
+            case _LIST_APPEND:
+            case _SET_ADD:
+                has_comp_append = true;
+                break;
             case _SET_IP:
             case _CHECK_PERIODIC:
             case _CHECK_PERIODIC_IF_NOT_YIELD_FROM:
@@ -1055,14 +1063,14 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
      * list/tuple-iteration, and attribute-reading loops where loop-invariant
      * or inductive local guards can be hoisted to Iteration 1. */
     if (can_peel_body &&
-        has_arith_binop &&
+        (has_arith_binop || has_comp_append) &&
         type_guard_count > 0 &&
         pop_top_count <= 2 &&
-        non_nop_count <= 32 &&
+        non_nop_count <= 64 &&
         !(has_iter_check && has_compare_op) &&
         length + non_nop_count <= UOP_MAX_TRACE_LENGTH)
     {
-        _PyUOpInstruction body[32];
+        _PyUOpInstruction body[64];
         int b_len = 0;
         for (int i = 2; i < length - 1; i++) {
             if (output[i].opcode != _NOP) {
@@ -1076,9 +1084,9 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             VAL_FLOAT = 2,
             VAL_ITER_ITEM = 3,
         };
-        int stk_type[32];
-        int stk_var[32];
-        bool stk_entry[32];
+        int stk_type[64];
+        int stk_var[64];
+        bool stk_entry[64];
         int sp = 0;
         bool seen_write[64] = {0};
         int cur_var_type[64] = {0};
@@ -1096,9 +1104,9 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
          *   3 = float guard on entry value of local guard_var[i] (or proven float if -2)
          *   4 = invariant local guard (container/type/managed-values) on guard_var[i]
          */
-        int guard_kind[32] = {0};
-        int guard_var[32];
-        for (int i = 0; i < 32; i++) {
+        int guard_kind[64] = {0};
+        int guard_var[64];
+        for (int i = 0; i < 64; i++) {
             guard_var[i] = -1;
         }
         bool body_valid = true;
@@ -1123,7 +1131,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _GUARD_BINARY_OP_SUBSCR_TUPLE_INT_BOUNDS:
                     break;
                 case _ITER_NEXT_RANGE:
-                    if (sp >= 32) { body_valid = false; break; }
+                    if (sp >= 64) { body_valid = false; break; }
                     stk_type[sp] = VAL_INT;
                     stk_var[sp] = -1;
                     stk_entry[sp] = false;
@@ -1132,7 +1140,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _ITER_NEXT_LIST:
                 case _ITER_NEXT_LIST_TIER_TWO:
                 case _ITER_NEXT_TUPLE:
-                    if (sp >= 32) { body_valid = false; break; }
+                    if (sp >= 64) { body_valid = false; break; }
                     stk_type[sp] = VAL_ITER_ITEM;
                     stk_var[sp] = -1;
                     stk_entry[sp] = false;
@@ -1156,7 +1164,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _LOAD_FAST_BORROW_5:
                 case _LOAD_FAST_BORROW_6:
                 case _LOAD_FAST_BORROW_7: {
-                    if (sp >= 32) { body_valid = false; break; }
+                    if (sp >= 64) { body_valid = false; break; }
                     int v;
                     if (op == _LOAD_FAST || op == _LOAD_FAST_BORROW) {
                         v = (int)inst->oparg;
@@ -1174,7 +1182,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     break;
                 }
                 case _LOAD_SMALL_INT:
-                    if (sp >= 32) { body_valid = false; break; }
+                    if (sp >= 64) { body_valid = false; break; }
                     stk_type[sp] = VAL_INT;
                     stk_var[sp] = -1;
                     stk_entry[sp] = false;
@@ -1182,7 +1190,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     break;
                 case _LOAD_CONST_INLINE:
                 case _LOAD_CONST_INLINE_BORROW: {
-                    if (sp >= 32) { body_valid = false; break; }
+                    if (sp >= 64) { body_valid = false; break; }
                     PyObject *c = (PyObject *)inst->operand0;
                     if (c != NULL && _PyLong_CheckExactAndCompact(c)) {
                         stk_type[sp] = VAL_INT;
@@ -1271,7 +1279,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     break;
                 case _BINARY_OP_SUBSCR_LIST_INT:
                 case _BINARY_OP_SUBSCR_TUPLE_INT:
-                    if (sp < 2 || sp >= 32) { body_valid = false; break; }
+                    if (sp < 2 || sp >= 64) { body_valid = false; break; }
                     stk_type[sp - 2] = VAL_UNKNOWN;
                     stk_var[sp - 2] = -1;
                     stk_entry[sp - 2] = false;
@@ -1285,7 +1293,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     break;
                 case _LOAD_ATTR_INSTANCE_VALUE:
                 case _LOAD_ATTR_SLOT:
-                    if (sp < 1 || sp >= 32) { body_valid = false; break; }
+                    if (sp < 1 || sp >= 64) { body_valid = false; break; }
                     stk_type[sp - 1] = VAL_UNKNOWN;
                     stk_var[sp - 1] = -1;
                     stk_entry[sp - 1] = false;
@@ -1303,7 +1311,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _BINARY_OP_MULTIPLY_INT:
                 case _BINARY_OP_MULTIPLY_INT_INPLACE:
                 case _BINARY_OP_MULTIPLY_INT_INPLACE_RIGHT:
-                    if (sp < 2 || sp >= 32) { body_valid = false; break; }
+                    if (sp < 2 || sp >= 64) { body_valid = false; break; }
                     stk_type[sp - 2] = VAL_INT;
                     stk_var[sp - 2] = -1;
                     stk_entry[sp - 2] = false;
@@ -1327,7 +1335,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _BINARY_OP_TRUEDIV_FLOAT:
                 case _BINARY_OP_TRUEDIV_FLOAT_INPLACE:
                 case _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT:
-                    if (sp < 2 || sp >= 32) { body_valid = false; break; }
+                    if (sp < 2 || sp >= 64) { body_valid = false; break; }
                     stk_type[sp - 2] = VAL_FLOAT;
                     stk_var[sp - 2] = -1;
                     stk_entry[sp - 2] = false;
@@ -1340,7 +1348,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     sp++;
                     break;
                 case _UNARY_NEGATIVE_FLOAT_INPLACE:
-                    if (sp < 1 || sp >= 32) { body_valid = false; break; }
+                    if (sp < 1 || sp >= 64) { body_valid = false; break; }
                     stk_type[sp - 1] = VAL_FLOAT;
                     stk_var[sp - 1] = -1;
                     stk_entry[sp - 1] = false;
@@ -1351,7 +1359,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     break;
                 case _COMPARE_OP_INT:
                 case _COMPARE_OP_FLOAT:
-                    if (sp < 2 || sp >= 32) { body_valid = false; break; }
+                    if (sp < 2 || sp >= 64) { body_valid = false; break; }
                     stk_type[sp - 2] = VAL_UNKNOWN;
                     stk_var[sp - 2] = -1;
                     stk_entry[sp - 2] = false;
@@ -1372,6 +1380,8 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _GUARD_IS_FALSE_POP:
                 case _GUARD_BIT_IS_SET_POP:
                 case _GUARD_BIT_IS_UNSET_POP:
+                case _LIST_APPEND:
+                case _SET_ADD:
                     if (sp < 1) { body_valid = false; break; }
                     sp--;
                     break;
@@ -1420,7 +1430,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             body_valid = false;
         }
 
-        bool hoist_inst[32] = {0};
+        bool hoist_inst[64] = {0};
         int hoist_type_guard_count = 0;
         if (body_valid) {
             for (int i = 0; i < b_len; i++) {
@@ -1480,7 +1490,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             }
         }
 
-        if (body_valid && hoist_type_guard_count > 0) {
+        if (body_valid && (hoist_type_guard_count > 0 || (has_iter_check && pop_top_count > 0))) {
             _PyUOpInstruction make_warm_inst = output[1];
             _PyUOpInstruction jump_inst = output[length - 1];
             int out_idx = 1;
@@ -1497,7 +1507,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             /* Loop Header */
             output[out_idx++] = make_warm_inst;
             /* Build Steady-State Loop Body with hoisted guards removed */
-            _PyUOpInstruction sbody[32];
+            _PyUOpInstruction sbody[64];
             int s_len = 0;
             for (int i = 0; i < b_len; i++) {
                 if (hoist_inst[i]) {
@@ -1676,7 +1686,6 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
     }
 
     if (iter_check_idx >= 0 && length + 3 <= UOP_MAX_TRACE_LENGTH) {
-        uint16_t first_op = output[iter_check_idx].opcode;
         bool safe_to_hoist_iter = true;
         int inline_depth = 0;
         int first_recursion_check_idx = -1;
@@ -1724,14 +1733,6 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             {
                 can_hoist_recursion_check = false;
             }
-#ifdef Py_GIL_DISABLED
-            if (first_op == _ITER_CHECK_LIST &&
-                (_PyUop_Flags[op] & HAS_ESCAPES_FLAG))
-            {
-                safe_to_hoist_iter = false;
-                break;
-            }
-#endif
         }
         if (inline_depth != 0) {
             safe_to_hoist_iter = false;

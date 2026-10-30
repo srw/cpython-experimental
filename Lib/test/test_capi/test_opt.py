@@ -6859,6 +6859,68 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertNotIn("_GUARD_NOS_INT", uops_at[mw_at:jmp_at])
         self.assertNotIn("_POP_TOP", uops_at[mw_at:jmp_at])
 
+    def test_inline_values_deduplication_and_multi_attr_comp_peeling(self):
+        class Point3D:
+            def __init__(self, x, y, z):
+                self.x = x
+                self.y = y
+                self.z = z
+
+            def norm(self, s):
+                return (self.x + self.y + self.z) * s
+
+        def f_multi_attr(n):
+            p = Point3D(1.25, 2.5, 3.75)
+            total = 0.0
+            for _ in range(n):
+                total = total + p.x + p.y + p.z
+            return total
+
+        res_ma, ex_ma = self._run_with_optimizer(f_multi_attr, TIER2_THRESHOLD)
+        self.assertAlmostEqual(res_ma, 7.5 * TIER2_THRESHOLD)
+        self.assertIsNotNone(ex_ma)
+        uops_ma = get_opnames(ex_ma)
+        mw_ma = uops_ma.index("_MAKE_WARM")
+        jmp_ma = uops_ma.index("_JUMP_TO_TOP")
+        # Only 1 _CHECK_MANAGED_OBJECT_HAS_VALUES in preheader (deduplicated across .x, .y, .z)
+        # and 0 in the peeled steady-state loop body:
+        self.assertEqual(uops_ma[:mw_ma].count("_CHECK_MANAGED_OBJECT_HAS_VALUES"), 1)
+        self.assertNotIn("_CHECK_MANAGED_OBJECT_HAS_VALUES", uops_ma[mw_ma:jmp_ma])
+        self.assertNotIn("_GUARD_TYPE_VERSION", uops_ma[mw_ma:jmp_ma])
+        self.assertNotIn("_POP_TOP", uops_ma[mw_ma:jmp_ma])
+
+        def f_method(n):
+            p = Point3D(1.25, 2.5, 3.75)
+            total = 0.0
+            for _ in range(n):
+                total = total + p.norm(1.5)
+            return total
+
+        res_m, ex_m = self._run_with_optimizer(f_method, TIER2_THRESHOLD)
+        self.assertAlmostEqual(res_m, 11.25 * TIER2_THRESHOLD)
+        self.assertIsNotNone(ex_m)
+        uops_m = get_opnames(ex_m)
+        # Deduplicated across p.norm and inlined self.x, self.y, self.z:
+        self.assertEqual(uops_m.count("_CHECK_MANAGED_OBJECT_HAS_VALUES"), 1)
+
+        def f_list_comp(n):
+            lst = [1, 2, 3, 4] * (n // 4 + 1)
+            return [x + 1 for x in lst]
+
+        res_lc, ex_lc = self._run_with_optimizer(f_list_comp, TIER2_THRESHOLD)
+        self.assertEqual(res_lc[:4], [2, 3, 4, 5])
+        self.assertIsNotNone(ex_lc)
+        uops_lc = get_opnames(ex_lc)
+        mw_lc = uops_lc.index("_MAKE_WARM")
+        jmp_lc = uops_lc.index("_JUMP_TO_TOP")
+        self.assertIn("_ITER_CHECK_LIST", uops_lc[:mw_lc])
+        self.assertNotIn("_ITER_CHECK_LIST", uops_lc[mw_lc:jmp_lc])
+        self.assertNotIn("_POP_TOP", uops_lc[mw_lc:jmp_lc])
+        self.assertIn("_POP_TOP_INT", uops_lc[mw_lc:jmp_lc])
+        iter_idx = uops_lc[mw_lc:jmp_lc].index("_ITER_NEXT_LIST_TIER_TWO")
+        self.assertNotEqual(uops_lc[mw_lc + iter_idx - 1], "_SET_IP")
+
+
 def global_identity(x):
     return x
 

@@ -6888,10 +6888,7 @@
                     next = PyStackRef_FromPyObjectNew(PyList_GET_ITEM(list_o, idx));
                 }
                 else {
-                    _PyFrame_SetStackPointer(frame, stack_pointer);
-                    _PyFrame_StackPointerValidate(frame);
                     int result = _PyList_GetItemRefNoLock((PyListObject *)list_o, PyStackRef_UntagInt(null_or_index), &next);
-                    _PyFrame_StackPointerInvalidate(frame);
                     if (result < 0) {
                         UPDATE_MISS_STATS(FOR_ITER);
                         assert(_PyOpcode_Deopt[opcode] == (FOR_ITER));

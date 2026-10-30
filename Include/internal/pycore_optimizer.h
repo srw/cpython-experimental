@@ -452,6 +452,9 @@ extern bool _Py_uop_sym_matches_type_version(JitOptRef sym, unsigned int version
 extern unsigned int _Py_uop_sym_get_type_version(JitOptRef sym);
 extern void _Py_uop_sym_set_unshared_local(JitOptRef ref, bool unshared);
 extern bool _Py_uop_sym_is_unshared_local(JitOptRef ref);
+extern void _Py_uop_sym_set_inline_values(JitOptRef ref, bool has_values);
+extern bool _Py_uop_sym_has_inline_values(JitOptRef ref);
+extern void _Py_uop_sym_clear_inline_values(JitOptContext *ctx);
 extern void _Py_uop_sym_set_null(JitOptContext *ctx, JitOptRef sym);
 extern void _Py_uop_sym_set_non_null(JitOptContext *ctx, JitOptRef sym);
 extern void _Py_uop_sym_set_type(JitOptContext *ctx, JitOptRef sym, PyTypeObject *typ);

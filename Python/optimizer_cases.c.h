@@ -2853,8 +2853,11 @@
         case _CHECK_MANAGED_OBJECT_HAS_VALUES: {
             JitOptRef owner;
             owner = stack_pointer[-1];
-            if (sym_is_unshared_local(owner)) {
+            if (sym_is_unshared_local(owner) || sym_has_inline_values(owner)) {
                 ADD_OP(_NOP, 0, 0);
+            }
+            else {
+                sym_set_inline_values(owner, true);
             }
             break;
         }
@@ -3046,6 +3049,9 @@
             if (sym_is_unshared_local(owner)) {
                 ADD_OP(_NOP, 0, 0);
             }
+            else {
+                sym_set_inline_values(owner, true);
+            }
             break;
         }
 
@@ -3069,9 +3075,14 @@
         case _LOCK_OBJECT: {
             JitOptRef value;
             value = stack_pointer[-1];
+            #ifdef Py_GIL_DISABLED
             if (sym_is_unshared_local(value)) {
                 ADD_OP(_NOP, 0, 0);
             }
+            #else
+            (void)value;
+            ADD_OP(_NOP, 0, 0);
+            #endif
             break;
         }
 
@@ -4746,6 +4757,7 @@
         case _CALL_BUILTIN_CLASS: {
             JitOptRef callable;
             callable = stack_pointer[-2 - oparg];
+            sym_clear_inline_values(ctx);
             callable = sym_new_not_null(ctx);
             stack_pointer[-2 - oparg] = callable;
             break;
@@ -4785,6 +4797,7 @@
             args = &stack_pointer[-oparg];
             self_or_null = stack_pointer[-1 - oparg];
             callable = stack_pointer[-2 - oparg];
+            sym_clear_inline_values(ctx);
             res = sym_new_not_null(ctx);
             c = callable;
             if (sym_is_not_null(self_or_null)) {
@@ -4825,6 +4838,7 @@
         case _CALL_BUILTIN_FAST: {
             JitOptRef callable;
             callable = stack_pointer[-2 - oparg];
+            sym_clear_inline_values(ctx);
             callable = sym_new_not_null(ctx);
             stack_pointer[-2 - oparg] = callable;
             break;
@@ -4849,6 +4863,7 @@
         case _CALL_BUILTIN_FAST_WITH_KEYWORDS: {
             JitOptRef callable;
             callable = stack_pointer[-2 - oparg];
+            sym_clear_inline_values(ctx);
             callable = sym_new_not_null(ctx);
             stack_pointer[-2 - oparg] = callable;
             break;

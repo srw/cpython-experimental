@@ -28,6 +28,9 @@ typedef struct _Py_UOpsAbstractFrame _Py_UOpsAbstractFrame;
 #define sym_get_type_version _Py_uop_sym_get_type_version
 #define sym_set_unshared_local _Py_uop_sym_set_unshared_local
 #define sym_is_unshared_local _Py_uop_sym_is_unshared_local
+#define sym_set_inline_values _Py_uop_sym_set_inline_values
+#define sym_has_inline_values _Py_uop_sym_has_inline_values
+#define sym_clear_inline_values _Py_uop_sym_clear_inline_values
 #define sym_get_type _Py_uop_sym_get_type
 #define sym_has_type _Py_uop_sym_has_type
 #define sym_set_null(SYM) _Py_uop_sym_set_null(ctx, SYM)
@@ -1440,20 +1443,31 @@ dummy_func(void) {
     }
 
     op(_LOCK_OBJECT, (value -- value)) {
+#ifdef Py_GIL_DISABLED
         if (sym_is_unshared_local(value)) {
             ADD_OP(_NOP, 0, 0);
         }
+#else
+        (void)value;
+        ADD_OP(_NOP, 0, 0);
+#endif
     }
 
     op(_GUARD_DORV_NO_DICT, (owner -- owner)) {
         if (sym_is_unshared_local(owner)) {
             ADD_OP(_NOP, 0, 0);
         }
+        else {
+            sym_set_inline_values(owner, true);
+        }
     }
 
     op(_CHECK_MANAGED_OBJECT_HAS_VALUES, (owner -- owner)) {
-        if (sym_is_unshared_local(owner)) {
+        if (sym_is_unshared_local(owner) || sym_has_inline_values(owner)) {
             ADD_OP(_NOP, 0, 0);
+        }
+        else {
+            sym_set_inline_values(owner, true);
         }
     }
 
@@ -1881,10 +1895,12 @@ dummy_func(void) {
     }
 
     op(_CALL_BUILTIN_FAST_WITH_KEYWORDS, (callable, self_or_null, args[oparg] -- callable, self_or_null, args[oparg])) {
+        sym_clear_inline_values(ctx);
         callable = sym_new_not_null(ctx);
     }
 
     op(_CALL_BUILTIN_O, (callable, self_or_null, args[oparg] -- res, c, s)) {
+        sym_clear_inline_values(ctx);
         res = sym_new_not_null(ctx);
         c = callable;
         if (sym_is_not_null(self_or_null)) {
@@ -1900,10 +1916,12 @@ dummy_func(void) {
     }
 
     op(_CALL_BUILTIN_FAST, (callable, self_or_null, args[oparg] -- callable, self_or_null, args[oparg])) {
+        sym_clear_inline_values(ctx);
         callable = sym_new_not_null(ctx);
     }
 
     op(_CALL_BUILTIN_CLASS, (callable, self_or_null, args[oparg] -- callable, self_or_null, args[oparg])) {
+        sym_clear_inline_values(ctx);
         callable = sym_new_not_null(ctx);
     }
 

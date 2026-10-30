@@ -15683,24 +15683,14 @@
                 next = PyStackRef_FromPyObjectNew(PyList_GET_ITEM(list_o, idx));
             }
             else {
-                stack_pointer[0] = iter;
-                stack_pointer[1] = null_or_index;
-                stack_pointer += 2;
-                ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
-                _PyFrame_SetStackPointer(frame, stack_pointer);
-                _PyFrame_StackPointerValidate(frame);
                 int result = _PyList_GetItemRefNoLock((PyListObject *)list_o, PyStackRef_UntagInt(null_or_index), &next);
-                _PyFrame_StackPointerInvalidate(frame);
                 if (result <= 0) {
                     UOP_STAT_INC(uopcode, miss);
                     _tos_cache1 = null_or_index;
                     _tos_cache0 = iter;
                     SET_CURRENT_CACHED_VALUES(2);
-                    stack_pointer += -2;
-                    ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
                     JUMP_TO_JUMP_TARGET();
                 }
-                stack_pointer += -2;
             }
             #else
             assert(PyStackRef_UntagInt(null_or_index) < PyList_GET_SIZE(list_o));
