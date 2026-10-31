@@ -2979,15 +2979,21 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                                    rop == _LOAD_CONST_INLINE_BORROW ||
                                    rop == _LOAD_SMALL_INT;
                     uint16_t binop = sbody[i_binop].opcode;
-                    bool binop_ok =
-                        binop == _BINARY_OP_ADD_INT ||
-                        binop == _BINARY_OP_SUBTRACT_INT ||
-                        binop == _BINARY_OP_MULTIPLY_INT;
+                    uint16_t inplace_binop = 0;
+                    if (binop == _BINARY_OP_ADD_INT || binop == _BINARY_OP_ADD_INT_INPLACE) {
+                        inplace_binop = _BINARY_OP_ADD_INT_INPLACE;
+                    }
+                    else if (binop == _BINARY_OP_SUBTRACT_INT || binop == _BINARY_OP_SUBTRACT_INT_INPLACE) {
+                        inplace_binop = _BINARY_OP_SUBTRACT_INT_INPLACE;
+                    }
+                    else if (binop == _BINARY_OP_MULTIPLY_INT || binop == _BINARY_OP_MULTIPLY_INT_INPLACE) {
+                        inplace_binop = _BINARY_OP_MULTIPLY_INT_INPLACE;
+                    }
                     bool pops_ok =
                         (sbody[i_pop1].opcode == _POP_TOP_NOP ||
                          sbody[i_pop1].opcode == _POP_TOP_INT) &&
                         sbody[i_pop2].opcode == _POP_TOP_NOP;
-                    if (!rhs_ok || !binop_ok || !pops_ok) {
+                    if (!rhs_ok || inplace_binop == 0 || !pops_ok) {
                         continue;
                     }
                     int k = NEXT_SBODY_IDX(i_pop2 + 1);
@@ -3031,6 +3037,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                         if (sw_v == v && sbody[k_pop].opcode == _POP_TOP_INT) {
                             sbody[i].opcode = _LOAD_FAST_AND_CLEAR;
                             sbody[i].oparg = v;
+                            sbody[i_binop].opcode = inplace_binop;
                             sbody[i_pop2].opcode = _POP_TOP_INT;
                             sbody[k_pop].opcode = _POP_TOP_NOP;
                         }
@@ -3123,6 +3130,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     }
                     bool rhs_ok = (rop == _LOAD_CONST_INLINE_BORROW) ||
                                   (rhs_v >= 0 && rhs_v != v);
+                    int i_rhs_attr = -1;
                     int i_binop = NEXT_SBODY_IDX(i_rhs + 1);
                     if (rhs_v >= 0 && !written[rhs_v] && i_binop < s_len &&
                         (sbody[i_binop].opcode == _LOAD_ATTR_SLOT ||
@@ -3135,6 +3143,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                             (rhs_v != v || rhs_off != offset || rhs_slot != is_slot))
                         {
                             rhs_ok = true;
+                            i_rhs_attr = i_binop;
                             i_binop = NEXT_SBODY_IDX(i_rhs_pop + 1);
                         }
                         else {
@@ -3243,6 +3252,38 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     {
                         sbody[i_binop].opcode = inplace_binop;
                         sbody[i_pop2].opcode = _POP_TOP_NOP;
+                        if (i_rhs_attr >= 0 &&
+                            sbody[i_rhs_attr].opcode == _LOAD_ATTR_SLOT &&
+                            (sbody[i_rhs_attr].operand0 >> 13) == 2 &&
+                            sbody[i_pop1].opcode == _POP_TOP_FLOAT)
+                        {
+                            sbody[i_rhs_attr].oparg = 254;
+                            sbody[i_pop1].opcode = _POP_TOP_NOP;
+                        }
+                        int kc = NEXT_SBODY_IDX(i_pop2 + 1);
+                        while (kc < k) {
+                            int kc_binop = NEXT_SBODY_IDX(kc + 1);
+                            int kc_attr = -1;
+                            if (kc_binop < k &&
+                                (sbody[kc_binop].opcode == _LOAD_ATTR_SLOT ||
+                                 sbody[kc_binop].opcode == _LOAD_ATTR_INSTANCE_VALUE))
+                            {
+                                kc_attr = kc_binop;
+                                int kc_rhs_pop = NEXT_SBODY_IDX(kc_binop + 1);
+                                kc_binop = NEXT_SBODY_IDX(kc_rhs_pop + 1);
+                            }
+                            int kc_pop1 = NEXT_SBODY_IDX(kc_binop + 1);
+                            int kc_pop2 = NEXT_SBODY_IDX(kc_pop1 + 1);
+                            if (kc_attr >= 0 &&
+                                sbody[kc_attr].opcode == _LOAD_ATTR_SLOT &&
+                                (sbody[kc_attr].operand0 >> 13) == 2 &&
+                                sbody[kc_pop1].opcode == _POP_TOP_FLOAT)
+                            {
+                                sbody[kc_attr].oparg = 254;
+                                sbody[kc_pop1].opcode = _POP_TOP_NOP;
+                            }
+                            kc = NEXT_SBODY_IDX(kc_pop2 + 1);
+                        }
                         if (is_slot && (sbody[i_attr].operand0 >> 13) == 2) {
                             sbody[i_attr].oparg = 254;
                             sbody[k].opcode = _POP_TOP_NOP;
@@ -3254,6 +3295,44 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                         sbody[k].operand0 = 0;
                         for (int c = k + 1; c <= m_pop; c++) {
                             sbody[c].opcode = _NOP;
+                        }
+                    }
+                }
+            }
+            {
+                int i_gne = NEXT_SBODY_IDX(0);
+                if (i_gne < s_len && sbody[i_gne].opcode == _GUARD_NOT_EXHAUSTED_RANGE) {
+                    int i_inr = NEXT_SBODY_IDX(i_gne + 1);
+                    int i_swf = NEXT_SBODY_IDX(i_inr + 1);
+                    int i_pop = NEXT_SBODY_IDX(i_swf + 1);
+                    if (i_pop < s_len &&
+                        sbody[i_inr].opcode == _ITER_NEXT_RANGE &&
+                        sbody[i_pop].opcode == _POP_TOP_INT)
+                    {
+                        uint16_t sop = sbody[i_swf].opcode;
+                        int sv = (sop == _SWAP_FAST) ? (int)sbody[i_swf].oparg :
+                                 (sop >= _SWAP_FAST_0 && sop <= _SWAP_FAST_7) ? (int)(sop - _SWAP_FAST_0) : -1;
+                        if (sv >= 0 && sv < 64 && store_count[sv] == 1 && !var_copied[sv]) {
+                            bool can_elide_sv = (load_count[sv] == 0);
+                            if (can_elide_sv) {
+                                for (int c = i_pop + 1; c < s_len; c++) {
+                                    uint16_t cop = sbody[c].opcode;
+                                    if (cop == _NOP || cop == _SET_IP || cop == _CHECK_VALIDITY ||
+                                        cop == _CHECK_PERIODIC || cop == _CHECK_PERIODIC_IF_NOT_YIELD_FROM ||
+                                        cop == _POP_TOP_NOP || cop == _POP_TOP_INT || cop == _POP_TOP_FLOAT)
+                                    {
+                                        continue;
+                                    }
+                                    if (_PyUop_Flags[cop] & (HAS_DEOPT_FLAG | HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ESCAPES_FLAG)) {
+                                        can_elide_sv = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            sbody[i_gne].oparg = (uint16_t)((can_elide_sv ? 0x8000 : 0x4000) | sv);
+                            for (int c = i_gne + 1; c <= i_pop; c++) {
+                                sbody[c].opcode = _NOP;
+                            }
                         }
                     }
                 }
@@ -3381,12 +3460,16 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 output[iter_check_idx].oparg == 0)
             {
                 int scan = iter_check_idx + 1;
+                int gne_idx = -1;
                 while (scan < length - 1 &&
                        (output[scan].opcode == _NOP ||
                         output[scan].opcode == _SET_IP ||
                         output[scan].opcode == _CHECK_VALIDITY ||
                         output[scan].opcode == _GUARD_NOT_EXHAUSTED_RANGE))
                 {
+                    if (output[scan].opcode == _GUARD_NOT_EXHAUSTED_RANGE) {
+                        gne_idx = scan;
+                    }
                     scan++;
                 }
                 if (scan + 2 < length - 1 && output[scan].opcode == _ITER_NEXT_RANGE) {
@@ -3413,6 +3496,8 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                         }
                         if (sv >= 0 && sv < 64) {
                             bool other_writes = false;
+                            bool sv_loaded = false;
+                            bool has_branch_guard = false;
                             int d = 0;
                             for (int k = 2; k < length - 1; k++) {
                                 uint16_t kop = output[k].opcode;
@@ -3431,11 +3516,36 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                                         other_writes = true;
                                         break;
                                     }
+                                    if (((kop == _LOAD_FAST || kop == _LOAD_FAST_BORROW ||
+                                          kop == _LOAD_FAST_CHECK) && (int)output[k].oparg == sv) ||
+                                        (kop >= _LOAD_FAST_0 && kop <= _LOAD_FAST_7 &&
+                                         (int)(kop - _LOAD_FAST_0) == sv) ||
+                                        (kop >= _LOAD_FAST_BORROW_0 && kop <= _LOAD_FAST_BORROW_7 &&
+                                         (int)(kop - _LOAD_FAST_BORROW_0) == sv))
+                                    {
+                                        sv_loaded = true;
+                                    }
+                                    if (kop == _GUARD_IS_TRUE_POP ||
+                                        kop == _GUARD_IS_FALSE_POP ||
+                                        kop == _GUARD_IS_NONE_POP ||
+                                        kop == _GUARD_IS_NOT_NONE_POP)
+                                    {
+                                        has_branch_guard = true;
+                                    }
                                 }
                             }
                             if (!other_writes) {
                                 output[iter_check_idx].oparg = (uint16_t)(0x8000 | sv);
-                                output[pop_idx].opcode = _POP_TOP_INT;
+                                if (gne_idx >= 0) {
+                                    bool can_elide = (!sv_loaded && !has_branch_guard);
+                                    output[gne_idx].oparg = (uint16_t)((can_elide ? 0x8000 : 0x4000) | sv);
+                                    for (int c = gne_idx + 1; c <= pop_idx; c++) {
+                                        output[c].opcode = _NOP;
+                                    }
+                                }
+                                else {
+                                    output[pop_idx].opcode = _POP_TOP_INT;
+                                }
                             }
                         }
                     }

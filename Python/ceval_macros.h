@@ -771,6 +771,95 @@ _PyLong_FromLong_RangeIter(_PyRangeIterObject *r, long x)
 }
 #define _PyLong_FromLong_StackRef(x) _PyLong_FromLong_RangeIter(r, (x))
 
+static inline Py_ALWAYS_INLINE _PyStackRef
+_PyLong_FromLong_RangeLocal(long x)
+{
+    if (_PY_IS_SMALL_INT(x)) {
+        return PyStackRef_FromPyObjectBorrow(
+            (PyObject *)&_PyLong_SMALL_INTS[_PY_NSMALLNEGINTS + x]);
+    }
+    if (__builtin_expect(((twodigits)x + PyLong_MASK) < ((twodigits)PyLong_MASK + PyLong_BASE), 1)) {
+        PyLongObject *v = _Py_FREELIST_POP(PyLongObject, ints);
+        if (__builtin_expect(v != NULL, 1)) {
+            _PyLong_SetSignAndDigitCount(v, x < 0 ? -1 : 1, 1);
+            v->long_value.ob_digit[0] = (digit)(x < 0 ? -(twodigits)x : (twodigits)x);
+            return PyStackRef_FromPyObjectStealMortal((PyObject *)v);
+        }
+    }
+    PyObject *res = PyLong_FromLong(x);
+    if (res == NULL) {
+        PyErr_Clear();
+        return PyStackRef_NULL;
+    }
+    return PyStackRef_FromPyObjectSteal(res);
+}
+
+static inline Py_ALWAYS_INLINE int
+_PyRangeIter_StepLocal(_PyRangeIterObject *r, _PyInterpreterFrame *frame, int oparg)
+{
+    if (oparg & 0x8000) {
+        long value = r->start;
+        r->start = value + r->step;
+        int sv = oparg & 0x3FFF;
+        if (__builtin_expect(--r->len == 0 || PyStackRef_IsNull(frame->localsplus[sv]), 0)) {
+            _PyStackRef last_ref = _PyLong_FromLong_RangeLocal(value);
+            if (__builtin_expect(PyStackRef_IsNull(last_ref), 0)) {
+                r->start = value;
+                r->len++;
+                return -1;
+            }
+            _PyStackRef old_ref = frame->localsplus[sv];
+            frame->localsplus[sv] = last_ref;
+            if (PyStackRef_RefcountOnObject(old_ref)) {
+                PyStackRef_CLOSE_SPECIALIZED(old_ref, _PyLong_ExactDealloc);
+            }
+        }
+        return 0;
+    }
+    if (oparg & 0x4000) {
+        long value = r->start;
+        r->start = value + r->step;
+        r->len--;
+        int sv = oparg & 0x3FFF;
+        _PyStackRef cur_ref = frame->localsplus[sv];
+        if (__builtin_expect(!PyStackRef_RefcountOnObject(cur_ref), 0)) {
+            if (__builtin_expect(_PY_IS_SMALL_INT(value), 1)) {
+                frame->localsplus[sv] = PyStackRef_FromPyObjectBorrow(
+                    (PyObject *)&_PyLong_SMALL_INTS[_PY_NSMALLNEGINTS + value]);
+                return 0;
+            }
+            _PyStackRef next_ref = _PyLong_FromLong_RangeLocal(value);
+            if (__builtin_expect(PyStackRef_IsNull(next_ref), 0)) {
+                r->start = value;
+                r->len++;
+                return -1;
+            }
+            frame->localsplus[sv] = next_ref;
+            return 0;
+        }
+        PyObject *cur_o = PyStackRef_AsPyObjectBorrow(cur_ref);
+        if (__builtin_expect(
+                ((unsigned long)value - _PY_NSMALLPOSINTS) <
+                    (unsigned long)(PyLong_BASE - _PY_NSMALLPOSINTS) &&
+                _PyObject_IsUniquelyReferenced(cur_o) &&
+                ((PyLongObject *)cur_o)->long_value.lv_tag == (1 << _PyLong_NON_SIZE_BITS), 1))
+        {
+            ((PyLongObject *)cur_o)->long_value.ob_digit[0] = (digit)value;
+            return 0;
+        }
+        _PyStackRef next_ref = _PyLong_FromLong_RangeLocal(value);
+        if (__builtin_expect(PyStackRef_IsNull(next_ref), 0)) {
+            r->start = value;
+            r->len++;
+            return -1;
+        }
+        frame->localsplus[sv] = next_ref;
+        PyStackRef_CLOSE_SPECIALIZED(cur_ref, _PyLong_ExactDealloc);
+        return 0;
+    }
+    return 0;
+}
+
 static inline Py_ALWAYS_INLINE stwodigits
 _PyLong_AsSTwoDigits_Fast(const PyLongObject *op)
 {

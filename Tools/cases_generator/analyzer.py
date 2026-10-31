@@ -624,6 +624,7 @@ NON_ESCAPING_FUNCTIONS = (
     "_PyLong_AsSTwoDigits_Fast",
     "_PyFloat_FromDouble_Fast",
     "_PyLong_FromLong_StackRef",
+    "_PyRangeIter_StepLocal",
     "_PyLong_FromNonNegativeSsize_t_StackRef",
     "_PyObject_IsUnsharedLocal",
     "_PyObject_IsInplaceFloatTarget",

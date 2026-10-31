@@ -47,9 +47,11 @@ Key Architectural Highlights
    slot updates (``_STORE_ATTR_SLOT_FLOAT_INPLACE``, ``_LOAD_ATTR_SLOT_NO_POP``), hardware Fused Multiply-Add
    (``_BINARY_OP_FMA_FLOAT_INPLACE``), 60-bit compact-int bitwise/divmod (``_BINARY_OP_BITWISE_INT``),
    and mixed float-int arithmetic (``_BINARY_OP_ARITH_FLOAT_INT``).
-4. **Basic Block Versioning via Loop Pre-Header Peeling (** ``hoist_loop_preheader_guards`` **):**
+4. **Basic Block Versioning & Fused Range-Iterator Induction (** ``hoist_loop_preheader_guards`` **&** ``_PyRangeIter_StepLocal`` **):**
    Peels up to 64 micro-ops of the first loop iteration into a trace pre-header to prove steady-state local
-   types and non-nullness (``_LOAD_FAST`` -> ``_LOAD_FAST_BORROW``) and hoist invariant type/container guards.
+   types and non-nullness (``_LOAD_FAST`` -> ``_LOAD_FAST_BORROW``), hoists invariant type/container guards,
+   and fuses ``_GUARD_NOT_EXHAUSTED_RANGE + _ITER_NEXT_RANGE + _SWAP_FAST + _POP_TOP_INT`` into a single
+   non-escaping uop (cutting ``float_loop`` by **2.56x** to ``11.00 ms`` and ``int_loop`` by **1.50x** to ``34.68 ms``).
 5. **Opt-In Sound Gradual Typing (** ``@strict`` **,** ``@struct`` **,** ``strict_mode`` **,** ``strict_module`` **):**
    Enforces primitive and slot type annotations in C via ``_Py_STRICT_SLOT_*`` flags on ``PyMemberDef``
    and 64-bit ``_co_strict_sig`` bitmasks on ``PyCodeObject`` (``_CHECK_FUNCTION_STRICT_ARGS``), sealing

@@ -4426,6 +4426,9 @@ dummy_func(
             _PyRangeIterObject *r = (_PyRangeIterObject *)PyStackRef_AsPyObjectBorrow(iter);
             assert(Py_TYPE(r) == &PyRangeIter_Type);
             EXIT_IF(r->len <= 0);
+            if (oparg) {
+                EXIT_IF(_PyRangeIter_StepLocal(r, frame, oparg) < 0);
+            }
         }
 
         op(_ITER_NEXT_RANGE, (iter, null_or_index -- iter, null_or_index, next)) {

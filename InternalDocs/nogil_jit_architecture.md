@@ -165,22 +165,26 @@ _LOAD_ATTR_SLOT 1         (item.price)
 3. **Read Forwarding:** Rewrites every downstream `_LOAD_ATTR_SLOT(slot_offset)` on `self` into `_POP_TOP` + `_LOAD_FAST_BORROW(temp_local)` (or `_LOAD_FAST(temp_local)`).
 4. **Allocation Elimination:** Replaces `_ALLOCATE_OBJECT`, `_CREATE_INIT_FRAME`, `_PUSH_FRAME`, `_STORE_ATTR_SLOT`, `_RETURN_VALUE`, and `_MAKE_HEAP_SAFE` with `_NOP` / `_POP_TOP`, reducing heap allocations to **zero**.
 
-### 4.4 Loop Pre-Header Peeling & LICM (`hoist_loop_preheader_guards`)
+### 4.4 Loop Pre-Header Peeling, LICM, & Fused Range-Iterator Induction (`hoist_loop_preheader_guards`)
 In dynamic loops, the first iteration resolves local slot initialization (`_LOAD_FAST_CHECK`), type checks (`_GUARD_TYPE_VERSION`), and container validity (`_GUARD_LIST_VALID`).
 - `hoist_loop_preheader_guards` peels up to `64` loop-body uops into a pre-header before `_JUMP_TO_TOP` and rewrites steady-state `_LOAD_FAST` instructions in the loop body to `_LOAD_FAST_BORROW` whenever the local slot is proven unmutated or reassigned with the same type.
 - Redundant `_GUARD_TYPE_VERSION_LOCKED` and `_CHECK_VALIDITY` instructions on loop-invariant receivers (`self`, outer containers) are hoisted out of the steady-state loop.
+- **Fused Range-Iterator Induction (`_PyRangeIter_StepLocal` in `_GUARD_NOT_EXHAUSTED_RANGE`):**
+  In `for i in range(n)` or `for _ in range(n)` loops, both the peeled steady-state loop (`sbody`) and the fallback `safe_to_hoist_iter` path fuse `_GUARD_NOT_EXHAUSTED_RANGE + _ITER_NEXT_RANGE + _SWAP_FAST(sv) + _POP_TOP_INT` into a single non-escaping `_GUARD_NOT_EXHAUSTED_RANGE` uop:
+  - **Dead Induction Variable (`oparg = 0x8000 | sv`, e.g. `for _ in range(n)`):** Advances `r->start += r->step` and decrements `r->len` purely in registers, only materializing `frame->localsplus[sv]` on the first iteration (if `NULL`) and final iteration (`--r->len == 0`) so post-loop local state remains exact.
+  - **Live Induction Variable (`oparg = 0x4000 | sv`, e.g. `for i in range(n)`):** Writes borrowed small-int singletons (`0..256`) directly into `frame->localsplus[sv]` or mutates `((PyLongObject *)cur_o)->long_value.ob_digit[0] = (digit)value` in place when uniquely referenced (`257..PyLong_BASE-1`), cutting `float_loop` by **`2.56x`** (`29.27 ms` $\rightarrow$ `11.00 ms`) and `int_loop` by **`1.50x`** (`52.97 ms` $\rightarrow$ `34.68 ms`).
 
 ### 4.5 In-Place Box Reuse, FMA Fusion, and `_LOAD_ATTR_SLOT_NO_POP`
-In floating-point kernels (such as `nbody_float`, polynomial evaluation, and physics updates):
-1. **Expression-Tree Box Reuse (`mark_inplace_float_allocs`):** Rewrites chains of `_BINARY_OP_ADD_FLOAT`, `_BINARY_OP_SUBTRACT_FLOAT`, `_BINARY_OP_MULTIPLY_FLOAT`, and `_BINARY_OP_TRUEDIV_FLOAT` into `*_INPLACE` variants that mutate the left/right operand's `PyFloatObject` `ob_fval` directly when `ob_ref_local == 1 && ob_ref_shared == 0`.
+In floating-point and integer kernels (such as `nbody_float`, `attr_loop`, `int_loop`, polynomial evaluation, and physics updates):
+1. **Expression-Tree & Accumulator Box Reuse (`mark_inplace_float_allocs` & `all_stores_int`):** Rewrites chains of `_BINARY_OP_ADD_FLOAT`, `_BINARY_OP_SUBTRACT_FLOAT`, `_BINARY_OP_MULTIPLY_FLOAT`, `_BINARY_OP_TRUEDIV_FLOAT`, and steady-state integer accumulators into `*_INPLACE` variants that mutate the left/right operand's `PyFloatObject` (`ob_fval`) or `PyLongObject` (`ob_digit`) directly when `ob_ref_local == 1 && ob_ref_shared == 0`.
 2. **Fused Multiply-Add (`_BINARY_OP_FMA_FLOAT_INPLACE`):** Fuses `_BINARY_OP_MULTIPLY_FLOAT[_INPLACE]` followed by `_BINARY_OP_ADD_FLOAT[_INPLACE]` or `_BINARY_OP_SUBTRACT_FLOAT[_INPLACE]` into a single 3-operand uop executing hardware `fma(a, b, c)` (`a * b + c` or `c ± a * b`, parameterized by `oparg` mode `0..2`).
-3. **In-Place Slot Updates (`_STORE_ATTR_SLOT_FLOAT_INPLACE` & `_LOAD_ATTR_SLOT_NO_POP`):**
-   - When an `@struct` float slot is updated (`b.vx = b.vx - dx * b2.mass`), `mark_inplace_float_attr_updates` rewrites `_STORE_ATTR_SLOT` to `_STORE_ATTR_SLOT_FLOAT_INPLACE`, which overwrites the existing `PyFloatObject` inside the instance slot if uniquely owned.
+3. **In-Place Slot Updates (`_STORE_ATTR_SLOT_FLOAT_INPLACE`, `oparg = 254` Borrowed Slot Reads, & `_LOAD_ATTR_SLOT_NO_POP`):**
+   - When an `@struct` float slot is updated (`b.vx = b.vx - dx * b2.mass` or `p.x = p.x + p.y - p.z`), `mark_inplace_float_attr_updates` and `hoist_loop_preheader_guards` rewrite steady-state slot reads to `oparg = 254` (borrowed slot read paired with `_POP_TOP_NOP`) and mutate the destination slot's `PyFloatObject` in place without reference-count churn.
    - When the receiver object on the stack is only consumed by `_LOAD_ATTR_SLOT` followed by `_POP_TOP` or another slot load, `_LOAD_ATTR_SLOT` is rewritten to `_LOAD_ATTR_SLOT_NO_POP` (borrowing the slot reference without incrementing/decrementing the receiver's reference count).
 
 ### 4.6 Non-Escaping C Helper Lowering in Copy-and-Patch (`Tools/cases_generator/analyzer.py`)
 In CPython's Copy-and-Patch generator, any uop that calls an arbitrary C function is normally marked `escaping`, forcing the code generator to spill `stack_pointer` and reload frame state before and after the call.
-- By designing pure register/box-mutating helpers that cannot trigger GC, arbitrary `__del__` finalizers, or Python frame re-entry (`_PyCompactLong_BitwiseInPlace`, `_PyFloat_MixedArithInPlace`, `_PyList_GetItemRefNoLock`, `_PyObject_CheckStrictSlotType`, etc.) and registering them in `NON_ESCAPING_FUNCTIONS` in `Tools/cases_generator/analyzer.py`, the JIT compiles these uops with zero frame-spill overhead.
+- By designing pure register/box-mutating helpers that cannot trigger GC, arbitrary `__del__` finalizers, or Python frame re-entry (`_PyRangeIter_StepLocal`, `_PyCompactLong_BitwiseInPlace`, `_PyFloat_MixedArithInPlace`, `_PyList_GetItemRefNoLock`, `_PyObject_CheckStrictSlotType`, etc.) and registering them in `NON_ESCAPING_FUNCTIONS` in `Tools/cases_generator/analyzer.py`, the JIT compiles these uops with zero frame-spill overhead.
 
 ---
 
