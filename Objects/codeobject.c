@@ -1584,6 +1584,9 @@ PyUnstable_Code_GetExtra(PyObject *code, Py_ssize_t index, void **extra)
 
     // Lock-free read; pairs with release stores in SetExtra.
     _PyCodeObjectExtra *co_extra = FT_ATOMIC_LOAD_PTR_ACQUIRE(co->co_extra);
+    if (((uintptr_t)co_extra & 1) != 0) {
+        co_extra = NULL;
+    }
     if (co_extra != NULL && index < co_extra->ce_size) {
         *extra = FT_ATOMIC_LOAD_PTR_ACQUIRE(co_extra->ce_extras[index]);
     }
@@ -1615,6 +1618,9 @@ PyUnstable_Code_SetExtra(PyObject *code, Py_ssize_t index, void *extra)
     Py_BEGIN_CRITICAL_SECTION(co);
 
     _PyCodeObjectExtra *old_co_extra = (_PyCodeObjectExtra *)co->co_extra;
+    if (((uintptr_t)old_co_extra & 1) != 0) {
+        old_co_extra = NULL;
+    }
     Py_ssize_t old_ce_size = (old_co_extra == NULL)
         ? 0 : old_co_extra->ce_size;
 
@@ -2017,7 +2023,7 @@ _PyCode_CheckNoInternalState(PyCodeObject *co, const char **p_errmsg)
     const char *errmsg = NULL;
     // We don't worry about co_executors, co_instrumentation,
     // or co_monitoring.  They are essentially ephemeral.
-    if (co->co_extra != NULL) {
+    if (co->co_extra != NULL && ((uintptr_t)co->co_extra & 1) == 0) {
         errmsg = "only basic code objects are supported";
     }
 
@@ -2427,7 +2433,7 @@ code_dealloc(PyObject *self)
 #endif
 
     _PyFunction_ClearCodeByVersion(co->co_version);
-    if (co->co_extra != NULL) {
+    if (co->co_extra != NULL && ((uintptr_t)co->co_extra & 1) == 0) {
         PyInterpreterState *interp = _PyInterpreterState_GET();
         _PyCodeObjectExtra *co_extra = co->co_extra;
 
@@ -2719,7 +2725,7 @@ code_sizeof(PyObject *self, PyObject *Py_UNUSED(args))
     PyCodeObject *co = _PyCodeObject_CAST(self);
     size_t res = _PyObject_VAR_SIZE(Py_TYPE(co), Py_SIZE(co));
     _PyCodeObjectExtra *co_extra = (_PyCodeObjectExtra*) co->co_extra;
-    if (co_extra != NULL) {
+    if (co_extra != NULL && ((uintptr_t)co_extra & 1) == 0) {
         res += sizeof(_PyCodeObjectExtra);
         res += ((size_t)co_extra->ce_size - 1) * sizeof(co_extra->ce_extras[0]);
     }

@@ -880,13 +880,26 @@ do_specialize_instance_load_attr(PyObject* owner, _Py_CODEUNIT* instr, PyObject*
                 SPECIALIZATION_FAIL(LOAD_ATTR, SPEC_FAIL_ATTR_AUDITED_SLOT);
                 return -1;
             }
-            if (offset != (uint16_t)offset) {
+            if (offset < 0 || offset >= 0x2000) {
                 SPECIALIZATION_FAIL(LOAD_ATTR, SPEC_FAIL_OUT_OF_RANGE);
                 return -1;
             }
             assert(dmem->type == Py_T_OBJECT_EX || dmem->type == _Py_T_OBJECT);
             assert(offset > 0);
-            cache->index = (uint16_t)offset;
+            uint16_t strict_tag = 0;
+            if (dmem->flags & _Py_STRICT_SLOT_INT) {
+                strict_tag = 1;
+            }
+            else if (dmem->flags & _Py_STRICT_SLOT_FLOAT) {
+                strict_tag = 2;
+            }
+            else if (dmem->flags & _Py_STRICT_SLOT_STR) {
+                strict_tag = 3;
+            }
+            else if (dmem->flags & _Py_STRICT_SLOT_BOOL) {
+                strict_tag = 4;
+            }
+            cache->index = (uint16_t)offset | (uint16_t)(strict_tag << 13);
             write_u32(cache->version, tp_version);
             specialize(instr, LOAD_ATTR_SLOT);
             return 0;
@@ -1081,13 +1094,26 @@ _Py_Specialize_StoreAttr(_PyStackRef owner_st, _Py_CODEUNIT *instr, PyObject *na
                 SPECIALIZATION_FAIL(STORE_ATTR, SPEC_FAIL_ATTR_READ_ONLY);
                 goto fail;
             }
-            if (offset != (uint16_t)offset) {
+            if (offset != (uint16_t)offset || offset >= 0x2000) {
                 SPECIALIZATION_FAIL(STORE_ATTR, SPEC_FAIL_OUT_OF_RANGE);
                 goto fail;
             }
             assert(dmem->type == Py_T_OBJECT_EX || dmem->type == _Py_T_OBJECT);
             assert(offset > 0);
-            cache->index = (uint16_t)offset;
+            uint16_t strict_tag = 0;
+            if (dmem->flags & _Py_STRICT_SLOT_INT) {
+                strict_tag = 1 << 13;
+            }
+            else if (dmem->flags & _Py_STRICT_SLOT_FLOAT) {
+                strict_tag = 2 << 13;
+            }
+            else if (dmem->flags & _Py_STRICT_SLOT_STR) {
+                strict_tag = 3 << 13;
+            }
+            else if (dmem->flags & _Py_STRICT_SLOT_BOOL) {
+                strict_tag = 4 << 13;
+            }
+            cache->index = (uint16_t)offset | strict_tag;
             write_u32(cache->version, tp_version);
             specialize(instr, STORE_ATTR_SLOT);
             goto success;
@@ -1680,7 +1706,9 @@ specialize_class_call(PyObject *callable, _Py_CODEUNIT *instr, int nargs)
             specialize(instr, CALL_BUILTIN_CLASS);
             return 0;
         }
-        goto generic;
+        if (!(tp->tp_flags & Py_TPFLAGS_HEAPTYPE) || tp->tp_new != PyBaseObject_Type.tp_new) {
+            goto generic;
+        }
     }
     if (Py_TYPE(tp) != &PyType_Type) {
         goto generic;

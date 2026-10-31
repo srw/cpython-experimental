@@ -150,6 +150,8 @@ because everything is automatically generated from
 
 See Also:
 
+* [Free-Threaded Tier 2 / JIT, `@strict` / `@struct`, and Auto-Parallel Runtime Architecture](nogil_jit_architecture.md) — Deep dive into Partial Escape Analysis (`eliminate_non_escaping_struct_allocs`), loop pre-header peeling (`hoist_loop_preheader_guards`), Perceus-style in-place box reuse (`mark_inplace_float_allocs`, `_PyCompactLong_BitwiseInPlace`, `_PyFloat_MixedArithInPlace`), C-enforced `@strict` / `@struct` gradual typing, special cases, and academic references.
+
 * [Copy-and-Patch Compilation: A fast compilation algorithm for high-level languages and bytecode](https://arxiv.org/abs/2011.13127)
 
 * [PyCon 2024: Building a JIT compiler for CPython](https://www.youtube.com/watch?v=kMO3Ju0QCDo)

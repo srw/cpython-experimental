@@ -156,7 +156,8 @@
                 ((PyFloatObject *)left_o)->ob_fval +
                 ((PyFloatObject *)right_o)->ob_fval;
                 if (PyStackRef_RefcountOnObject(left) &&
-                    _PyObject_IsUniquelyReferenced(left_o))
+                    (oparg == 255 ? _PyObject_IsInplaceFloatTarget(left_o)
+                    : _PyObject_IsUniquelyReferenced(left_o)))
                 {
                     ((PyFloatObject *)left_o)->ob_fval = dres;
                     res = left;
@@ -185,13 +186,13 @@
             {
                 value = r;
                 assert(PyFloat_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
-                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc);
+                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc_Fast);
             }
             // _POP_TOP_FLOAT
             {
                 value = l;
                 assert(PyFloat_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
-                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc);
+                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc_Fast);
             }
             stack_pointer[-2] = res;
             stack_pointer += -1;
@@ -281,13 +282,15 @@
             // _POP_TOP_INT
             {
                 value = r;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             // _POP_TOP_INT
             {
                 value = l;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             stack_pointer[-2] = res;
@@ -416,15 +419,11 @@
                 STAT_INC(BINARY_OP, hit);
                 _PyFrame_SetStackPointer(frame, stack_pointer);
                 _PyFrame_StackPointerValidate(frame);
-                PyObject *res_o = d->action(left_o, right_o);
+                res = _PyEval_BinaryOpExtendFast(d, &left, &right, left_o, right_o, oparg);
                 _PyFrame_StackPointerInvalidate(frame);
-                if (res_o == NULL) {
+                if (PyStackRef_IsNull(res)) {
                     JUMP_TO_LABEL(error);
                 }
-                assert(d->result_type == NULL || Py_TYPE(res_o) == d->result_type);
-                assert(!d->result_unique || Py_REFCNT(res_o) == 1 || _Py_IsImmortal(res_o));
-                assert(!PyFloat_CheckExact(res_o) || Py_REFCNT(res_o) == 1);
-                res = PyStackRef_FromPyObjectSteal(res_o);
                 l = left;
                 r = right;
             }
@@ -586,7 +585,8 @@
                 ((PyFloatObject *)left_o)->ob_fval *
                 ((PyFloatObject *)right_o)->ob_fval;
                 if (PyStackRef_RefcountOnObject(left) &&
-                    _PyObject_IsUniquelyReferenced(left_o))
+                    (oparg == 255 ? _PyObject_IsInplaceFloatTarget(left_o)
+                    : _PyObject_IsUniquelyReferenced(left_o)))
                 {
                     ((PyFloatObject *)left_o)->ob_fval = dres;
                     res = left;
@@ -615,13 +615,13 @@
             {
                 value = r;
                 assert(PyFloat_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
-                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc);
+                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc_Fast);
             }
             // _POP_TOP_FLOAT
             {
                 value = l;
                 assert(PyFloat_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
-                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc);
+                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc_Fast);
             }
             stack_pointer[-2] = res;
             stack_pointer += -1;
@@ -711,13 +711,15 @@
             // _POP_TOP_INT
             {
                 value = r;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             // _POP_TOP_INT
             {
                 value = l;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             stack_pointer[-2] = res;
@@ -997,7 +999,8 @@
             // _POP_TOP_INT
             {
                 value = ss;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             // _POP_TOP
@@ -1180,7 +1183,8 @@
             // _POP_TOP_INT
             {
                 value = i;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             // _POP_TOP_UNICODE
@@ -1280,7 +1284,8 @@
             // _POP_TOP_INT
             {
                 value = ss;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             // _POP_TOP
@@ -1379,7 +1384,8 @@
             // _POP_TOP_INT
             {
                 value = i;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             // _POP_TOP_UNICODE
@@ -1444,7 +1450,8 @@
                 ((PyFloatObject *)left_o)->ob_fval -
                 ((PyFloatObject *)right_o)->ob_fval;
                 if (PyStackRef_RefcountOnObject(left) &&
-                    _PyObject_IsUniquelyReferenced(left_o))
+                    (oparg == 255 ? _PyObject_IsInplaceFloatTarget(left_o)
+                    : _PyObject_IsUniquelyReferenced(left_o)))
                 {
                     ((PyFloatObject *)left_o)->ob_fval = dres;
                     res = left;
@@ -1473,13 +1480,13 @@
             {
                 value = r;
                 assert(PyFloat_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
-                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc);
+                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc_Fast);
             }
             // _POP_TOP_FLOAT
             {
                 value = l;
                 assert(PyFloat_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
-                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc);
+                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc_Fast);
             }
             stack_pointer[-2] = res;
             stack_pointer += -1;
@@ -1569,13 +1576,15 @@
             // _POP_TOP_INT
             {
                 value = r;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             // _POP_TOP_INT
             {
                 value = l;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             stack_pointer[-2] = res;
@@ -2195,7 +2204,9 @@
                 STAT_INC(CALL, hit);
                 _PyFrame_SetStackPointer(frame, stack_pointer);
                 _PyFrame_StackPointerValidate(frame);
-                PyObject *self_o = PyType_GenericAlloc(tp, 0);
+                PyObject *self_o = (tp->tp_dictoffset == 0 && (tp->tp_flags & Py_TPFLAGS_IMMUTABLETYPE))
+                ? _PyType_AllocNoTrack(tp, 0)
+            : PyType_GenericAlloc(tp, 0);
                 _PyFrame_StackPointerInvalidate(frame);
                 if (self_o == NULL) {
                     JUMP_TO_LABEL(error);
@@ -5702,13 +5713,13 @@
             {
                 value = r;
                 assert(PyFloat_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
-                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc);
+                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc_Fast);
             }
             // _POP_TOP_FLOAT
             {
                 value = l;
                 assert(PyFloat_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
-                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc);
+                PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc_Fast);
             }
             stack_pointer[-2] = res;
             stack_pointer += -1;
@@ -5798,13 +5809,15 @@
             // _POP_TOP_INT
             {
                 value = r;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             // _POP_TOP_INT
             {
                 value = l;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             stack_pointer[-2] = res;
@@ -6941,6 +6954,18 @@
                     UPDATE_MISS_STATS(FOR_ITER);
                     assert(_PyOpcode_Deopt[opcode] == (FOR_ITER));
                     JUMP_TO_PREDICTED(FOR_ITER);
+                }
+                #endif
+                #if TIER_TWO
+                if (oparg & 0x8000) {
+                    _PyStackRef idx_local = frame->localsplus[oparg & 0x7FFF];
+                    if (!PyStackRef_IsNull(idx_local) && !PyStackRef_IsTaggedInt(idx_local)) {
+                        if (!PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(idx_local))) {
+                            UPDATE_MISS_STATS(FOR_ITER);
+                            assert(_PyOpcode_Deopt[opcode] == (FOR_ITER));
+                            JUMP_TO_PREDICTED(FOR_ITER);
+                        }
+                    }
                 }
                 #endif
             }
@@ -8607,6 +8632,9 @@
             // _MAKE_HEAP_SAFE
             {
                 value = val;
+                if (_PyEval_StrictReturnCheck(tstate, frame, value)) {
+                    JUMP_TO_LABEL(error);
+                }
                 value = PyStackRef_MakeHeapSafe(value);
             }
             // _RETURN_VALUE
@@ -8691,6 +8719,9 @@
             // _MAKE_HEAP_SAFE
             {
                 value = val;
+                if (_PyEval_StrictReturnCheck(tstate, frame, value)) {
+                    JUMP_TO_LABEL(error);
+                }
                 value = PyStackRef_MakeHeapSafe(value);
             }
             // _YIELD_VALUE
@@ -9915,28 +9946,12 @@
             {
                 uint16_t index = read_u16(&this_instr[4].cache);
                 PyObject *owner_o = PyStackRef_AsPyObjectBorrow(owner);
-                PyObject **addr = (PyObject **)((char *)owner_o + index);
-                PyObject *attr_o = FT_ATOMIC_LOAD_PTR(*addr);
-                if (attr_o == NULL) {
+                int ok = _PyEval_LoadAttrSlotFast(owner_o, index, oparg, &attr);
+                if (!ok) {
                     UPDATE_MISS_STATS(LOAD_ATTR);
                     assert(_PyOpcode_Deopt[opcode] == (LOAD_ATTR));
                     JUMP_TO_PREDICTED(LOAD_ATTR);
                 }
-                #ifdef Py_GIL_DISABLED
-                if (IS_UNSHARED_LOCAL_OBJECT(owner_o)) {
-                    attr = PyStackRef_FromPyObjectNew(attr_o);
-                }
-                else {
-                    int increfed = _Py_TryIncrefCompareStackRef(addr, attr_o, &attr);
-                    if (!increfed) {
-                        UPDATE_MISS_STATS(LOAD_ATTR);
-                        assert(_PyOpcode_Deopt[opcode] == (LOAD_ATTR));
-                        JUMP_TO_PREDICTED(LOAD_ATTR);
-                    }
-                }
-                #else
-                attr = PyStackRef_FromPyObjectNew(attr_o);
-                #endif
                 STAT_INC(LOAD_ATTR, hit);
                 o = owner;
             }
@@ -11761,6 +11776,13 @@
                 JUMP_TO_PREDICTED(RESUME);
             }
             #endif
+            if ((oparg & (RESUME_OPARG_LOCATION_MASK | 0x80)) == RESUME_AT_FUNC_START) {
+                if (_PyEval_StrictParamsCheck(frame)) {
+                    UPDATE_MISS_STATS(RESUME);
+                    assert(_PyOpcode_Deopt[opcode] == (RESUME));
+                    JUMP_TO_PREDICTED(RESUME);
+                }
+            }
             DISPATCH();
         }
 
@@ -11802,6 +11824,13 @@
                     JUMP_TO_PREDICTED(RESUME);
                 }
                 #endif
+                if ((oparg & (RESUME_OPARG_LOCATION_MASK | 0x80)) == RESUME_AT_FUNC_START) {
+                    if (_PyEval_StrictParamsCheck(frame)) {
+                        UPDATE_MISS_STATS(RESUME);
+                        assert(_PyOpcode_Deopt[opcode] == (RESUME));
+                        JUMP_TO_PREDICTED(RESUME);
+                    }
+                }
             }
             // _JIT
             {
@@ -11890,6 +11919,9 @@
             // _MAKE_HEAP_SAFE
             {
                 value = stack_pointer[-1];
+                if (_PyEval_StrictReturnCheck(tstate, frame, value)) {
+                    JUMP_TO_LABEL(error);
+                }
                 value = PyStackRef_MakeHeapSafe(value);
             }
             // _RETURN_VALUE
@@ -12560,18 +12592,41 @@
                 UNLOCK_OBJECT(owner_o);
                 #endif
                 o = owner;
-                stack_pointer[-2] = o;
-                stack_pointer += -1;
-                ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
-                _PyFrame_SetStackPointer(frame, stack_pointer);
-                _PyFrame_StackPointerValidate(frame);
-                Py_XDECREF(old_value);
-                _PyFrame_StackPointerInvalidate(frame);
+                if (old_value != NULL) {
+                    if (PyFloat_CheckExact(old_value)) {
+                        stack_pointer[-2] = o;
+                        stack_pointer += -1;
+                        ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                        _PyFrame_SetStackPointer(frame, stack_pointer);
+                        _PyFrame_StackPointerValidate(frame);
+                        _Py_DECREF_SPECIALIZED(old_value, _PyFloat_ExactDealloc_Fast);
+                        _PyFrame_StackPointerInvalidate(frame);
+                    }
+                    else if (PyLong_CheckExact(old_value)) {
+                        stack_pointer[-2] = o;
+                        stack_pointer += -1;
+                        ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                        _PyFrame_SetStackPointer(frame, stack_pointer);
+                        _PyFrame_StackPointerValidate(frame);
+                        _Py_DECREF_SPECIALIZED(old_value, _PyLong_ExactDealloc);
+                        _PyFrame_StackPointerInvalidate(frame);
+                    }
+                    else {
+                        stack_pointer[-2] = o;
+                        stack_pointer += -1;
+                        ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                        _PyFrame_SetStackPointer(frame, stack_pointer);
+                        _PyFrame_StackPointerValidate(frame);
+                        Py_DECREF(old_value);
+                        _PyFrame_StackPointerInvalidate(frame);
+                    }
+                    stack_pointer += 1;
+                }
             }
             // _POP_TOP
             {
                 value = o;
-                stack_pointer += -1;
+                stack_pointer += -2;
                 ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
                 _PyFrame_SetStackPointer(frame, stack_pointer);
                 _PyFrame_StackPointerValidate(frame);
@@ -12613,32 +12668,80 @@
                 value = stack_pointer[-2];
                 uint16_t index = read_u16(&this_instr[4].cache);
                 PyObject *owner_o = PyStackRef_AsPyObjectBorrow(owner);
-                char *addr = (char *)owner_o + index;
-                PyObject *old_value;
-                if (IS_UNSHARED_LOCAL_OBJECT(owner_o)) {
-                    STAT_INC(STORE_ATTR, hit);
-                    old_value = *(PyObject **)addr;
-                    *(PyObject **)addr = PyStackRef_AsPyObjectSteal(value);
-                }
-                else {
-                    if (!LOCK_SHARED_OBJECT(owner_o)) {
+                PyObject *val_o = PyStackRef_AsPyObjectBorrow(value);
+                uint16_t strict_tag = index >> 13;
+                if (strict_tag != 0) {
+                    if ((strict_tag == 1 && (!PyLong_CheckExact(val_o) || PyBool_Check(val_o))) ||
+                        (strict_tag == 2 && !PyFloat_CheckExact(val_o)) ||
+                        (strict_tag == 3 && !PyUnicode_CheckExact(val_o)) ||
+                        (strict_tag == 4 && !PyBool_Check(val_o))) {
                         UPDATE_MISS_STATS(STORE_ATTR);
                         assert(_PyOpcode_Deopt[opcode] == (STORE_ATTR));
                         JUMP_TO_PREDICTED(STORE_ATTR);
                     }
-                    STAT_INC(STORE_ATTR, hit);
-                    old_value = *(PyObject **)addr;
-                    FT_ATOMIC_STORE_PTR_RELEASE(*(PyObject **)addr, PyStackRef_AsPyObjectSteal(value));
-                    UNLOCK_SHARED_OBJECT(owner_o);
                 }
-                o = owner;
-                stack_pointer[-2] = o;
-                stack_pointer += -1;
-                ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
-                _PyFrame_SetStackPointer(frame, stack_pointer);
-                _PyFrame_StackPointerValidate(frame);
-                Py_XDECREF(old_value);
-                _PyFrame_StackPointerInvalidate(frame);
+                char *addr = (char *)owner_o + (index & 0x1FFF);
+                PyObject *old_value = *(PyObject **)addr;
+                if (old_value == val_o) {
+                    STAT_INC(STORE_ATTR, hit);
+                    o = owner;
+                    stack_pointer[-2] = o;
+                    stack_pointer += -1;
+                    ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                    _PyFrame_SetStackPointer(frame, stack_pointer);
+                    _PyFrame_StackPointerValidate(frame);
+                    PyStackRef_CLOSE(value);
+                    _PyFrame_StackPointerInvalidate(frame);
+                }
+                else {
+                    if (IS_UNSHARED_LOCAL_OBJECT(owner_o)) {
+                        STAT_INC(STORE_ATTR, hit);
+                        *(PyObject **)addr = PyStackRef_AsPyObjectSteal(value);
+                    }
+                    else {
+                        if (!LOCK_SHARED_OBJECT(owner_o)) {
+                            UPDATE_MISS_STATS(STORE_ATTR);
+                            assert(_PyOpcode_Deopt[opcode] == (STORE_ATTR));
+                            JUMP_TO_PREDICTED(STORE_ATTR);
+                        }
+                        STAT_INC(STORE_ATTR, hit);
+                        old_value = *(PyObject **)addr;
+                        FT_ATOMIC_STORE_PTR_RELEASE(*(PyObject **)addr, PyStackRef_AsPyObjectSteal(value));
+                        UNLOCK_SHARED_OBJECT(owner_o);
+                    }
+                    o = owner;
+                    if (old_value != NULL) {
+                        if (PyFloat_CheckExact(old_value)) {
+                            stack_pointer[-2] = o;
+                            stack_pointer += -1;
+                            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                            _PyFrame_SetStackPointer(frame, stack_pointer);
+                            _PyFrame_StackPointerValidate(frame);
+                            _Py_DECREF_SPECIALIZED(old_value, _PyFloat_ExactDealloc_Fast);
+                            _PyFrame_StackPointerInvalidate(frame);
+                        }
+                        else if (PyLong_CheckExact(old_value)) {
+                            stack_pointer[-2] = o;
+                            stack_pointer += -1;
+                            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                            _PyFrame_SetStackPointer(frame, stack_pointer);
+                            _PyFrame_StackPointerValidate(frame);
+                            _Py_DECREF_SPECIALIZED(old_value, _PyLong_ExactDealloc);
+                            _PyFrame_StackPointerInvalidate(frame);
+                        }
+                        else {
+                            stack_pointer[-2] = o;
+                            stack_pointer += -1;
+                            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                            _PyFrame_SetStackPointer(frame, stack_pointer);
+                            _PyFrame_StackPointerValidate(frame);
+                            Py_DECREF(old_value);
+                            _PyFrame_StackPointerInvalidate(frame);
+                        }
+                        stack_pointer += 1;
+                    }
+                    stack_pointer += -1;
+                }
             }
             // _POP_TOP
             {
@@ -12734,18 +12837,41 @@
                 UNLOCK_SHARED_OBJECT(dict);
                 STAT_INC(STORE_ATTR, hit);
                 o = owner;
-                stack_pointer[-2] = o;
-                stack_pointer += -1;
-                ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
-                _PyFrame_SetStackPointer(frame, stack_pointer);
-                _PyFrame_StackPointerValidate(frame);
-                Py_XDECREF(old_value);
-                _PyFrame_StackPointerInvalidate(frame);
+                if (old_value != NULL) {
+                    if (PyFloat_CheckExact(old_value)) {
+                        stack_pointer[-2] = o;
+                        stack_pointer += -1;
+                        ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                        _PyFrame_SetStackPointer(frame, stack_pointer);
+                        _PyFrame_StackPointerValidate(frame);
+                        _Py_DECREF_SPECIALIZED(old_value, _PyFloat_ExactDealloc_Fast);
+                        _PyFrame_StackPointerInvalidate(frame);
+                    }
+                    else if (PyLong_CheckExact(old_value)) {
+                        stack_pointer[-2] = o;
+                        stack_pointer += -1;
+                        ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                        _PyFrame_SetStackPointer(frame, stack_pointer);
+                        _PyFrame_StackPointerValidate(frame);
+                        _Py_DECREF_SPECIALIZED(old_value, _PyLong_ExactDealloc);
+                        _PyFrame_StackPointerInvalidate(frame);
+                    }
+                    else {
+                        stack_pointer[-2] = o;
+                        stack_pointer += -1;
+                        ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                        _PyFrame_SetStackPointer(frame, stack_pointer);
+                        _PyFrame_StackPointerValidate(frame);
+                        Py_DECREF(old_value);
+                        _PyFrame_StackPointerInvalidate(frame);
+                    }
+                    stack_pointer += 1;
+                }
             }
             // _POP_TOP
             {
                 value = o;
-                stack_pointer += -1;
+                stack_pointer += -2;
                 ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
                 _PyFrame_SetStackPointer(frame, stack_pointer);
                 _PyFrame_StackPointerValidate(frame);
@@ -13257,19 +13383,42 @@
                 assert(old_value != NULL);
                 ls = list_st;
                 ss = sub_st;
-                stack_pointer[-3] = ls;
-                stack_pointer[-2] = ss;
-                stack_pointer += -1;
-                ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
-                _PyFrame_SetStackPointer(frame, stack_pointer);
-                _PyFrame_StackPointerValidate(frame);
-                Py_DECREF(old_value);
-                _PyFrame_StackPointerInvalidate(frame);
+                if (PyFloat_CheckExact(old_value)) {
+                    stack_pointer[-3] = ls;
+                    stack_pointer[-2] = ss;
+                    stack_pointer += -1;
+                    ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                    _PyFrame_SetStackPointer(frame, stack_pointer);
+                    _PyFrame_StackPointerValidate(frame);
+                    _Py_DECREF_SPECIALIZED(old_value, _PyFloat_ExactDealloc_Fast);
+                    _PyFrame_StackPointerInvalidate(frame);
+                }
+                else if (PyLong_CheckExact(old_value)) {
+                    stack_pointer[-3] = ls;
+                    stack_pointer[-2] = ss;
+                    stack_pointer += -1;
+                    ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                    _PyFrame_SetStackPointer(frame, stack_pointer);
+                    _PyFrame_StackPointerValidate(frame);
+                    _Py_DECREF_SPECIALIZED(old_value, _PyLong_ExactDealloc);
+                    _PyFrame_StackPointerInvalidate(frame);
+                }
+                else {
+                    stack_pointer[-3] = ls;
+                    stack_pointer[-2] = ss;
+                    stack_pointer += -1;
+                    ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+                    _PyFrame_SetStackPointer(frame, stack_pointer);
+                    _PyFrame_StackPointerValidate(frame);
+                    Py_DECREF(old_value);
+                    _PyFrame_StackPointerInvalidate(frame);
+                }
             }
             // _POP_TOP_INT
             {
                 value = ss;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             // _POP_TOP
@@ -13466,7 +13615,8 @@
             // _POP_TOP_INT
             {
                 value = v;
-                assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+                assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
                 PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
             }
             stack_pointer[-1] = res;
@@ -14091,6 +14241,9 @@
             // _MAKE_HEAP_SAFE
             {
                 value = stack_pointer[-1];
+                if (_PyEval_StrictReturnCheck(tstate, frame, value)) {
+                    JUMP_TO_LABEL(error);
+                }
                 value = PyStackRef_MakeHeapSafe(value);
             }
             // _YIELD_VALUE

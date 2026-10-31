@@ -4837,7 +4837,7 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertEqual(res, 3.5)
         self.assertIsNotNone(ex)
         uops = get_opnames(ex)
-        self.assertIn("_BINARY_OP_EXTEND", uops)
+        self.assertIn("_BINARY_OP_ARITH_FLOAT_INT", uops)
         self.assertIn("_POP_TOP_NOP", uops)
         self.assertLessEqual(count_ops(ex, "_POP_TOP"), 2)
 
@@ -4885,7 +4885,7 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertEqual(res, 11.0)
         self.assertIsNotNone(ex)
         uops = get_opnames(ex)
-        self.assertIn("_BINARY_OP_EXTEND", uops)
+        self.assertIn("_BINARY_OP_ARITH_FLOAT_INT", uops)
         self.assertIn("_BINARY_OP_MULTIPLY_FLOAT_INPLACE", uops)
         self.assertNotIn("_BINARY_OP_MULTIPLY_FLOAT", uops)
         # NOS guard on the multiply is eliminated because _BINARY_OP_EXTEND
@@ -6696,7 +6696,7 @@ class TestUopsOptimization(unittest.TestCase):
         res, ex = self._run_with_optimizer(testfunc, TIER2_THRESHOLD)
         self.assertIsNotNone(ex)
         uops = get_opnames(ex)
-        self.assertIn("_BINARY_OP_EXTEND", uops)
+        self.assertIn("_BINARY_OP_BITWISE_INT", uops)
         self.assertNotIn("_GUARD_BINARY_OP_EXTEND", uops)
         self.assertNotIn("_GUARD_NOS_OVERFLOWED", uops)
         self.assertNotIn("_GUARD_TOS_OVERFLOWED", uops)
@@ -6761,7 +6761,8 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertNotIn("_ITER_CHECK_RANGE", uops_f[mw_f:jmp_f])
         self.assertNotIn("_GUARD_NOS_FLOAT", uops_f[mw_f:jmp_f])
         self.assertNotIn("_GUARD_TOS_FLOAT", uops_f[mw_f:jmp_f])
-        self.assertIn("_LOAD_FAST_AND_CLEAR", uops_f[mw_f:jmp_f])
+        self.assertIn("_BINARY_OP_ADD_FLOAT_INPLACE", uops_f[mw_f:jmp_f])
+        self.assertNotIn("_SWAP_FAST_1", uops_f[mw_f:jmp_f])
         self.assertNotIn("_POP_TOP", uops_f[mw_f:jmp_f])
         self.assertIn("_LOAD_FAST_AND_CLEAR", loop_body)
         self.assertNotIn("_POP_TOP", loop_body)
@@ -6789,9 +6790,28 @@ class TestUopsOptimization(unittest.TestCase):
         loop_body = uops[mw_idx:jmp_idx]
         self.assertIn("_ITER_CHECK_RANGE", preheader)
         self.assertIn("_CHECK_RECURSION_REMAINING", preheader)
+        self.assertIn("_CHECK_STACK_SPACE_OPERAND", preheader)
         self.assertNotIn("_ITER_CHECK_RANGE", loop_body)
         self.assertNotIn("_CHECK_RECURSION_REMAINING", loop_body)
+        self.assertNotIn("_CHECK_STACK_SPACE_OPERAND", loop_body)
         self.assertEqual(loop_body.count("_PUSH_FRAME"), 2)
+
+        def f_global_call(n):
+            s = 0
+            for i in range(n):
+                s = global_identity(s) + i
+            return s
+
+        res_g, ex_g = self._run_with_optimizer(f_global_call, TIER2_THRESHOLD)
+        self.assertEqual(res_g, TIER2_THRESHOLD * (TIER2_THRESHOLD - 1) // 2)
+        self.assertIsNotNone(ex_g)
+        uops_g = get_opnames(ex_g)
+        mw_g = uops_g.index("_MAKE_WARM")
+        jmp_g = uops_g.index("_JUMP_TO_TOP")
+        self.assertIn("_GUARD_GLOBALS_VERSION", uops_g[:mw_g])
+        self.assertIn("_CHECK_STACK_SPACE_OPERAND", uops_g[:mw_g])
+        self.assertNotIn("_GUARD_GLOBALS_VERSION", uops_g[mw_g:jmp_g])
+        self.assertNotIn("_CHECK_STACK_SPACE_OPERAND", uops_g[mw_g:jmp_g])
 
     def test_container_and_attr_loop_preheader_hoisting(self):
         def f_list_iter(n):
@@ -6919,6 +6939,484 @@ class TestUopsOptimization(unittest.TestCase):
         self.assertIn("_POP_TOP_INT", uops_lc[mw_lc:jmp_lc])
         iter_idx = uops_lc[mw_lc:jmp_lc].index("_ITER_NEXT_LIST_TIER_TWO")
         self.assertNotEqual(uops_lc[mw_lc + iter_idx - 1], "_SET_IP")
+
+    def test_list_store_dict_subscr_and_attr_store_loop_peeling(self):
+        def f_list_store(n):
+            lst = [0] * 16
+            for i in range(n):
+                idx = i & 15
+                lst[idx] = lst[idx] + 1
+            return lst[0]
+
+        res_ls, ex_ls = self._run_with_optimizer(f_list_store, TIER2_THRESHOLD)
+        self.assertEqual(res_ls, (TIER2_THRESHOLD + 15) // 16)
+        self.assertIsNotNone(ex_ls)
+        uops_ls = get_opnames(ex_ls)
+        mw_ls = uops_ls.index("_MAKE_WARM")
+        jmp_ls = uops_ls.index("_JUMP_TO_TOP")
+        self.assertIn("_ITER_CHECK_RANGE", uops_ls[:mw_ls])
+        self.assertIn("_GUARD_NOS_LIST", uops_ls[:mw_ls])
+        self.assertNotIn("_ITER_CHECK_RANGE", uops_ls[mw_ls:jmp_ls])
+        self.assertNotIn("_GUARD_NOS_LIST", uops_ls[mw_ls:jmp_ls])
+        self.assertNotIn("_POP_TOP", uops_ls[mw_ls:jmp_ls])
+        self.assertIn("_POP_TOP_INT", uops_ls[mw_ls:jmp_ls])
+
+        def f_dict_subscr(n):
+            d = {"a": 1, "b": 2}
+            total = 0
+            for i in range(n):
+                total = total + d["a"] + d["b"]
+            return total
+
+        res_ds, ex_ds = self._run_with_optimizer(f_dict_subscr, TIER2_THRESHOLD)
+        self.assertEqual(res_ds, 3 * TIER2_THRESHOLD)
+        self.assertIsNotNone(ex_ds)
+        uops_ds = get_opnames(ex_ds)
+        mw_ds = uops_ds.index("_MAKE_WARM")
+        jmp_ds = uops_ds.index("_JUMP_TO_TOP")
+        self.assertIn("_ITER_CHECK_RANGE", uops_ds[:mw_ds])
+        self.assertIn("_GUARD_NOS_TYPE", uops_ds[:mw_ds])
+        self.assertIn("_GUARD_NOS_INT", uops_ds[:mw_ds])
+        self.assertNotIn("_ITER_CHECK_RANGE", uops_ds[mw_ds:jmp_ds])
+        self.assertNotIn("_GUARD_NOS_TYPE", uops_ds[mw_ds:jmp_ds])
+        self.assertNotIn("_GUARD_NOS_INT", uops_ds[mw_ds:jmp_ds])
+        self.assertNotIn("_POP_TOP", uops_ds[mw_ds:jmp_ds])
+        self.assertIn("_POP_TOP_INT", uops_ds[mw_ds:jmp_ds])
+
+        class MutablePoint:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+        shared_c = 1.5
+
+        def f_attr_store(n):
+            p = MutablePoint(shared_c, 2.0)
+            for i in range(n):
+                p.x = p.x + 1.0
+                p.y = p.y + 0.5
+            return p.x + p.y
+
+        res_as, ex_as = self._run_with_optimizer(f_attr_store, TIER2_THRESHOLD)
+        self.assertAlmostEqual(res_as, 3.5 + 1.5 * TIER2_THRESHOLD)
+        self.assertEqual(shared_c, 1.5)
+        self.assertIsNotNone(ex_as)
+        uops_as = get_opnames(ex_as)
+        mw_as = uops_as.index("_MAKE_WARM")
+        jmp_as = uops_as.index("_JUMP_TO_TOP")
+        self.assertIn("_ITER_CHECK_RANGE", uops_as[:mw_as])
+        self.assertIn("_GUARD_TYPE_VERSION", uops_as[:mw_as])
+        self.assertIn("_CHECK_MANAGED_OBJECT_HAS_VALUES", uops_as[:mw_as])
+        self.assertIn("_GUARD_NOS_FLOAT", uops_as[:mw_as])
+        self.assertIn("_GUARD_DORV_NO_DICT", uops_as[:mw_as])
+        self.assertIn("_STORE_ATTR_INSTANCE_VALUE", uops_as[:mw_as])
+        self.assertNotIn("_ITER_CHECK_RANGE", uops_as[mw_as:jmp_as])
+        self.assertNotIn("_GUARD_TYPE_VERSION", uops_as[mw_as:jmp_as])
+        self.assertNotIn("_CHECK_MANAGED_OBJECT_HAS_VALUES", uops_as[mw_as:jmp_as])
+        self.assertNotIn("_GUARD_NOS_FLOAT", uops_as[mw_as:jmp_as])
+        self.assertNotIn("_GUARD_DORV_NO_DICT", uops_as[mw_as:jmp_as])
+        self.assertNotIn("_LOCK_OBJECT", uops_as[mw_as:jmp_as])
+        self.assertNotIn("_STORE_ATTR_INSTANCE_VALUE", uops_as[mw_as:jmp_as])
+        self.assertIn("_BINARY_OP_ADD_FLOAT_INPLACE", uops_as[mw_as:jmp_as])
+        self.assertIn("_POP_TOP_FLOAT", uops_as[mw_as:jmp_as])
+        self.assertNotIn("_POP_TOP", uops_as[mw_as:jmp_as])
+        self.assertIn("_POP_TOP_INT", uops_as[mw_as:jmp_as])
+
+    def test_massive_dynamism_and_reflection_in_peeled_loops(self):
+        class MutablePoint:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+        def attr_loop(p, n):
+            for i in range(n):
+                p.x = p.x + 1.0
+                p.y = p.y + 0.5
+            return p.x + p.y
+
+        # 1. Constant/reference aliasing across and before JIT calls
+        shared_c = 1.25
+        p = MutablePoint(shared_c, 2.5)
+        for _ in range(10):
+            attr_loop(p, 500)
+        self.assertEqual(shared_c, 1.25)
+        saved_x = p.x
+        attr_loop(p, 10)
+        self.assertEqual(saved_x, 5001.25)
+        self.assertEqual(p.x, 5011.25)
+
+        # 2. Boundary iterations (n=0, n=1) on already-compiled peeled loop
+        self.assertEqual(attr_loop(MutablePoint(1.0, 2.0), 0), 3.0)
+        self.assertEqual(attr_loop(MutablePoint(1.0, 2.0), 1), 4.5)
+
+        # 3. Reading p.x inside the loop before mutating it (load_count == 2)
+        def attr_loop_with_alias(p, n):
+            last_prev = 0.0
+            for i in range(n):
+                prev = p.x
+                p.x = p.x + 1.0
+                last_prev = prev
+            return last_prev, p.x
+
+        p_alias = MutablePoint(0.0, 0.0)
+        for _ in range(10):
+            prev_val, cur_val = attr_loop_with_alias(p_alias, 500)
+        self.assertEqual(cur_val - prev_val, 1.0)
+
+        # 4. Dynamic type change (int instead of float, and float subclass override)
+        p_int = MutablePoint(1, 2)
+        self.assertEqual(attr_loop(p_int, 100), 153.0)
+
+        class DoublingFloat(float):
+            def __add__(self, other):
+                return DoublingFloat(super().__add__(other) * 2.0)
+
+        p_sub = MutablePoint(DoublingFloat(1.0), DoublingFloat(2.0))
+        self.assertEqual(attr_loop(p_sub, 3), 90.0)
+
+        # 5. Materializing instance __dict__, deleting attribute, invalid type
+        p_dict = MutablePoint(1.0, 2.0)
+        p_dict.__dict__["extra"] = "materialized"
+        self.assertEqual(attr_loop(p_dict, 100), 153.0)
+        self.assertEqual(p_dict.__dict__["extra"], "materialized")
+
+        p_del = MutablePoint(1.0, 2.0)
+        del p_del.x
+        with self.assertRaises(AttributeError):
+            attr_loop(p_del, 10)
+
+        p_bad = MutablePoint("not_a_float", 2.0)
+        with self.assertRaises(TypeError):
+            attr_loop(p_bad, 10)
+
+        # 6. Dynamic __class__ swap and @property injection after JIT compilation
+        class HookedPoint:
+            def __init__(self, x, y):
+                self._x = x
+                self._y = y
+                self.writes = 0
+            @property
+            def x(self):
+                return self._x
+            @x.setter
+            def x(self, val):
+                self.writes += 1
+                self._x = val
+            @property
+            def y(self):
+                return self._y
+            @y.setter
+            def y(self, val):
+                self.writes += 1
+                self._y = val
+
+        p_swap = MutablePoint(1.0, 2.0)
+        attr_loop(p_swap, 10)
+        p_swap.__class__ = HookedPoint
+        p_swap._x = 1.0
+        p_swap._y = 2.0
+        p_swap.writes = 0
+        self.assertEqual(attr_loop(p_swap, 10), 18.0)
+        self.assertEqual(p_swap.writes, 20)
+
+        MutablePoint.x = property(lambda self: self._px,
+                                  lambda self, v: setattr(self, "_px", v + 10.0))
+        p_prop = MutablePoint.__new__(MutablePoint)
+        p_prop._px = 1.0
+        p_prop.y = 2.0
+        self.assertEqual(attr_loop(p_prop, 5), 60.5)
+
+        # 7. Dict/List dynamic type mutation, KeyError, IndexError, container swap
+        def dict_and_list_loop(d, lst, n):
+            total = 0
+            for i in range(n):
+                idx = i & 15
+                lst[idx] = lst[idx] + d["a"]
+                total = total + d["b"]
+            return total + lst[0]
+
+        d = {"a": 1, "b": 2}
+        lst = [0] * 16
+        for _ in range(10):
+            dict_and_list_loop(d, lst, 500)
+        d["a"] = 1.5
+        d["b"] = 2.5
+        res_dl = dict_and_list_loop(d, [0.0] * 16, 16)
+        self.assertEqual(res_dl, 41.5)
+        del d["b"]
+        with self.assertRaises(KeyError):
+            dict_and_list_loop(d, [0] * 16, 10)
+        d["b"] = 2
+        with self.assertRaises(IndexError):
+            dict_and_list_loop(d, [0] * 4, 10)
+        with self.assertRaises(KeyError):
+            dict_and_list_loop(d, {}, 10)
+        with self.assertRaises(TypeError):
+            dict_and_list_loop(d, (0,) * 16, 10)
+
+    def test_strict_decorator_struct_and_third_party_propagation(self):
+        import strict
+        import types
+
+        @strict.struct
+        class Vec2:
+            x: float
+            y: float
+            steps: int
+
+        v = Vec2(1.0, 2.0, 0)
+        self.assertFalse(hasattr(v, "__dict__"))
+        self.assertEqual((v.x, v.y, v.steps), (1.0, 2.0, 0))
+
+        # 1. Third-party / legacy code receiving a @struct instance cannot violate slot types
+        def legacy_corrupt_x(obj, bad_val):
+            obj.x = bad_val
+
+        with self.assertRaises(TypeError):
+            legacy_corrupt_x(v, "not a float")
+        with self.assertRaises(TypeError):
+            legacy_corrupt_x(v, 42)  # exact float required
+        with self.assertRaises(TypeError):
+            v.steps = True  # bool is not accepted for exact int slot
+        with self.assertRaises(AttributeError):
+            v.undeclared = 99
+        with self.assertRaises(TypeError):
+            del v.x
+        with self.assertRaises(TypeError):
+            Vec2.x = "monkeypatch"
+
+        # 2. Hot Tier 2 loop over @struct slots: eliminates float type guards & deopts on bad store
+        def step_vec(n, vec=v):
+            for i in range(n):
+                vec.x = vec.x + 0.5
+                vec.y = vec.y + 1.5
+            return vec.x + vec.y
+
+        _, ex = self._run_with_optimizer(step_vec, TIER2_THRESHOLD)
+        self.assertIsNotNone(ex)
+        opnames = get_opnames(ex)
+        # Because Vec2 slots have _Py_STRICT_SLOT_FLOAT, _LOAD_ATTR_SLOT
+        # propagates &PyFloat_Type directly in the Tier 2 abstract interpreter,
+        # so no _GUARD_TOS_FLOAT or _GUARD_NOS_FLOAT is emitted at all!
+        self.assertNotIn("_GUARD_TOS_FLOAT", opnames)
+        self.assertNotIn("_GUARD_NOS_FLOAT", opnames)
+        self.assertIn("_BINARY_OP_ADD_FLOAT_INPLACE", opnames)
+
+        # Specialize STORE_ATTR_SLOT in a loop, then trigger TypeError mid-loop
+        def store_seq(vec, items):
+            for val in items:
+                vec.x = val
+
+        store_seq(v, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+        with self.assertRaises(TypeError):
+            store_seq(v, [1.0, 2.0, 3.0, "bad_mid_loop", 5.0])
+        self.assertEqual(v.x, 3.0)
+
+        # 3. @strict function and explicit third-party inheritance via strict_module & strict_mode
+        third_party_mod = types.ModuleType("legacy_third_party")
+        exec(
+            "def compute_fee(amount: float, rate: float) -> float:\n"
+            "    return amount * rate\n"
+            "def buggy_third_party(amount: float) -> float:\n"
+            "    return 'corrupted_return'\n"
+            "def untyped_legacy_helper(x):\n"
+            "    return x + 1\n",
+            third_party_mod.__dict__,
+        )
+
+        # Without strict mode, buggy_third_party silently violates its return annotation
+        self.assertEqual(third_party_mod.buggy_third_party(10.0), "corrupted_return")
+
+        # Propagating @strict(propagate=True) into uninstrumented third-party calls
+        @strict.strict(propagate=True)
+        def caller_with_propagation(a: float) -> float:
+            return third_party_mod.buggy_third_party(a)
+
+        with self.assertRaises(TypeError):
+            caller_with_propagation(10.0)
+
+        @strict.strict(propagate=True, require_annotations=True)
+        def caller_requiring_annotations(a: int) -> int:
+            return third_party_mod.untyped_legacy_helper(a)
+
+        with self.assertRaises(TypeError):
+            caller_requiring_annotations(5)
+
+        # Explicit module-level instrumentation via strict_module()
+        strict.strict_module(third_party_mod)
+        self.assertEqual(third_party_mod.compute_fee(100.0, 0.05), 5.0)
+        with self.assertRaises(TypeError):
+            third_party_mod.compute_fee("100.0", 0.05)
+        with self.assertRaises(TypeError):
+            third_party_mod.buggy_third_party(10.0)
+
+    def test_duplicated_core_loops_undecorated_vs_strict_and_negative_cases(self):
+        import strict
+
+        # 1. Float arithmetic loop: undecorated vs @strict
+        def float_poly_undecorated(x, c1, c2, n):
+            acc = x
+            for _ in range(n):
+                acc = (acc * c1 + c2) - (acc * 0.5)
+            return acc
+
+        @strict.strict
+        def float_poly_strict(x: float, c1: float, c2: float, n: int) -> float:
+            acc = x
+            for _ in range(n):
+                acc = (acc * c1 + c2) - (acc * 0.5)
+            return acc
+
+        for _ in range(5):
+            self.assertEqual(
+                float_poly_undecorated(1.5, 1.0001, 0.25, 200),
+                float_poly_strict(1.5, 1.0001, 0.25, 200),
+            )
+
+        # Negative enforcement cases for float_poly_strict
+        with self.assertRaises(TypeError):
+            float_poly_strict(1, 1.0001, 0.25, 10)  # int instead of float
+        with self.assertRaises(TypeError):
+            float_poly_strict(1.5, "1.0001", 0.25, 10)  # str instead of float
+        with self.assertRaises(TypeError):
+            float_poly_strict(1.5, 1.0001, 0.25, True)  # bool instead of int
+
+        # 2. Integer bitwise & arithmetic loop: undecorated vs @strict
+        def int_bitmix_undecorated(seed, mask, step, n):
+            acc = seed
+            for i in range(n):
+                acc = ((acc + i + step) ^ (acc >> 3)) & mask
+            return acc
+
+        @strict.strict
+        def int_bitmix_strict(seed: int, mask: int, step: int, n: int) -> int:
+            acc = seed
+            for i in range(n):
+                acc = ((acc + i + step) ^ (acc >> 3)) & mask
+            return acc
+
+        for _ in range(5):
+            self.assertEqual(
+                int_bitmix_undecorated(7, 0xFFFF, 3, 200),
+                int_bitmix_strict(7, 0xFFFF, 3, 200),
+            )
+
+        with self.assertRaises(TypeError):
+            int_bitmix_strict(7.0, 0xFFFF, 3, 10)
+        with self.assertRaises(TypeError):
+            int_bitmix_strict(True, 0xFFFF, 3, 10)
+
+        # 3. Inlined helper calls in hot loop: undecorated vs @strict
+        def step_undecorated(x, a, b):
+            return (x * a + b) - (x * 0.25)
+
+        def call_loop_undecorated(x, a, b, n):
+            acc = x
+            for _ in range(n):
+                acc = step_undecorated(acc, a, b)
+            return acc
+
+        @strict.strict
+        def step_strict(x: float, a: float, b: float) -> float:
+            return (x * a + b) - (x * 0.25)
+
+        @strict.strict
+        def call_loop_strict(x: float, a: float, b: float, n: int) -> float:
+            acc = x
+            for _ in range(n):
+                acc = step_strict(acc, a, b)
+            return acc
+
+        for _ in range(5):
+            self.assertEqual(
+                call_loop_undecorated(2.0, 1.25, 0.5, 200),
+                call_loop_strict(2.0, 1.25, 0.5, 200),
+            )
+
+        with self.assertRaises(TypeError):
+            step_strict(2, 1.25, 0.5)
+        with self.assertRaises(TypeError):
+            call_loop_strict(2.0, 1.25, "bad", 10)
+
+        # 4. Object attribute simulation: undecorated class vs @struct + @strict
+        class ParticleUndecorated:
+            def __init__(self, x, y, vx, vy):
+                self.x = x
+                self.y = y
+                self.vx = vx
+                self.vy = vy
+
+            def advance(self, dt):
+                self.x = self.x + self.vx * dt
+                self.y = self.y + self.vy * dt
+
+        @strict.struct
+        class ParticleStruct:
+            x: float
+            y: float
+            vx: float
+            vy: float
+
+            @strict.strict
+            def __init__(self, x: float, y: float, vx: float, vy: float) -> None:
+                self.x = x
+                self.y = y
+                self.vx = vx
+                self.vy = vy
+
+            @strict.strict
+            def advance(self, dt: float) -> None:
+                self.x = self.x + self.vx * dt
+                self.y = self.y + self.vy * dt
+
+        p_u = ParticleUndecorated(1.0, 2.0, 0.5, -0.25)
+        p_s = ParticleStruct(1.0, 2.0, 0.5, -0.25)
+        for _ in range(200):
+            p_u.advance(0.01)
+            p_s.advance(0.01)
+        self.assertEqual((p_u.x, p_u.y), (p_s.x, p_s.y))
+
+        # Negative enforcement cases on @struct + @strict ParticleStruct
+        with self.assertRaises(TypeError):
+            ParticleStruct(1, 2.0, 0.5, -0.25)  # int instead of float in __init__
+        with self.assertRaises(TypeError):
+            p_s.x = "not_a_float"  # slot descriptor enforces float after Tier 1/2 warmup
+        with self.assertRaises(TypeError):
+            p_s.x = 42  # exact float required, int rejected
+        with self.assertRaises(AttributeError):
+            p_s.extra_field = 1.0  # __slots__ layout rejects undeclared attributes
+        with self.assertRaises(TypeError):
+            p_s.advance(1)  # int instead of float in @strict method
+
+        # 5. Non-escaping @struct allocation scalar replacement (PEA) + mixed float/int & bitwise uops
+        @strict.struct
+        class OrderItemStruct:
+            order_id: int
+            price: float
+            quantity: int
+
+        globals()["_TestOrderItemStruct"] = OrderItemStruct
+
+        @strict.strict
+        def order_total_strict(n: int) -> float:
+            total = 0.0
+            for i in range(n):
+                item = _TestOrderItemStruct(i, 19.99, (i & 7) + 1)
+                total = total + item.price * item.quantity
+            return total
+
+        res_ord, ex_ord = self._run_with_optimizer(order_total_strict, TIER2_THRESHOLD * 2)
+        expected_ord = sum(19.99 * ((i & 7) + 1) for i in range(TIER2_THRESHOLD * 2))
+        self.assertAlmostEqual(res_ord, expected_ord, places=5)
+        self.assertIsNotNone(ex_ord)
+        ord_uops = get_opnames(ex_ord)
+        self.assertNotIn("_ALLOCATE_OBJECT", ord_uops)
+        self.assertNotIn("_CREATE_INIT_FRAME", ord_uops)
+        self.assertNotIn("_STORE_ATTR_SLOT", ord_uops)
+        self.assertNotIn("_LOAD_ATTR_SLOT", ord_uops)
+        self.assertIn("_BINARY_OP_BITWISE_INT", ord_uops)
+        self.assertIn("_BINARY_OP_ARITH_FLOAT_INT", ord_uops)
+
 
 
 def global_identity(x):

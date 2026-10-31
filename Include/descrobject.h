@@ -87,6 +87,11 @@ struct PyMemberDef {
 
 #ifndef Py_LIMITED_API
 #  define _Py_AFTER_ITEMS      (1 << 4) // For internal use.
+#  define _Py_STRICT_SLOT_INT   (1 << 5)
+#  define _Py_STRICT_SLOT_FLOAT (1 << 6)
+#  define _Py_STRICT_SLOT_STR   (1 << 7)
+#  define _Py_STRICT_SLOT_BOOL  (1 << 8)
+#  define _Py_STRICT_SLOT_MASK  (_Py_STRICT_SLOT_INT | _Py_STRICT_SLOT_FLOAT | _Py_STRICT_SLOT_STR | _Py_STRICT_SLOT_BOOL)
 #endif
 
 PyAPI_FUNC(PyObject *) PyMember_GetOne(const char *, PyMemberDef *);

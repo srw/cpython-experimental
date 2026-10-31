@@ -321,6 +321,39 @@ PyMember_SetOne(char *addr, PyMemberDef *l, PyObject *v)
     }
     case _Py_T_OBJECT:
     case Py_T_OBJECT_EX:
+        if (l->flags & _Py_STRICT_SLOT_MASK) {
+            if (v == NULL) {
+                PyErr_Format(PyExc_TypeError,
+                             "cannot delete strict slot '%s'", l->name);
+                return -1;
+            }
+            if ((l->flags & _Py_STRICT_SLOT_INT) &&
+                (!PyLong_CheckExact(v) || PyBool_Check(v)))
+            {
+                PyErr_Format(PyExc_TypeError,
+                             "strict slot '%s' requires exact int, got %T",
+                             l->name, v);
+                return -1;
+            }
+            if ((l->flags & _Py_STRICT_SLOT_FLOAT) && !PyFloat_CheckExact(v)) {
+                PyErr_Format(PyExc_TypeError,
+                             "strict slot '%s' requires exact float, got %T",
+                             l->name, v);
+                return -1;
+            }
+            if ((l->flags & _Py_STRICT_SLOT_STR) && !PyUnicode_CheckExact(v)) {
+                PyErr_Format(PyExc_TypeError,
+                             "strict slot '%s' requires exact str, got %T",
+                             l->name, v);
+                return -1;
+            }
+            if ((l->flags & _Py_STRICT_SLOT_BOOL) && !PyBool_Check(v)) {
+                PyErr_Format(PyExc_TypeError,
+                             "strict slot '%s' requires exact bool, got %T",
+                             l->name, v);
+                return -1;
+            }
+        }
         Py_BEGIN_CRITICAL_SECTION(obj);
         oldv = *(PyObject **)addr;
         FT_ATOMIC_STORE_PTR_RELEASE(*(PyObject **)addr, Py_XNewRef(v));

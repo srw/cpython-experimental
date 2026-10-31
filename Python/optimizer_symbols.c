@@ -1517,7 +1517,29 @@ _Py_uop_frame_new(
 
     for (int i = arg_len; i < co->co_nlocalsplus; i++) {
         if (args == NULL) {
-            frame->locals[i] = _Py_uop_sym_new_unknown(ctx);
+            uint32_t tag = 0;
+            uint32_t strict_sig = ((uintptr_t)co->co_extra & 1) ? (uint32_t)(uintptr_t)co->co_extra : 0;
+            if ((strict_sig & 0x2) != 0 && i < co->co_argcount && i < 9) {
+                tag = (strict_sig >> (5 + i * 3)) & 0x7;
+            }
+            if (tag == 1) {
+                frame->locals[i] = _Py_uop_sym_new_type(ctx, &PyLong_Type);
+            }
+            else if (tag == 2) {
+                frame->locals[i] = _Py_uop_sym_new_type(ctx, &PyFloat_Type);
+            }
+            else if (tag == 3) {
+                frame->locals[i] = _Py_uop_sym_new_type(ctx, &PyUnicode_Type);
+            }
+            else if (tag == 4) {
+                frame->locals[i] = _Py_uop_sym_new_type(ctx, &PyBool_Type);
+            }
+            else if (tag == 5) {
+                frame->locals[i] = _Py_uop_sym_new_const(ctx, Py_None);
+            }
+            else {
+                frame->locals[i] = _Py_uop_sym_new_unknown(ctx);
+            }
         }
         else if (i < parameter_count) {
             frame->locals[i] = _Py_uop_sym_new_not_null(ctx);

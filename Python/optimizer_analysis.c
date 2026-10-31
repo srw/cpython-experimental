@@ -644,6 +644,98 @@ optimize_uops(
     ctx->frame = frame;
     _Py_uop_sym_set_stack_depth(ctx, curr_stacklen, frame->stack_pointer);
 
+    if (((uintptr_t)frame->code->co_extra & 0x1) != 0 &&
+        trace_len > 0)
+    {
+        PyCodeObject *co = frame->code;
+        int nlocals = co->co_nlocals < 64 ? co->co_nlocals : 64;
+        int writes[64] = {0};
+        int const_init[64];
+        for (int v = 0; v < 64; v++) {
+            const_init[v] = -1;
+        }
+        _Py_CODEUNIT *code = _PyCode_CODE(co);
+        Py_ssize_t code_len = Py_SIZE(co);
+        bool in_entry_bb = true;
+        int prev_const = -1;
+        for (Py_ssize_t pc = 0; pc < code_len; ) {
+            uint8_t raw_op = code[pc].op.code;
+            uint8_t op = _PyOpcode_Deopt[raw_op];
+            int arg = code[pc].op.arg;
+            int caches = _PyOpcode_Caches[op];
+            if (op == EXTENDED_ARG) {
+                pc += 1;
+                continue;
+            }
+            if (op == LOAD_CONST) {
+                prev_const = in_entry_bb ? arg : -1;
+            }
+            else if (op == STORE_FAST) {
+                if (arg < 64) {
+                    writes[arg]++;
+                    if (in_entry_bb && prev_const >= 0 && writes[arg] == 1) {
+                        const_init[arg] = prev_const;
+                    }
+                }
+                prev_const = -1;
+            }
+            else if (op == STORE_FAST_LOAD_FAST) {
+                int st_arg = arg >> 4;
+                if (st_arg < 64) {
+                    writes[st_arg]++;
+                    if (in_entry_bb && prev_const >= 0 && writes[st_arg] == 1) {
+                        const_init[st_arg] = prev_const;
+                    }
+                }
+                prev_const = -1;
+            }
+            else if (op == STORE_FAST_STORE_FAST) {
+                int st1 = arg >> 4;
+                int st2 = arg & 0xf;
+                if (st1 < 64) {
+                    writes[st1]++;
+                }
+                if (st2 < 64) {
+                    writes[st2]++;
+                }
+                prev_const = -1;
+            }
+            else if (op == DELETE_FAST) {
+                if (arg < 64) {
+                    writes[arg] += 2;
+                }
+                prev_const = -1;
+            }
+            else {
+                if (op == FOR_ITER ||
+                    op == JUMP_BACKWARD || op == JUMP_BACKWARD_NO_INTERRUPT ||
+                    op == JUMP_FORWARD ||
+                    op == POP_JUMP_IF_FALSE || op == POP_JUMP_IF_TRUE ||
+                    op == POP_JUMP_IF_NONE || op == POP_JUMP_IF_NOT_NONE ||
+                    op == RETURN_VALUE || op == RETURN_GENERATOR || op == YIELD_VALUE)
+                {
+                    in_entry_bb = false;
+                }
+                prev_const = -1;
+            }
+            pc += 1 + caches;
+        }
+        PyObject *consts = co->co_consts;
+        for (int v = co->co_argcount; v < nlocals; v++) {
+            if (writes[v] == 1 && const_init[v] >= 0 &&
+                const_init[v] < PyTuple_GET_SIZE(consts))
+            {
+                PyObject *cval = PyTuple_GET_ITEM(consts, const_init[v]);
+                if (PyFloat_CheckExact(cval)) {
+                    frame->locals[v] = _Py_uop_sym_new_type(ctx, &PyFloat_Type);
+                }
+                else if (_PyLong_CheckExactAndCompact(cval)) {
+                    frame->locals[v] = _Py_uop_sym_new_compact_int(ctx);
+                }
+            }
+        }
+    }
+
     _PyUOpInstruction *this_instr = NULL;
     JitOptRef *stack_pointer = ctx->frame->stack_pointer;
 
@@ -756,7 +848,6 @@ const uint16_t op_without_pop[MAX_UOP_ID + 1] = {
     [_POP_TOP_UNICODE] = _NOP,
 };
 
-
 static int
 remove_unneeded_uops(_PyUOpInstruction *buffer, int buffer_size)
 {
@@ -807,6 +898,13 @@ remove_unneeded_uops(_PyUOpInstruction *buffer, int buffer_size)
                     }
                     max_checked_recursion_depth = call_depth;
                 }
+                else if (opcode == _TIER2_RESUME_CHECK &&
+                         call_depth > 0 &&
+                         (buffer[pc].oparg & 0x80) != 0)
+                {
+                    buffer[pc].opcode = _NOP;
+                    break;
+                }
                 else if (opcode == _PUSH_FRAME || opcode == _CREATE_INIT_FRAME) {
                     call_depth++;
                 }
@@ -845,14 +943,24 @@ remove_unneeded_uops(_PyUOpInstruction *buffer, int buffer_size)
                 /* _PUSH_FRAME doesn't escape or error, but it
                  * does need the IP for the return address */
                 bool needs_ip = (opcode == _PUSH_FRAME || opcode == _YIELD_VALUE || opcode == _DYNAMIC_EXIT || opcode == _EXIT_TRACE);
-                if (_PyUop_Flags[opcode] & HAS_ESCAPES_FLAG) {
+                bool store_attr_no_escape =
+                    (opcode == _STORE_ATTR_SLOT &&
+                     ((buffer[pc].operand0 >> 13) != 0 || buffer[pc].oparg == 255)) ||
+                    (opcode == _STORE_ATTR_INSTANCE_VALUE && buffer[pc].oparg == 255);
+                if ((_PyUop_Flags[opcode] & HAS_ESCAPES_FLAG) && !store_attr_no_escape) {
                     needs_ip = true;
                     may_have_escaped = true;
                     if (opcode != _CHECK_PERIODIC &&
                         opcode != _CHECK_PERIODIC_IF_NOT_YIELD_FROM &&
                         opcode != _TIER2_RESUME_CHECK &&
                         opcode != _RETURN_VALUE &&
-                        opcode != _POP_TOP)
+                        opcode != _POP_TOP &&
+                        opcode != _MAKE_HEAP_SAFE &&
+                        opcode != _STORE_ATTR_SLOT &&
+                        opcode != _STORE_ATTR_INSTANCE_VALUE &&
+                        opcode != _BINARY_OP_TRUEDIV_FLOAT &&
+                        opcode != _BINARY_OP_TRUEDIV_FLOAT_INPLACE &&
+                        opcode != _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT)
                     {
                         max_checked_recursion_depth = -1;
                     }
@@ -874,6 +982,710 @@ remove_unneeded_uops(_PyUOpInstruction *buffer, int buffer_size)
         }
     }
     Py_UNREACHABLE();
+}
+
+static void
+mark_inplace_float_attr_updates(_PyUOpInstruction *buffer, int length)
+{
+    #define NEXT_ACT_IDX(idx) \
+        ({ int _i = (idx); \
+           while (_i < length && \
+                  (buffer[_i].opcode == _NOP || \
+                   buffer[_i].opcode == _SET_IP || \
+                   buffer[_i].opcode == _CHECK_VALIDITY)) { \
+               _i++; \
+           } \
+           _i; })
+    for (int i = 0; i < length; i++) {
+        uint16_t op = buffer[i].opcode;
+        int v = -1;
+        if (op == _LOAD_FAST || op == _LOAD_FAST_BORROW) {
+            v = (int)buffer[i].oparg;
+        }
+        else if (op >= _LOAD_FAST_0 && op <= _LOAD_FAST_7) {
+            v = (int)(op - _LOAD_FAST_0);
+        }
+        else if (op >= _LOAD_FAST_BORROW_0 && op <= _LOAD_FAST_BORROW_7) {
+            v = (int)(op - _LOAD_FAST_BORROW_0);
+        }
+        if (v < 0) {
+            continue;
+        }
+        int j = NEXT_ACT_IDX(i + 1);
+        while (j < length &&
+               (buffer[j].opcode == _GUARD_TYPE_VERSION ||
+                buffer[j].opcode == _GUARD_TYPE ||
+                buffer[j].opcode == _CHECK_FUNCTION_VERSION_INLINE ||
+                buffer[j].opcode == _CHECK_MANAGED_OBJECT_HAS_VALUES ||
+                buffer[j].opcode == _GUARD_DORV_NO_DICT))
+        {
+            j = NEXT_ACT_IDX(j + 1);
+        }
+        if (j >= length ||
+            (buffer[j].opcode != _LOAD_ATTR_SLOT &&
+             buffer[j].opcode != _LOAD_ATTR_INSTANCE_VALUE))
+        {
+            continue;
+        }
+        bool is_slot = (buffer[j].opcode == _LOAD_ATTR_SLOT);
+        uint64_t offset = is_slot ? (buffer[j].operand0 & 0x1FFF) : buffer[j].operand0;
+        int j_pop = NEXT_ACT_IDX(j + 1);
+        if (j_pop >= length || buffer[j_pop].opcode != _POP_TOP_NOP) {
+            continue;
+        }
+        int r = NEXT_ACT_IDX(j_pop + 1);
+        if (r >= length) {
+            continue;
+        }
+        uint16_t rop = buffer[r].opcode;
+        int rv = -1;
+        if (rop == _LOAD_FAST || rop == _LOAD_FAST_BORROW) {
+            rv = (int)buffer[r].oparg;
+        }
+        else if (rop >= _LOAD_FAST_0 && rop <= _LOAD_FAST_7) {
+            rv = (int)(rop - _LOAD_FAST_0);
+        }
+        else if (rop >= _LOAD_FAST_BORROW_0 && rop <= _LOAD_FAST_BORROW_7) {
+            rv = (int)(rop - _LOAD_FAST_BORROW_0);
+        }
+        bool rhs_ok = (rop == _LOAD_CONST_INLINE_BORROW ||
+                       rop == _LOAD_CONST_INLINE ||
+                       (rv >= 0 && rv != v));
+        int b = NEXT_ACT_IDX(r + 1);
+        int rhs_slot_idx = -1;
+        if (rv >= 0) {
+            int r2 = b;
+            while (r2 < length &&
+                   (buffer[r2].opcode == _GUARD_TYPE_VERSION ||
+                    buffer[r2].opcode == _GUARD_TYPE ||
+                    buffer[r2].opcode == _CHECK_FUNCTION_VERSION_INLINE ||
+                    buffer[r2].opcode == _CHECK_MANAGED_OBJECT_HAS_VALUES ||
+                    buffer[r2].opcode == _GUARD_DORV_NO_DICT))
+            {
+                r2 = NEXT_ACT_IDX(r2 + 1);
+            }
+            if (r2 < length &&
+                (buffer[r2].opcode == _LOAD_ATTR_SLOT ||
+                 buffer[r2].opcode == _LOAD_ATTR_INSTANCE_VALUE))
+            {
+                bool r_slot = (buffer[r2].opcode == _LOAD_ATTR_SLOT);
+                uint64_t r_off = r_slot ? (buffer[r2].operand0 & 0x1FFF) : buffer[r2].operand0;
+                int r_pop = NEXT_ACT_IDX(r2 + 1);
+                if (r_pop < length && buffer[r_pop].opcode == _POP_TOP_NOP &&
+                    (rv != v || r_off != offset || r_slot != is_slot))
+                {
+                    rhs_ok = true;
+                    if (r_slot && (buffer[r2].operand0 >> 13) == 2) {
+                        rhs_slot_idx = r2;
+                    }
+                    b = NEXT_ACT_IDX(r_pop + 1);
+                }
+                else {
+                    rhs_ok = false;
+                }
+            }
+        }
+        if (!rhs_ok) {
+            continue;
+        }
+        while (b < length &&
+               (buffer[b].opcode == _GUARD_TOS_FLOAT ||
+                buffer[b].opcode == _GUARD_NOS_FLOAT))
+        {
+            b = NEXT_ACT_IDX(b + 1);
+        }
+        if (b >= length ||
+            (buffer[b].opcode != _BINARY_OP_ADD_FLOAT &&
+             buffer[b].opcode != _BINARY_OP_SUBTRACT_FLOAT &&
+             buffer[b].opcode != _BINARY_OP_MULTIPLY_FLOAT))
+        {
+            continue;
+        }
+        int b_pop1 = NEXT_ACT_IDX(b + 1);
+        int b_pop2 = NEXT_ACT_IDX(b_pop1 + 1);
+        if (b_pop2 >= length ||
+            (buffer[b_pop1].opcode != _POP_TOP_NOP &&
+             buffer[b_pop1].opcode != _POP_TOP_FLOAT) ||
+            buffer[b_pop2].opcode != _POP_TOP_FLOAT)
+        {
+            continue;
+        }
+        int s = NEXT_ACT_IDX(b_pop2 + 1);
+        if (s >= length) {
+            continue;
+        }
+        uint16_t sop = buffer[s].opcode;
+        int sv = -1;
+        if (sop == _LOAD_FAST || sop == _LOAD_FAST_BORROW) {
+            sv = (int)buffer[s].oparg;
+        }
+        else if (sop >= _LOAD_FAST_0 && sop <= _LOAD_FAST_7) {
+            sv = (int)(sop - _LOAD_FAST_0);
+        }
+        else if (sop >= _LOAD_FAST_BORROW_0 && sop <= _LOAD_FAST_BORROW_7) {
+            sv = (int)(sop - _LOAD_FAST_BORROW_0);
+        }
+        if (sv != v) {
+            continue;
+        }
+        int s_next = NEXT_ACT_IDX(s + 1);
+        int st = s_next;
+        while (st < length &&
+               (buffer[st].opcode == _LOCK_OBJECT ||
+                buffer[st].opcode == _GUARD_TYPE_VERSION ||
+                buffer[st].opcode == _GUARD_TYPE_VERSION_LOCKED ||
+                buffer[st].opcode == _GUARD_DORV_NO_DICT))
+        {
+            st = NEXT_ACT_IDX(st + 1);
+        }
+        uint16_t exp_store = is_slot ? _STORE_ATTR_SLOT : _STORE_ATTR_INSTANCE_VALUE;
+        if (st < length && buffer[st].opcode == exp_store) {
+            uint64_t st_off = is_slot ? (buffer[st].operand0 & 0x1FFF) : buffer[st].operand0;
+            if (st_off == offset) {
+                int st_pop = NEXT_ACT_IDX(st + 1);
+                bool s_borrowed = (sop == _LOAD_FAST_BORROW ||
+                                   (sop >= _LOAD_FAST_BORROW_0 && sop <= _LOAD_FAST_BORROW_7));
+                if (is_slot && (buffer[j].operand0 >> 13) == 2 &&
+                    s_next == st && s_borrowed &&
+                    st_pop < length && buffer[st_pop].opcode == _POP_TOP_NOP)
+                {
+                    buffer[j].oparg = 255;
+                    if (rhs_slot_idx >= 0 && buffer[b_pop1].opcode == _POP_TOP_FLOAT) {
+                        buffer[rhs_slot_idx].oparg = 254;
+                        buffer[b_pop1].opcode = _POP_TOP_NOP;
+                    }
+                    if (buffer[b].opcode == _BINARY_OP_ADD_FLOAT) {
+                        buffer[b].opcode = _BINARY_OP_ADD_FLOAT_INPLACE;
+                    }
+                    else if (buffer[b].opcode == _BINARY_OP_SUBTRACT_FLOAT) {
+                        buffer[b].opcode = _BINARY_OP_SUBTRACT_FLOAT_INPLACE;
+                    }
+                    else {
+                        buffer[b].opcode = _BINARY_OP_MULTIPLY_FLOAT_INPLACE;
+                    }
+                    buffer[b_pop2].opcode = _POP_TOP_NOP;
+                    buffer[s].opcode = _POP_TOP_NOP;
+                    buffer[s].oparg = 0;
+                    buffer[s].operand0 = 0;
+                    buffer[st].opcode = _NOP;
+                    buffer[st_pop].opcode = _NOP;
+                }
+                else {
+                    buffer[b].oparg = 255;
+                    buffer[st].oparg = 255;
+                }
+            }
+        }
+    }
+
+    /* Second sub-pass: fuse float FMA patterns:
+     * (1) Temp accumulator FMA:
+     *     acc_op + 2 pops +
+     *     load_a + load_b + _BINARY_OP_MULTIPLY_FLOAT + 2 pops +
+     *     _BINARY_OP_{ADD,SUBTRACT}_FLOAT_INPLACE + _POP_TOP_FLOAT + _POP_TOP_NOP
+     * (2) Attribute accumulator FMA:
+     *     self.attr = self.attr +/- (a * b)
+     *     where self.attr is loaded on stack, followed by 1 or 2 loads +
+     *     _BINARY_OP_MULTIPLY_FLOAT[_INPLACE[_RIGHT]] + 2 pops +
+     *     _BINARY_OP_{ADD,SUBTRACT}_FLOAT[_INPLACE_RIGHT] + 2 pops + store to same self.attr.
+     */
+    for (int i = 0; i < length; i++) {
+        uint16_t op = buffer[i].opcode;
+        if (op == _BINARY_OP_MULTIPLY_FLOAT || op == _BINARY_OP_MULTIPLY_FLOAT_INPLACE) {
+            int p1 = NEXT_ACT_IDX(i + 1);
+            int p2 = NEXT_ACT_IDX(p1 + 1);
+            int add_idx = NEXT_ACT_IDX(p2 + 1);
+            if (add_idx < length &&
+                (buffer[p1].opcode == _POP_TOP_FLOAT || buffer[p1].opcode == _POP_TOP_NOP) &&
+                (buffer[p2].opcode == _POP_TOP_FLOAT || buffer[p2].opcode == _POP_TOP_NOP) &&
+                (buffer[add_idx].opcode == _BINARY_OP_ADD_FLOAT_INPLACE ||
+                 buffer[add_idx].opcode == _BINARY_OP_SUBTRACT_FLOAT_INPLACE))
+            {
+                int ap1 = NEXT_ACT_IDX(add_idx + 1);
+                int ap2 = NEXT_ACT_IDX(ap1 + 1);
+                if (ap2 < length &&
+                    buffer[ap1].opcode == _POP_TOP_FLOAT &&
+                    buffer[ap2].opcode == _POP_TOP_NOP)
+                {
+                    int is_sub = (buffer[add_idx].opcode == _BINARY_OP_SUBTRACT_FLOAT_INPLACE) ? 1 : 0;
+                    buffer[i].opcode = _BINARY_OP_FMA_FLOAT_INPLACE;
+                    buffer[i].oparg = is_sub;
+                    if (op == _BINARY_OP_MULTIPLY_FLOAT_INPLACE) {
+                        buffer[p1].opcode = _POP_TOP_FLOAT;
+                    }
+                    buffer[add_idx].opcode = _NOP;
+                    buffer[ap1].opcode = _NOP;
+                    buffer[ap2].opcode = _NOP;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < length; i++) {
+        uint16_t op = buffer[i].opcode;
+        int v = -1;
+        if (op == _LOAD_FAST || op == _LOAD_FAST_BORROW) {
+            v = (int)buffer[i].oparg;
+        }
+        else if (op >= _LOAD_FAST_0 && op <= _LOAD_FAST_7) {
+            v = (int)(op - _LOAD_FAST_0);
+        }
+        else if (op >= _LOAD_FAST_BORROW_0 && op <= _LOAD_FAST_BORROW_7) {
+            v = (int)(op - _LOAD_FAST_BORROW_0);
+        }
+        if (v < 0) {
+            continue;
+        }
+        int j = NEXT_ACT_IDX(i + 1);
+        while (j < length &&
+               (buffer[j].opcode == _GUARD_TYPE_VERSION ||
+                buffer[j].opcode == _GUARD_TYPE ||
+                buffer[j].opcode == _CHECK_FUNCTION_VERSION_INLINE ||
+                buffer[j].opcode == _CHECK_MANAGED_OBJECT_HAS_VALUES ||
+                buffer[j].opcode == _GUARD_DORV_NO_DICT))
+        {
+            j = NEXT_ACT_IDX(j + 1);
+        }
+        if (j >= length ||
+            (buffer[j].opcode != _LOAD_ATTR_SLOT &&
+             buffer[j].opcode != _LOAD_ATTR_INSTANCE_VALUE))
+        {
+            continue;
+        }
+        bool is_slot = (buffer[j].opcode == _LOAD_ATTR_SLOT);
+        uint64_t offset = is_slot ? (buffer[j].operand0 & 0x1FFF) : buffer[j].operand0;
+        int j_pop = NEXT_ACT_IDX(j + 1);
+        if (j_pop >= length || buffer[j_pop].opcode != _POP_TOP_NOP) {
+            continue;
+        }
+        /* Scan forward up to 14 instructions for a multiplication followed immediately
+         * by _BINARY_OP_{ADD,SUBTRACT}_FLOAT[_INPLACE_RIGHT] and store back to the same (v, offset).
+         * Ensure none of the intermediate loads alias (v, offset). */
+        int cur = NEXT_ACT_IDX(j_pop + 1);
+        int mul_idx = -1;
+        bool safe_rhs = true;
+        int steps = 0;
+        while (cur < length && steps < 14) {
+            uint16_t cop = buffer[cur].opcode;
+            if (cop == _LOAD_ATTR_SLOT || cop == _LOAD_ATTR_INSTANCE_VALUE) {
+                bool c_slot = (cop == _LOAD_ATTR_SLOT);
+                uint64_t c_off = c_slot ? (buffer[cur].operand0 & 0x1FFF) : buffer[cur].operand0;
+                if (c_slot == is_slot && c_off == offset) {
+                    /* Could alias self.attr if loaded from same local v */
+                    safe_rhs = false;
+                    break;
+                }
+            }
+            if (cop == _BINARY_OP_MULTIPLY_FLOAT ||
+                cop == _BINARY_OP_MULTIPLY_FLOAT_INPLACE ||
+                cop == _BINARY_OP_MULTIPLY_FLOAT_INPLACE_RIGHT)
+            {
+                int mp1 = NEXT_ACT_IDX(cur + 1);
+                int mp2 = NEXT_ACT_IDX(mp1 + 1);
+                int nx = NEXT_ACT_IDX(mp2 + 1);
+                while (nx < length &&
+                       (buffer[nx].opcode == _GUARD_TOS_FLOAT ||
+                        buffer[nx].opcode == _GUARD_NOS_FLOAT))
+                {
+                    nx = NEXT_ACT_IDX(nx + 1);
+                }
+                if (nx < length &&
+                    (buffer[nx].opcode == _BINARY_OP_ADD_FLOAT ||
+                     buffer[nx].opcode == _BINARY_OP_SUBTRACT_FLOAT ||
+                     buffer[nx].opcode == _BINARY_OP_ADD_FLOAT_INPLACE_RIGHT ||
+                     buffer[nx].opcode == _BINARY_OP_SUBTRACT_FLOAT_INPLACE_RIGHT))
+                {
+                    mul_idx = cur;
+                    break;
+                }
+            }
+            else if (cop == _SWAP_FAST || (cop >= _SWAP_FAST_0 && cop <= _SWAP_FAST_7) ||
+                     cop == _STORE_ATTR_SLOT || cop == _STORE_ATTR_INSTANCE_VALUE ||
+                     cop == _PUSH_FRAME || cop == _RETURN_VALUE)
+            {
+                safe_rhs = false;
+                break;
+            }
+            cur = NEXT_ACT_IDX(cur + 1);
+            steps++;
+        }
+        if (!safe_rhs || mul_idx < 0) {
+            continue;
+        }
+        int mp1 = NEXT_ACT_IDX(mul_idx + 1);
+        int mp2 = NEXT_ACT_IDX(mp1 + 1);
+        int b = NEXT_ACT_IDX(mp2 + 1);
+        while (b < length &&
+               (buffer[b].opcode == _GUARD_TOS_FLOAT ||
+                buffer[b].opcode == _GUARD_NOS_FLOAT))
+        {
+            buffer[b].opcode = _NOP;
+            b = NEXT_ACT_IDX(b + 1);
+        }
+        if (b >= length ||
+            (buffer[b].opcode != _BINARY_OP_ADD_FLOAT &&
+             buffer[b].opcode != _BINARY_OP_SUBTRACT_FLOAT &&
+             buffer[b].opcode != _BINARY_OP_ADD_FLOAT_INPLACE_RIGHT &&
+             buffer[b].opcode != _BINARY_OP_SUBTRACT_FLOAT_INPLACE_RIGHT))
+        {
+            continue;
+        }
+        int bp1 = NEXT_ACT_IDX(b + 1);
+        int bp2 = NEXT_ACT_IDX(bp1 + 1);
+        if (bp2 >= length ||
+            (buffer[bp1].opcode != _POP_TOP_FLOAT && buffer[bp1].opcode != _POP_TOP_NOP) ||
+            buffer[bp2].opcode != _POP_TOP_FLOAT)
+        {
+            continue;
+        }
+        int s = NEXT_ACT_IDX(bp2 + 1);
+        if (s >= length) {
+            continue;
+        }
+        uint16_t sop = buffer[s].opcode;
+        int sv = -1;
+        if (sop == _LOAD_FAST || sop == _LOAD_FAST_BORROW) {
+            sv = (int)buffer[s].oparg;
+        }
+        else if (sop >= _LOAD_FAST_0 && sop <= _LOAD_FAST_7) {
+            sv = (int)(sop - _LOAD_FAST_0);
+        }
+        else if (sop >= _LOAD_FAST_BORROW_0 && sop <= _LOAD_FAST_BORROW_7) {
+            sv = (int)(sop - _LOAD_FAST_BORROW_0);
+        }
+        if (sv != v) {
+            continue;
+        }
+        int s_next = NEXT_ACT_IDX(s + 1);
+        int st = s_next;
+        while (st < length &&
+               (buffer[st].opcode == _LOCK_OBJECT ||
+                buffer[st].opcode == _GUARD_TYPE_VERSION ||
+                buffer[st].opcode == _GUARD_TYPE_VERSION_LOCKED ||
+                buffer[st].opcode == _GUARD_DORV_NO_DICT))
+        {
+            st = NEXT_ACT_IDX(st + 1);
+        }
+        uint16_t exp_store = is_slot ? _STORE_ATTR_SLOT : _STORE_ATTR_INSTANCE_VALUE;
+        if (st < length && buffer[st].opcode == exp_store) {
+            uint64_t st_off = is_slot ? (buffer[st].operand0 & 0x1FFF) : buffer[st].operand0;
+            if (st_off == offset) {
+                int is_sub = (buffer[b].opcode == _BINARY_OP_SUBTRACT_FLOAT ||
+                              buffer[b].opcode == _BINARY_OP_SUBTRACT_FLOAT_INPLACE_RIGHT) ? 1 : 0;
+                uint16_t old_mul = buffer[mul_idx].opcode;
+                buffer[mul_idx].opcode = _BINARY_OP_FMA_FLOAT_INPLACE;
+                if (old_mul == _BINARY_OP_MULTIPLY_FLOAT_INPLACE) {
+                    buffer[mp1].opcode = _POP_TOP_FLOAT;
+                }
+                else if (old_mul == _BINARY_OP_MULTIPLY_FLOAT_INPLACE_RIGHT) {
+                    buffer[mp2].opcode = _POP_TOP_FLOAT;
+                }
+                buffer[b].opcode = _NOP;
+                buffer[bp1].opcode = _NOP;
+                buffer[bp2].opcode = _NOP;
+                int st_pop = NEXT_ACT_IDX(st + 1);
+                bool s_borrowed = (sop == _LOAD_FAST_BORROW ||
+                                   (sop >= _LOAD_FAST_BORROW_0 && sop <= _LOAD_FAST_BORROW_7));
+                if (is_slot && (buffer[j].operand0 >> 13) == 2 &&
+                    s_next == st && s_borrowed &&
+                    st_pop < length && buffer[st_pop].opcode == _POP_TOP_NOP)
+                {
+                    buffer[j].oparg = 255;
+                    buffer[mul_idx].oparg = 4 | is_sub;
+                    buffer[s].opcode = _POP_TOP_NOP;
+                    buffer[s].oparg = 0;
+                    buffer[s].operand0 = 0;
+                    buffer[st].opcode = _NOP;
+                    buffer[st_pop].opcode = _NOP;
+                }
+                else {
+                    buffer[mul_idx].oparg = 2 | is_sub;
+                    buffer[st].oparg = 255;
+                }
+            }
+        }
+    }
+
+    /* Fourth sub-pass: convert remaining read-only @struct int/float slot loads
+     * (_LOAD_ATTR_SLOT with oparg == 0 and strict_tag == 1 or 2) that are immediately
+     * consumed by a non-escaping float/int binary/compare op or FMA into borrowed slot loads
+     * (oparg = 254) and turn their corresponding _POP_TOP_FLOAT/_POP_TOP_INT into _POP_TOP_NOP. */
+    for (int i = 0; i < length; i++) {
+        uint16_t slot_tag = (uint16_t)(buffer[i].operand0 >> 13);
+        if (buffer[i].opcode != _LOAD_ATTR_SLOT ||
+            buffer[i].oparg != 0 ||
+            (slot_tag != 1 && slot_tag != 2))
+        {
+            continue;
+        }
+        int i_pop = NEXT_ACT_IDX(i + 1);
+        if (i_pop >= length || buffer[i_pop].opcode != _POP_TOP_NOP) {
+            continue;
+        }
+        int rel_sp = 1;
+        int cur = NEXT_ACT_IDX(i_pop + 1);
+        int steps = 0;
+        while (cur < length && steps < 12 && rel_sp >= 1) {
+            uint16_t cop = buffer[cur].opcode;
+            if (cop == _LOAD_FAST_BORROW || cop == _LOAD_FAST ||
+                (cop >= _LOAD_FAST_BORROW_0 && cop <= _LOAD_FAST_BORROW_7) ||
+                (cop >= _LOAD_FAST_0 && cop <= _LOAD_FAST_7) ||
+                cop == _LOAD_CONST_INLINE_BORROW || cop == _LOAD_CONST_INLINE)
+            {
+                rel_sp++;
+            }
+            else if (cop == _GUARD_TYPE_VERSION || cop == _GUARD_TYPE ||
+                     cop == _CHECK_FUNCTION_VERSION_INLINE ||
+                     cop == _GUARD_TOS_FLOAT || cop == _GUARD_NOS_FLOAT ||
+                     cop == _GUARD_TOS_INT || cop == _GUARD_NOS_INT ||
+                     cop == _GUARD_BINARY_OP_EXTEND ||
+                     cop == _GUARD_BINARY_OP_EXTEND_LHS ||
+                     cop == _GUARD_BINARY_OP_EXTEND_RHS ||
+                     cop == _CHECK_MANAGED_OBJECT_HAS_VALUES || cop == _GUARD_DORV_NO_DICT)
+            {
+                /* stack depth unchanged */
+            }
+            else if (cop == _LOAD_ATTR_SLOT || cop == _LOAD_ATTR_INSTANCE_VALUE) {
+                int c_pop = NEXT_ACT_IDX(cur + 1);
+                if (c_pop >= length || buffer[c_pop].opcode != _POP_TOP_NOP) {
+                    break;
+                }
+                cur = c_pop;
+            }
+            else if (rel_sp == 1 &&
+                     (cop == _BINARY_OP_ADD_FLOAT ||
+                      cop == _BINARY_OP_SUBTRACT_FLOAT ||
+                      cop == _BINARY_OP_MULTIPLY_FLOAT ||
+                      cop == _BINARY_OP_TRUEDIV_FLOAT ||
+                      cop == _BINARY_OP_ADD_FLOAT_INPLACE ||
+                      cop == _BINARY_OP_SUBTRACT_FLOAT_INPLACE ||
+                      cop == _BINARY_OP_MULTIPLY_FLOAT_INPLACE ||
+                      cop == _BINARY_OP_TRUEDIV_FLOAT_INPLACE ||
+                      cop == _BINARY_OP_FMA_FLOAT_INPLACE ||
+                      cop == _BINARY_OP_BITWISE_INT ||
+                      cop == _BINARY_OP_ARITH_FLOAT_INT ||
+                      cop == _BINARY_OP_EXTEND ||
+                      cop == _COMPARE_OP_FLOAT ||
+                      cop == _COMPARE_OP_INT))
+            {
+                int p1 = NEXT_ACT_IDX(cur + 1);
+                if (p1 < length &&
+                    (buffer[p1].opcode == _POP_TOP_FLOAT ||
+                     buffer[p1].opcode == _POP_TOP_INT))
+                {
+                    buffer[i].oparg = 254;
+                    buffer[p1].opcode = _POP_TOP_NOP;
+                }
+                break;
+            }
+            else if (rel_sp == 2 &&
+                     (cop == _BINARY_OP_ADD_FLOAT ||
+                      cop == _BINARY_OP_SUBTRACT_FLOAT ||
+                      cop == _BINARY_OP_MULTIPLY_FLOAT ||
+                      cop == _BINARY_OP_TRUEDIV_FLOAT ||
+                      cop == _BINARY_OP_ADD_FLOAT_INPLACE_RIGHT ||
+                      cop == _BINARY_OP_SUBTRACT_FLOAT_INPLACE_RIGHT ||
+                      cop == _BINARY_OP_MULTIPLY_FLOAT_INPLACE_RIGHT ||
+                      cop == _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT ||
+                      cop == _BINARY_OP_FMA_FLOAT_INPLACE ||
+                      cop == _BINARY_OP_BITWISE_INT ||
+                      cop == _BINARY_OP_ARITH_FLOAT_INT ||
+                      cop == _BINARY_OP_EXTEND ||
+                      cop == _COMPARE_OP_FLOAT ||
+                      cop == _COMPARE_OP_INT))
+            {
+                int p1 = NEXT_ACT_IDX(cur + 1);
+                int p2 = NEXT_ACT_IDX(p1 + 1);
+                if (p2 < length &&
+                    (buffer[p2].opcode == _POP_TOP_FLOAT ||
+                     buffer[p2].opcode == _POP_TOP_INT))
+                {
+                    buffer[i].oparg = 254;
+                    buffer[p2].opcode = _POP_TOP_NOP;
+                }
+                break;
+            }
+            else {
+                break;
+            }
+            cur = NEXT_ACT_IDX(cur + 1);
+            steps++;
+        }
+    }
+
+    /* Deduplicate oparg == 255 (ensure-unique float slot loads) on the same
+     * (owner_var, offset) once uniqueness is already established earlier in the
+     * trace or loop iteration without any intervening strong reference load or store. */
+    {
+        bool written_in_trace[64] = {0};
+        for (int i = 0; i < length; i++) {
+            uint16_t op = buffer[i].opcode;
+            int wv = -1;
+            if (op == _SWAP_FAST || op == _LOAD_FAST_AND_CLEAR) {
+                wv = (int)buffer[i].oparg;
+            }
+            else if (op >= _SWAP_FAST_0 && op <= _SWAP_FAST_7) {
+                wv = (int)(op - _SWAP_FAST_0);
+            }
+            if (wv >= 0 && wv < 64) {
+                written_in_trace[wv] = true;
+            }
+        }
+        struct {
+            int owner_var;
+            uint64_t offset;
+            bool active;
+        } unique_slots[32];
+        int num_unique = 0;
+        int prev_owner_v = -1;
+        for (int i = 0; i < length; i++) {
+            uint16_t op = buffer[i].opcode;
+            if (op == _NOP || op == _SET_IP || op == _CHECK_VALIDITY ||
+                op == _GUARD_TYPE_VERSION || op == _GUARD_TYPE ||
+                op == _CHECK_FUNCTION_VERSION_INLINE ||
+                op == _CHECK_MANAGED_OBJECT_HAS_VALUES ||
+                op == _GUARD_DORV_NO_DICT)
+            {
+                continue;
+            }
+            if (op == _LOAD_FAST || op == _LOAD_FAST_BORROW) {
+                prev_owner_v = (int)buffer[i].oparg;
+                continue;
+            }
+            if (op >= _LOAD_FAST_0 && op <= _LOAD_FAST_7) {
+                prev_owner_v = (int)(op - _LOAD_FAST_0);
+                continue;
+            }
+            if (op >= _LOAD_FAST_BORROW_0 && op <= _LOAD_FAST_BORROW_7) {
+                prev_owner_v = (int)(op - _LOAD_FAST_BORROW_0);
+                continue;
+            }
+            if (op == _MAKE_WARM) {
+                for (int u = 0; u < num_unique; u++) {
+                    if (!unique_slots[u].active) {
+                        continue;
+                    }
+                    if (unique_slots[u].owner_var >= 0 &&
+                        unique_slots[u].owner_var < 64 &&
+                        written_in_trace[unique_slots[u].owner_var])
+                    {
+                        unique_slots[u].active = false;
+                        continue;
+                    }
+                    for (int k = i + 1; k < length; k++) {
+                        if (buffer[k].opcode == _STORE_ATTR_SLOT &&
+                            (buffer[k].operand0 & 0x1FFF) == unique_slots[u].offset)
+                        {
+                            unique_slots[u].active = false;
+                            break;
+                        }
+                        if (buffer[k].opcode == _LOAD_ATTR_SLOT &&
+                            buffer[k].oparg == 0 &&
+                            (buffer[k].operand0 & 0x1FFF) == unique_slots[u].offset)
+                        {
+                            unique_slots[u].active = false;
+                            break;
+                        }
+                    }
+                }
+                prev_owner_v = -1;
+                continue;
+            }
+            int wv = -1;
+            if (op == _SWAP_FAST || op == _LOAD_FAST_AND_CLEAR) {
+                wv = (int)buffer[i].oparg;
+            }
+            else if (op >= _SWAP_FAST_0 && op <= _SWAP_FAST_7) {
+                wv = (int)(op - _SWAP_FAST_0);
+            }
+            if (wv >= 0) {
+                for (int u = 0; u < num_unique; u++) {
+                    if (unique_slots[u].owner_var == wv) {
+                        unique_slots[u].active = false;
+                    }
+                }
+                prev_owner_v = -1;
+                continue;
+            }
+            if (op == _LOAD_ATTR_SLOT) {
+                uint64_t off = buffer[i].operand0 & 0x1FFF;
+                if (buffer[i].oparg == 0) {
+                    for (int u = 0; u < num_unique; u++) {
+                        if (unique_slots[u].offset == off) {
+                            unique_slots[u].active = false;
+                        }
+                    }
+                }
+                else if (buffer[i].oparg == 255 && prev_owner_v >= 0) {
+                    bool already_unique = false;
+                    for (int u = 0; u < num_unique; u++) {
+                        if (unique_slots[u].active &&
+                            unique_slots[u].owner_var == prev_owner_v &&
+                            unique_slots[u].offset == off)
+                        {
+                            already_unique = true;
+                            break;
+                        }
+                    }
+                    if (already_unique) {
+                        buffer[i].oparg = 254;
+                    }
+                    else if (num_unique < 32) {
+                        unique_slots[num_unique].owner_var = prev_owner_v;
+                        unique_slots[num_unique].offset = off;
+                        unique_slots[num_unique].active = true;
+                        num_unique++;
+                    }
+                }
+                prev_owner_v = -1;
+                continue;
+            }
+            if (op == _STORE_ATTR_SLOT) {
+                uint64_t off = buffer[i].operand0 & 0x1FFF;
+                for (int u = 0; u < num_unique; u++) {
+                    if (unique_slots[u].offset == off) {
+                        unique_slots[u].active = false;
+                    }
+                }
+                prev_owner_v = -1;
+                continue;
+            }
+            if (op == _PUSH_FRAME || op == _RETURN_VALUE ||
+                ((_PyUop_Flags[op] & HAS_ESCAPES_FLAG) &&
+                 op != _CHECK_PERIODIC &&
+                 op != _CHECK_PERIODIC_IF_NOT_YIELD_FROM &&
+                 op != _TIER2_RESUME_CHECK &&
+                 op != _POP_TOP &&
+                 op != _POP_TOP_FLOAT &&
+                 op != _POP_TOP_INT))
+            {
+                num_unique = 0;
+            }
+            prev_owner_v = -1;
+        }
+    }
+
+    /* Fifth sub-pass: fuse @struct _LOAD_ATTR_SLOT (oparg == 254) + _POP_TOP_NOP
+     * into _LOAD_ATTR_SLOT_NO_POP + _NOP so stack effect is (1 -- 1) instead of
+     * (1 -- 2), avoiding _SPILL_OR_RELOAD at stack depth 3 and _POP_TOP_NOP,
+     * and executing a single inline pointer load in the JIT/interpreter.
+     */
+    for (int i = 0; i < length; i++) {
+        if (buffer[i].opcode != _LOAD_ATTR_SLOT) {
+            continue;
+        }
+        if ((buffer[i].operand0 >> 13) == 0 || buffer[i].oparg != 254) {
+            continue;
+        }
+        int p1 = NEXT_ACT_IDX(i + 1);
+        if ( p1 < length && buffer[p1].opcode == _POP_TOP_NOP) {
+            buffer[i].opcode = _LOAD_ATTR_SLOT_NO_POP;
+            buffer[i].oparg = (uint16_t)(buffer[i].operand0 >> 13);
+            buffer[i].operand0 &= 0x1FFF;
+            buffer[p1].opcode = _NOP;
+        }
+    }
+    #undef NEXT_ACT_IDX
 }
 
 static int
@@ -934,15 +1746,30 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             case _GUARD_NOS_UNICODE:
             case _GUARD_NOS_COMPACT_ASCII:
             case _GUARD_TYPE:
+            case _GUARD_NOS_TYPE:
+            case _GUARD_NOS_DICT_SUBSCRIPT:
             case _GUARD_TYPE_VERSION:
             case _CHECK_MANAGED_OBJECT_HAS_VALUES:
+            case _GUARD_GLOBALS_VERSION:
+            case _GUARD_BUILTINS_IS_CANONICAL:
+            case _CHECK_FUNCTION_VERSION_INLINE:
+            case _CHECK_STACK_SPACE_OPERAND:
+            case _CHECK_RECURSION_REMAINING:
                 type_guard_count++;
                 break;
             case _GUARD_BINARY_OP_SUBSCR_TUPLE_INT_BOUNDS:
+            case _GUARD_BINARY_OP_EXTEND:
+            case _GUARD_BINARY_OP_EXTEND_LHS:
+            case _GUARD_BINARY_OP_EXTEND_RHS:
             case _BINARY_OP_SUBSCR_LIST_INT:
             case _BINARY_OP_SUBSCR_TUPLE_INT:
+            case _BINARY_OP_SUBSCR_DICT_KNOWN_HASH:
+            case _BINARY_OP_SUBSCR_DICT:
             case _LOAD_ATTR_INSTANCE_VALUE:
             case _LOAD_ATTR_SLOT:
+            case _LOAD_ATTR_SLOT_NO_POP:
+            case _LOCK_OBJECT:
+            case _GUARD_DORV_NO_DICT:
                 break;
             case _LOAD_FAST:
             case _LOAD_FAST_BORROW:
@@ -1014,12 +1841,19 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             case _BINARY_OP_TRUEDIV_FLOAT:
             case _BINARY_OP_TRUEDIV_FLOAT_INPLACE:
             case _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT:
+            case _BINARY_OP_FMA_FLOAT_INPLACE:
+            case _BINARY_OP_BITWISE_INT:
+            case _BINARY_OP_ARITH_FLOAT_INT:
+            case _BINARY_OP_EXTEND:
                 has_arith_binop = true;
                 break;
             case _LIST_APPEND:
             case _SET_ADD:
                 has_comp_append = true;
                 break;
+            case _STORE_SUBSCR_LIST_INT:
+            case _STORE_ATTR_INSTANCE_VALUE:
+            case _STORE_ATTR_SLOT:
             case _SET_IP:
             case _CHECK_PERIODIC:
             case _CHECK_PERIODIC_IF_NOT_YIELD_FROM:
@@ -1060,17 +1894,17 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
     }
 
     /* Try Pre-Header guard peeling for arithmetic, container-indexing,
-     * list/tuple-iteration, and attribute-reading loops where loop-invariant
-     * or inductive local guards can be hoisted to Iteration 1. */
+     * list/tuple-iteration, and attribute-reading/writing loops where
+     * loop-invariant or inductive local guards can be hoisted to Iteration 1. */
     if (can_peel_body &&
         (has_arith_binop || has_comp_append) &&
         type_guard_count > 0 &&
-        pop_top_count <= 2 &&
-        non_nop_count <= 64 &&
+        pop_top_count <= 8 &&
+        non_nop_count <= 256 &&
         !(has_iter_check && has_compare_op) &&
         length + non_nop_count <= UOP_MAX_TRACE_LENGTH)
     {
-        _PyUOpInstruction body[64];
+        _PyUOpInstruction body[256];
         int b_len = 0;
         for (int i = 2; i < length - 1; i++) {
             if (output[i].opcode != _NOP) {
@@ -1084,29 +1918,54 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             VAL_FLOAT = 2,
             VAL_ITER_ITEM = 3,
         };
+        typedef struct {
+            int owner_var;
+            uint64_t offset;
+            bool is_slot;
+            int cur_type;
+            bool seen_write;
+            bool entry_guarded;
+            bool all_stores_int;
+            bool all_stores_float;
+            int load_count;
+            int store_count;
+        } AttrSlotInfo;
+        AttrSlotInfo attr_slots[32];
+        int num_attr_slots = 0;
+        int attr_owner_var = -1;
+        bool attr_tracking_valid = true;
+
         int stk_type[64];
         int stk_var[64];
         bool stk_entry[64];
+        int stk_attr[64];
+        bool stk_attr_entry[64];
         int sp = 0;
         bool seen_write[64] = {0};
+        bool var_copied[64] = {0};
         int cur_var_type[64] = {0};
         bool all_stores_int[64];
         bool all_stores_float[64];
         for (int v = 0; v < 64; v++) {
             all_stores_int[v] = true;
             all_stores_float[v] = true;
+            stk_attr[v] = -1;
+            stk_attr_entry[v] = false;
         }
 
         /* guard_kind[i]:
          *   0 = not a hoistable guard
-         *   1 = iterator check (_ITER_CHECK_{RANGE,LIST,TUPLE})
+         *   1 = iterator/version check (_ITER_CHECK_*, _GUARD_GLOBALS_VERSION, etc.)
          *   2 = int guard on entry value of local guard_var[i] (or proven int if -2)
          *   3 = float guard on entry value of local guard_var[i] (or proven float if -2)
          *   4 = invariant local guard (container/type/managed-values) on guard_var[i]
+         *   5 = int guard on entry value of attribute slot attr_slots[guard_var[i]]
+         *   6 = float guard on entry value of attribute slot attr_slots[guard_var[i]]
+         *   7 = _GUARD_DORV_NO_DICT on invariant receiver local guard_var[i]
          */
-        int guard_kind[64] = {0};
-        int guard_var[64];
-        for (int i = 0; i < 64; i++) {
+        int guard_kind[256] = {0};
+        int guard_var[256];
+        for (int i = 0; i < 256; i++) {
             guard_var[i] = -1;
         }
         bool body_valid = true;
@@ -1118,6 +1977,11 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _ITER_CHECK_RANGE:
                 case _ITER_CHECK_LIST:
                 case _ITER_CHECK_TUPLE:
+                case _GUARD_GLOBALS_VERSION:
+                case _GUARD_BUILTINS_IS_CANONICAL:
+                case _CHECK_FUNCTION_VERSION_INLINE:
+                case _CHECK_STACK_SPACE_OPERAND:
+                case _CHECK_RECURSION_REMAINING:
                     guard_kind[i] = 1;
                     break;
                 case _SET_IP:
@@ -1135,6 +1999,8 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     stk_type[sp] = VAL_INT;
                     stk_var[sp] = -1;
                     stk_entry[sp] = false;
+                    stk_attr[sp] = -1;
+                    stk_attr_entry[sp] = false;
                     sp++;
                     break;
                 case _ITER_NEXT_LIST:
@@ -1144,6 +2010,8 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     stk_type[sp] = VAL_ITER_ITEM;
                     stk_var[sp] = -1;
                     stk_entry[sp] = false;
+                    stk_attr[sp] = -1;
+                    stk_attr_entry[sp] = false;
                     sp++;
                     break;
                 case _LOAD_FAST:
@@ -1178,6 +2046,8 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     stk_type[sp] = cur_var_type[v];
                     stk_var[sp] = v;
                     stk_entry[sp] = !seen_write[v];
+                    stk_attr[sp] = -1;
+                    stk_attr_entry[sp] = false;
                     sp++;
                     break;
                 }
@@ -1186,6 +2056,8 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     stk_type[sp] = VAL_INT;
                     stk_var[sp] = -1;
                     stk_entry[sp] = false;
+                    stk_attr[sp] = -1;
+                    stk_attr_entry[sp] = false;
                     sp++;
                     break;
                 case _LOAD_CONST_INLINE:
@@ -1203,6 +2075,8 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     }
                     stk_var[sp] = -1;
                     stk_entry[sp] = false;
+                    stk_attr[sp] = -1;
+                    stk_attr_entry[sp] = false;
                     sp++;
                     break;
                 }
@@ -1218,12 +2092,26 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                         guard_kind[i] = 2;
                         guard_var[i] = stk_var[idx];
                     }
+                    else if (attr_tracking_valid && stk_attr_entry[idx] && stk_attr[idx] >= 0) {
+                        guard_kind[i] = 5;
+                        guard_var[i] = stk_attr[idx];
+                        attr_slots[stk_attr[idx]].entry_guarded = true;
+                    }
                     stk_type[idx] = VAL_INT;
                     if (stk_var[idx] >= 0) {
                         int v = stk_var[idx];
                         cur_var_type[v] = VAL_INT;
                         for (int s = 0; s < sp; s++) {
                             if (stk_var[s] == v) {
+                                stk_type[s] = VAL_INT;
+                            }
+                        }
+                    }
+                    if (stk_attr[idx] >= 0) {
+                        int a = stk_attr[idx];
+                        attr_slots[a].cur_type = VAL_INT;
+                        for (int s = 0; s < sp; s++) {
+                            if (stk_attr[s] == a) {
                                 stk_type[s] = VAL_INT;
                             }
                         }
@@ -1242,12 +2130,26 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                         guard_kind[i] = 3;
                         guard_var[i] = stk_var[idx];
                     }
+                    else if (attr_tracking_valid && stk_attr_entry[idx] && stk_attr[idx] >= 0) {
+                        guard_kind[i] = 6;
+                        guard_var[i] = stk_attr[idx];
+                        attr_slots[stk_attr[idx]].entry_guarded = true;
+                    }
                     stk_type[idx] = VAL_FLOAT;
                     if (stk_var[idx] >= 0) {
                         int v = stk_var[idx];
                         cur_var_type[v] = VAL_FLOAT;
                         for (int s = 0; s < sp; s++) {
                             if (stk_var[s] == v) {
+                                stk_type[s] = VAL_FLOAT;
+                            }
+                        }
+                    }
+                    if (stk_attr[idx] >= 0) {
+                        int a = stk_attr[idx];
+                        attr_slots[a].cur_type = VAL_FLOAT;
+                        for (int s = 0; s < sp; s++) {
+                            if (stk_attr[s] == a) {
                                 stk_type[s] = VAL_FLOAT;
                             }
                         }
@@ -1271,37 +2173,257 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _GUARD_NOS_TUPLE:
                 case _GUARD_NOS_UNICODE:
                 case _GUARD_NOS_COMPACT_ASCII:
+                case _GUARD_NOS_TYPE:
+                case _GUARD_NOS_DICT_SUBSCRIPT:
                     if (sp < 2) { body_valid = false; break; }
                     if (stk_entry[sp - 2] && stk_var[sp - 2] >= 0 && !written[stk_var[sp - 2]]) {
                         guard_kind[i] = 4;
                         guard_var[i] = stk_var[sp - 2];
                     }
                     break;
+                case _LOCK_OBJECT:
+                    if (sp < 1) { body_valid = false; break; }
+                    break;
+                case _GUARD_DORV_NO_DICT:
+                    if (sp < 1) { body_valid = false; break; }
+                    if (stk_entry[sp - 1] && stk_var[sp - 1] >= 0 && !written[stk_var[sp - 1]]) {
+                        guard_kind[i] = 7;
+                        guard_var[i] = stk_var[sp - 1];
+                    }
+                    break;
+                case _GUARD_BINARY_OP_EXTEND:
+                case _GUARD_BINARY_OP_EXTEND_LHS:
+                case _GUARD_BINARY_OP_EXTEND_RHS:
+                    if (sp < 2) { body_valid = false; break; }
+                    break;
                 case _BINARY_OP_SUBSCR_LIST_INT:
                 case _BINARY_OP_SUBSCR_TUPLE_INT:
+                case _BINARY_OP_SUBSCR_DICT_KNOWN_HASH:
+                case _BINARY_OP_SUBSCR_DICT:
                     if (sp < 2 || sp >= 64) { body_valid = false; break; }
                     stk_type[sp - 2] = VAL_UNKNOWN;
                     stk_var[sp - 2] = -1;
                     stk_entry[sp - 2] = false;
+                    stk_attr[sp - 2] = -1;
+                    stk_attr_entry[sp - 2] = false;
                     stk_type[sp - 1] = VAL_UNKNOWN;
                     stk_var[sp - 1] = -1;
                     stk_entry[sp - 1] = false;
+                    stk_attr[sp - 1] = -1;
+                    stk_attr_entry[sp - 1] = false;
                     stk_type[sp] = VAL_UNKNOWN;
                     stk_var[sp] = -1;
                     stk_entry[sp] = false;
+                    stk_attr[sp] = -1;
+                    stk_attr_entry[sp] = false;
                     sp++;
                     break;
                 case _LOAD_ATTR_INSTANCE_VALUE:
-                case _LOAD_ATTR_SLOT:
+                case _LOAD_ATTR_SLOT: {
                     if (sp < 1 || sp >= 64) { body_valid = false; break; }
-                    stk_type[sp - 1] = VAL_UNKNOWN;
-                    stk_var[sp - 1] = -1;
-                    stk_entry[sp - 1] = false;
+                    bool is_slot = (op == _LOAD_ATTR_SLOT);
+                    uint64_t raw_offset = is_slot ? (inst->operand0 & 0x1FFF) : inst->operand0;
+                    int owner_v = stk_var[sp - 1];
+                    int a_idx = -1;
+                    if (attr_tracking_valid && owner_v >= 0 && !written[owner_v] && stk_entry[sp - 1]) {
+                        if (attr_owner_var < 0) {
+                            attr_owner_var = owner_v;
+                        }
+                        else if (attr_owner_var != owner_v && !(is_slot && (inst->operand0 >> 13) != 0)) {
+                            attr_tracking_valid = false;
+                        }
+                        if (attr_tracking_valid) {
+                            for (int a = 0; a < num_attr_slots; a++) {
+                                if (attr_slots[a].owner_var == owner_v &&
+                                    attr_slots[a].offset == raw_offset &&
+                                    attr_slots[a].is_slot == is_slot)
+                                {
+                                    a_idx = a;
+                                    break;
+                                }
+                            }
+                            if (a_idx < 0 && num_attr_slots < 32) {
+                                uint16_t strict_tag = is_slot ? (uint16_t)(inst->operand0 >> 13) : 0;
+                                a_idx = num_attr_slots++;
+                                attr_slots[a_idx].owner_var = owner_v;
+                                attr_slots[a_idx].offset = raw_offset;
+                                attr_slots[a_idx].is_slot = is_slot;
+                                attr_slots[a_idx].cur_type = (strict_tag == 1) ? VAL_INT :
+                                                             (strict_tag == 2) ? VAL_FLOAT : VAL_UNKNOWN;
+                                attr_slots[a_idx].seen_write = false;
+                                attr_slots[a_idx].entry_guarded = (strict_tag == 1 || strict_tag == 2);
+                                attr_slots[a_idx].all_stores_int = true;
+                                attr_slots[a_idx].all_stores_float = true;
+                                attr_slots[a_idx].load_count = 0;
+                                attr_slots[a_idx].store_count = 0;
+                            }
+                            else if (a_idx < 0) {
+                                attr_tracking_valid = false;
+                            }
+                        }
+                    }
+                    else if (!(is_slot && (inst->operand0 >> 13) != 0)) {
+                        attr_tracking_valid = false;
+                    }
+                    if (a_idx >= 0 && attr_tracking_valid) {
+                        attr_slots[a_idx].load_count++;
+                        stk_type[sp - 1] = attr_slots[a_idx].cur_type;
+                        stk_var[sp - 1] = -1;
+                        stk_entry[sp - 1] = false;
+                        stk_attr[sp - 1] = a_idx;
+                        stk_attr_entry[sp - 1] = !attr_slots[a_idx].seen_write;
+                    }
+                    else {
+                        uint16_t strict_tag = is_slot ? (uint16_t)(inst->operand0 >> 13) : 0;
+                        stk_type[sp - 1] = (strict_tag == 1) ? VAL_INT :
+                                           (strict_tag == 2) ? VAL_FLOAT : VAL_UNKNOWN;
+                        stk_var[sp - 1] = -1;
+                        stk_entry[sp - 1] = false;
+                        stk_attr[sp - 1] = -1;
+                        stk_attr_entry[sp - 1] = false;
+                    }
                     stk_type[sp] = VAL_UNKNOWN;
                     stk_var[sp] = -1;
                     stk_entry[sp] = false;
+                    stk_attr[sp] = -1;
+                    stk_attr_entry[sp] = false;
                     sp++;
                     break;
+                }
+                case _LOAD_ATTR_SLOT_NO_POP:
+                    if (sp < 1) { body_valid = false; break; }
+                    stk_type[sp - 1] = (inst->oparg == 1) ? VAL_INT : VAL_FLOAT;
+                    stk_var[sp - 1] = -1;
+                    stk_entry[sp - 1] = false;
+                    stk_attr[sp - 1] = -1;
+                    stk_attr_entry[sp - 1] = false;
+                    break;
+                case _STORE_SUBSCR_LIST_INT:
+                    if (sp < 3) { body_valid = false; break; }
+                    stk_type[sp - 3] = VAL_UNKNOWN;
+                    stk_var[sp - 3] = -1;
+                    stk_entry[sp - 3] = false;
+                    stk_attr[sp - 3] = -1;
+                    stk_attr_entry[sp - 3] = false;
+                    stk_type[sp - 2] = VAL_UNKNOWN;
+                    stk_var[sp - 2] = -1;
+                    stk_entry[sp - 2] = false;
+                    stk_attr[sp - 2] = -1;
+                    stk_attr_entry[sp - 2] = false;
+                    sp--;
+                    break;
+                case _STORE_ATTR_INSTANCE_VALUE:
+                case _STORE_ATTR_SLOT: {
+                    if (sp < 2) { body_valid = false; break; }
+                    bool is_slot = (op == _STORE_ATTR_SLOT);
+                    uint64_t raw_offset = is_slot ? (inst->operand0 & 0x1FFF) : inst->operand0;
+                    int owner_v = stk_var[sp - 1];
+                    int val_type = stk_type[sp - 2];
+                    if (attr_tracking_valid && owner_v >= 0 && !written[owner_v] && stk_entry[sp - 1]) {
+                        if (attr_owner_var < 0) {
+                            attr_owner_var = owner_v;
+                        }
+                        else if (attr_owner_var != owner_v && !(is_slot && (inst->operand0 >> 13) != 0)) {
+                            attr_tracking_valid = false;
+                        }
+                        int a_idx = -1;
+                        if (attr_tracking_valid) {
+                            for (int a = 0; a < num_attr_slots; a++) {
+                                if (attr_slots[a].owner_var == owner_v &&
+                                    attr_slots[a].offset == raw_offset &&
+                                    attr_slots[a].is_slot == is_slot)
+                                {
+                                    a_idx = a;
+                                    break;
+                                }
+                            }
+                            if (a_idx < 0 && num_attr_slots < 32) {
+                                uint16_t strict_tag = is_slot ? (uint16_t)(inst->operand0 >> 13) : 0;
+                                a_idx = num_attr_slots++;
+                                attr_slots[a_idx].owner_var = owner_v;
+                                attr_slots[a_idx].offset = raw_offset;
+                                attr_slots[a_idx].is_slot = is_slot;
+                                attr_slots[a_idx].cur_type = (strict_tag == 1) ? VAL_INT :
+                                                             (strict_tag == 2) ? VAL_FLOAT : VAL_UNKNOWN;
+                                attr_slots[a_idx].seen_write = false;
+                                attr_slots[a_idx].entry_guarded = (strict_tag == 1 || strict_tag == 2);
+                                attr_slots[a_idx].all_stores_int = true;
+                                attr_slots[a_idx].all_stores_float = true;
+                                attr_slots[a_idx].load_count = 0;
+                                attr_slots[a_idx].store_count = 0;
+                            }
+                            else if (a_idx < 0) {
+                                attr_tracking_valid = false;
+                            }
+                        }
+                        if (a_idx >= 0 && attr_tracking_valid) {
+                            for (int s = 0; s < sp; s++) {
+                                if (stk_attr[s] == a_idx) {
+                                    stk_attr[s] = -1;
+                                    stk_attr_entry[s] = false;
+                                }
+                            }
+                            attr_slots[a_idx].seen_write = true;
+                            attr_slots[a_idx].store_count++;
+                            attr_slots[a_idx].cur_type = val_type;
+                            if (val_type != VAL_INT) {
+                                attr_slots[a_idx].all_stores_int = false;
+                            }
+                            if (val_type != VAL_FLOAT) {
+                                attr_slots[a_idx].all_stores_float = false;
+                            }
+                        }
+                    }
+                    else if (!(is_slot && (inst->operand0 >> 13) != 0 && (val_type == VAL_INT || val_type == VAL_FLOAT))) {
+                        attr_tracking_valid = false;
+                    }
+                    stk_type[sp - 2] = VAL_UNKNOWN;
+                    stk_var[sp - 2] = -1;
+                    stk_entry[sp - 2] = false;
+                    stk_attr[sp - 2] = -1;
+                    stk_attr_entry[sp - 2] = false;
+                    sp--;
+                    break;
+                }
+                case _BINARY_OP_EXTEND: {
+                    if (sp < 2 || sp >= 64) { body_valid = false; break; }
+                    _PyBinaryOpSpecializationDescr *d =
+                        (_PyBinaryOpSpecializationDescr *)inst->operand0;
+                    int res_type = VAL_UNKNOWN;
+                    if (d != NULL && d->result_type == &PyFloat_Type) {
+                        res_type = VAL_FLOAT;
+                    }
+                    else if (d != NULL && d->result_type == &PyLong_Type &&
+                             stk_type[sp - 2] == VAL_INT && stk_type[sp - 1] == VAL_INT &&
+                             (inst->oparg == NB_AND || inst->oparg == NB_OR ||
+                              inst->oparg == NB_XOR || inst->oparg == NB_RSHIFT ||
+                              inst->oparg == NB_FLOOR_DIVIDE || inst->oparg == NB_REMAINDER ||
+                              inst->oparg == NB_INPLACE_AND || inst->oparg == NB_INPLACE_OR ||
+                              inst->oparg == NB_INPLACE_XOR || inst->oparg == NB_INPLACE_RSHIFT ||
+                              inst->oparg == NB_INPLACE_FLOOR_DIVIDE ||
+                              inst->oparg == NB_INPLACE_REMAINDER))
+                    {
+                        res_type = VAL_INT;
+                    }
+                    stk_type[sp - 2] = res_type;
+                    stk_var[sp - 2] = -1;
+                    stk_entry[sp - 2] = false;
+                    stk_attr[sp - 2] = -1;
+                    stk_attr_entry[sp - 2] = false;
+                    stk_type[sp - 1] = VAL_UNKNOWN;
+                    stk_var[sp - 1] = -1;
+                    stk_entry[sp - 1] = false;
+                    stk_attr[sp - 1] = -1;
+                    stk_attr_entry[sp - 1] = false;
+                    stk_type[sp] = VAL_UNKNOWN;
+                    stk_var[sp] = -1;
+                    stk_entry[sp] = false;
+                    stk_attr[sp] = -1;
+                    stk_attr_entry[sp] = false;
+                    sp++;
+                    break;
+                }
+                case _BINARY_OP_BITWISE_INT:
                 case _BINARY_OP_ADD_INT:
                 case _BINARY_OP_ADD_INT_INPLACE:
                 case _BINARY_OP_ADD_INT_INPLACE_RIGHT:
@@ -1312,15 +2434,48 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _BINARY_OP_MULTIPLY_INT_INPLACE:
                 case _BINARY_OP_MULTIPLY_INT_INPLACE_RIGHT:
                     if (sp < 2 || sp >= 64) { body_valid = false; break; }
+                    if (stk_attr_entry[sp - 2] && stk_attr[sp - 2] >= 0) {
+                        attr_slots[stk_attr[sp - 2]].entry_guarded = true;
+                        attr_slots[stk_attr[sp - 2]].cur_type = VAL_INT;
+                    }
+                    if (stk_attr_entry[sp - 1] && stk_attr[sp - 1] >= 0) {
+                        attr_slots[stk_attr[sp - 1]].entry_guarded = true;
+                        attr_slots[stk_attr[sp - 1]].cur_type = VAL_INT;
+                    }
                     stk_type[sp - 2] = VAL_INT;
                     stk_var[sp - 2] = -1;
                     stk_entry[sp - 2] = false;
+                    stk_attr[sp - 2] = -1;
+                    stk_attr_entry[sp - 2] = false;
                     stk_type[sp - 1] = VAL_UNKNOWN;
                     stk_var[sp - 1] = -1;
                     stk_entry[sp - 1] = false;
+                    stk_attr[sp - 1] = -1;
+                    stk_attr_entry[sp - 1] = false;
                     stk_type[sp] = VAL_UNKNOWN;
                     stk_var[sp] = -1;
                     stk_entry[sp] = false;
+                    stk_attr[sp] = -1;
+                    stk_attr_entry[sp] = false;
+                    sp++;
+                    break;
+                case _BINARY_OP_ARITH_FLOAT_INT:
+                    if (sp < 2 || sp >= 64) { body_valid = false; break; }
+                    stk_type[sp - 2] = VAL_FLOAT;
+                    stk_var[sp - 2] = -1;
+                    stk_entry[sp - 2] = false;
+                    stk_attr[sp - 2] = -1;
+                    stk_attr_entry[sp - 2] = false;
+                    stk_type[sp - 1] = VAL_UNKNOWN;
+                    stk_var[sp - 1] = -1;
+                    stk_entry[sp - 1] = false;
+                    stk_attr[sp - 1] = -1;
+                    stk_attr_entry[sp - 1] = false;
+                    stk_type[sp] = VAL_UNKNOWN;
+                    stk_var[sp] = -1;
+                    stk_entry[sp] = false;
+                    stk_attr[sp] = -1;
+                    stk_attr_entry[sp] = false;
                     sp++;
                     break;
                 case _BINARY_OP_ADD_FLOAT:
@@ -1336,26 +2491,56 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 case _BINARY_OP_TRUEDIV_FLOAT_INPLACE:
                 case _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT:
                     if (sp < 2 || sp >= 64) { body_valid = false; break; }
+                    if (stk_attr_entry[sp - 2] && stk_attr[sp - 2] >= 0) {
+                        attr_slots[stk_attr[sp - 2]].entry_guarded = true;
+                        attr_slots[stk_attr[sp - 2]].cur_type = VAL_FLOAT;
+                    }
+                    if (stk_attr_entry[sp - 1] && stk_attr[sp - 1] >= 0) {
+                        attr_slots[stk_attr[sp - 1]].entry_guarded = true;
+                        attr_slots[stk_attr[sp - 1]].cur_type = VAL_FLOAT;
+                    }
                     stk_type[sp - 2] = VAL_FLOAT;
                     stk_var[sp - 2] = -1;
                     stk_entry[sp - 2] = false;
+                    stk_attr[sp - 2] = -1;
+                    stk_attr_entry[sp - 2] = false;
                     stk_type[sp - 1] = VAL_UNKNOWN;
                     stk_var[sp - 1] = -1;
                     stk_entry[sp - 1] = false;
+                    stk_attr[sp - 1] = -1;
+                    stk_attr_entry[sp - 1] = false;
                     stk_type[sp] = VAL_UNKNOWN;
                     stk_var[sp] = -1;
                     stk_entry[sp] = false;
+                    stk_attr[sp] = -1;
+                    stk_attr_entry[sp] = false;
                     sp++;
+                    break;
+                case _BINARY_OP_FMA_FLOAT_INPLACE:
+                    if (sp < 3 || sp >= 64) { body_valid = false; break; }
+                    stk_type[sp - 3] = VAL_FLOAT;
+                    stk_var[sp - 3] = -1;
+                    stk_entry[sp - 3] = false;
+                    stk_attr[sp - 3] = -1;
+                    stk_attr_entry[sp - 3] = false;
+                    stk_type[sp - 2] = VAL_UNKNOWN;
+                    stk_var[sp - 2] = -1;
+                    stk_entry[sp - 2] = false;
+                    stk_attr[sp - 2] = -1;
+                    stk_attr_entry[sp - 2] = false;
+                    stk_type[sp - 1] = VAL_UNKNOWN;
+                    stk_var[sp - 1] = -1;
+                    stk_entry[sp - 1] = false;
+                    stk_attr[sp - 1] = -1;
+                    stk_attr_entry[sp - 1] = false;
                     break;
                 case _UNARY_NEGATIVE_FLOAT_INPLACE:
                     if (sp < 1 || sp >= 64) { body_valid = false; break; }
                     stk_type[sp - 1] = VAL_FLOAT;
                     stk_var[sp - 1] = -1;
                     stk_entry[sp - 1] = false;
-                    stk_type[sp] = VAL_UNKNOWN;
-                    stk_var[sp] = -1;
-                    stk_entry[sp] = false;
-                    sp++;
+                    stk_attr[sp - 1] = -1;
+                    stk_attr_entry[sp - 1] = false;
                     break;
                 case _COMPARE_OP_INT:
                 case _COMPARE_OP_FLOAT:
@@ -1363,12 +2548,18 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     stk_type[sp - 2] = VAL_UNKNOWN;
                     stk_var[sp - 2] = -1;
                     stk_entry[sp - 2] = false;
+                    stk_attr[sp - 2] = -1;
+                    stk_attr_entry[sp - 2] = false;
                     stk_type[sp - 1] = VAL_UNKNOWN;
                     stk_var[sp - 1] = -1;
                     stk_entry[sp - 1] = false;
+                    stk_attr[sp - 1] = -1;
+                    stk_attr_entry[sp - 1] = false;
                     stk_type[sp] = VAL_UNKNOWN;
                     stk_var[sp] = -1;
                     stk_entry[sp] = false;
+                    stk_attr[sp] = -1;
+                    stk_attr_entry[sp] = false;
                     sp++;
                     break;
                 case _POP_TOP:
@@ -1401,9 +2592,14 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                         body_valid = false;
                         break;
                     }
+                    if (stk_var[sp - 1] >= 0) {
+                        var_copied[stk_var[sp - 1]] = true;
+                    }
                     stk_type[sp - 1] = VAL_UNKNOWN;
                     stk_var[sp - 1] = -1;
                     stk_entry[sp - 1] = false;
+                    stk_attr[sp - 1] = -1;
+                    stk_attr_entry[sp - 1] = false;
                     for (int s = 0; s < sp; s++) {
                         if (stk_var[s] == v) {
                             stk_var[s] = -1;
@@ -1430,7 +2626,21 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             body_valid = false;
         }
 
-        bool hoist_inst[64] = {0};
+        bool all_attr_stores_safe = attr_tracking_valid;
+        bool all_attr_stores_entry_guarded = attr_tracking_valid;
+        for (int a = 0; a < num_attr_slots; a++) {
+            if (attr_slots[a].seen_write) {
+                if (!attr_slots[a].all_stores_int && !attr_slots[a].all_stores_float) {
+                    all_attr_stores_safe = false;
+                    all_attr_stores_entry_guarded = false;
+                }
+                if (!attr_slots[a].entry_guarded) {
+                    all_attr_stores_entry_guarded = false;
+                }
+            }
+        }
+
+        bool hoist_inst[256] = {0};
         int hoist_type_guard_count = 0;
         if (body_valid) {
             for (int i = 0; i < b_len; i++) {
@@ -1452,6 +2662,28 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     }
                 }
                 else if (gk == 4) {
+                    if (gv >= 0 && !written[gv]) {
+                        hoist_inst[i] = true;
+                        hoist_type_guard_count++;
+                    }
+                }
+                else if (gk == 5 && all_attr_stores_safe) {
+                    if (gv >= 0 && gv < num_attr_slots &&
+                        (!attr_slots[gv].seen_write || attr_slots[gv].all_stores_int))
+                    {
+                        hoist_inst[i] = true;
+                        hoist_type_guard_count++;
+                    }
+                }
+                else if (gk == 6 && all_attr_stores_safe) {
+                    if (gv >= 0 && gv < num_attr_slots &&
+                        (!attr_slots[gv].seen_write || attr_slots[gv].all_stores_float))
+                    {
+                        hoist_inst[i] = true;
+                        hoist_type_guard_count++;
+                    }
+                }
+                else if (gk == 7 && all_attr_stores_safe) {
                     if (gv >= 0 && !written[gv]) {
                         hoist_inst[i] = true;
                         hoist_type_guard_count++;
@@ -1494,6 +2726,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             _PyUOpInstruction make_warm_inst = output[1];
             _PyUOpInstruction jump_inst = output[length - 1];
             int out_idx = 1;
+            bool seen_pre_dorv_guard = false;
             /* Emit Pre-Header (Iteration 1 with all type and iterator guards) */
             for (int i = 0; i < b_len; i++) {
                 uint16_t op = body[i].opcode;
@@ -1502,12 +2735,21 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 {
                     continue;
                 }
+                if (op == _GUARD_DORV_NO_DICT &&
+                    guard_kind[i] == 7 &&
+                    all_attr_stores_entry_guarded)
+                {
+                    if (seen_pre_dorv_guard) {
+                        continue;
+                    }
+                    seen_pre_dorv_guard = true;
+                }
                 output[out_idx++] = body[i];
             }
             /* Loop Header */
             output[out_idx++] = make_warm_inst;
             /* Build Steady-State Loop Body with hoisted guards removed */
-            _PyUOpInstruction sbody[64];
+            _PyUOpInstruction sbody[256];
             int s_len = 0;
             for (int i = 0; i < b_len; i++) {
                 if (hoist_inst[i]) {
@@ -1542,111 +2784,485 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     }
                 }
             }
-            /* In-place ownership transfer for int/float accumulators in steady-state
-             * loop body: after Iteration 1 creates and stores a uniquely-owned
-             * PyLongObject/PyFloatObject into locals[v], use _LOAD_FAST_AND_CLEAR v
-             * so _BINARY_OP_{ADD,SUBTRACT,MULTIPLY}_{INT,FLOAT} mutates locals[v]
-             * in place on iterations 2..N without allocating or touching the freelist. */
-            for (int i = 0; i + 6 < s_len; i++) {
-                if (sbody[i].opcode != _LOAD_FAST_BORROW) {
-                    continue;
+            /* In-place ownership transfer / mutation for int/float accumulators
+             * in steady-state loop body (skipping _NOP and _SET_IP instructions):
+             * - For float accumulators: keep _LOAD_FAST_BORROW v, convert
+             *   _BINARY_OP_{ADD,SUBTRACT,MULTIPLY}_FLOAT to _FLOAT_INPLACE, and
+             *   replace _SWAP_FAST v + _POP_TOP_FLOAT with _POP_TOP_NOP + _NOP so
+             *   locals[v]->ob_fval is mutated directly in place with zero refcount
+             *   ops, zero local stores, and zero _SET_IP instructions.
+             * - For int accumulators: use _LOAD_FAST_AND_CLEAR v so
+             *   _BINARY_OP_{ADD,SUBTRACT,MULTIPLY}_INT mutates locals[v] in place. */
+            #define NEXT_SBODY_IDX(idx) \
+                ({ int _idx = (idx); \
+                   while (_idx < s_len && \
+                          (sbody[_idx].opcode == _NOP || \
+                           sbody[_idx].opcode == _SET_IP || \
+                           sbody[_idx].opcode == _CHECK_VALIDITY)) { \
+                       _idx++; \
+                   } \
+                   _idx; })
+            for (int i = 0; i < s_len; i++) {
+                uint16_t lop = sbody[i].opcode;
+                int v = -1;
+                if (lop == _LOAD_FAST_BORROW) {
+                    v = (int)sbody[i].oparg;
                 }
-                int v = (int)sbody[i].oparg;
+                else if (lop >= _LOAD_FAST_BORROW_0 && lop <= _LOAD_FAST_BORROW_7) {
+                    v = (int)(lop - _LOAD_FAST_BORROW_0);
+                }
                 if (v < 0 || v >= 64 ||
                     !written[v] ||
-                    load_count[v] != 1 ||
+                    var_copied[v] ||
+                    load_count[v] < 1 ||
                     store_count[v] != 1)
                 {
                     continue;
                 }
+                if (load_count[v] > 1 && i > 0) {
+                    int prev = i - 1;
+                    while (prev >= 0 &&
+                           (sbody[prev].opcode == _NOP ||
+                            sbody[prev].opcode == _SET_IP ||
+                            sbody[prev].opcode == _CHECK_VALIDITY ||
+                            sbody[prev].opcode == _GUARD_TYPE_VERSION ||
+                            sbody[prev].opcode == _CHECK_MANAGED_OBJECT_HAS_VALUES)) {
+                        prev--;
+                    }
+                    if (prev >= 0) {
+                        uint16_t pop = sbody[prev].opcode;
+                        if (pop != _POP_TOP_INT &&
+                            pop != _POP_TOP_FLOAT &&
+                            pop != _POP_TOP_NOP &&
+                            pop != _GUARD_NOT_EXHAUSTED_RANGE &&
+                            pop != _GUARD_NOT_EXHAUSTED_LIST &&
+                            pop != _GUARD_NOT_EXHAUSTED_TUPLE)
+                        {
+                            continue;
+                        }
+                    }
+                }
+                int i_rhs = NEXT_SBODY_IDX(i + 1);
+                if (i_rhs >= s_len) {
+                    continue;
+                }
+                uint16_t rop = sbody[i_rhs].opcode;
+                int rhs_v = -1;
+                if (rop == _LOAD_FAST_BORROW) {
+                    rhs_v = (int)sbody[i_rhs].oparg;
+                }
+                else if (rop >= _LOAD_FAST_BORROW_0 && rop <= _LOAD_FAST_BORROW_7) {
+                    rhs_v = (int)(rop - _LOAD_FAST_BORROW_0);
+                }
+                int i_binop = NEXT_SBODY_IDX(i_rhs + 1);
+                if (rhs_v >= 0 && rhs_v != v && i_binop < s_len &&
+                    (sbody[i_binop].opcode == _LOAD_ATTR_SLOT ||
+                     sbody[i_binop].opcode == _LOAD_ATTR_INSTANCE_VALUE))
+                {
+                    int i_attr_pop = NEXT_SBODY_IDX(i_binop + 1);
+                    if (i_attr_pop < s_len && sbody[i_attr_pop].opcode == _POP_TOP_NOP) {
+                        i_binop = NEXT_SBODY_IDX(i_attr_pop + 1);
+                    }
+                }
+                int i_pop1 = NEXT_SBODY_IDX(i_binop + 1);
+                int i_pop2 = NEXT_SBODY_IDX(i_pop1 + 1);
+                if (i_pop2 >= s_len) {
+                    continue;
+                }
                 if (all_stores_float[v]) {
-                    bool rhs_ok =
-                        (sbody[i + 1].opcode == _LOAD_FAST_BORROW &&
-                         (int)sbody[i + 1].oparg != v) ||
-                        sbody[i + 1].opcode == _LOAD_CONST_INLINE_BORROW;
-                    uint16_t binop = sbody[i + 2].opcode;
-                    bool binop_ok =
-                        binop == _BINARY_OP_ADD_FLOAT ||
-                        binop == _BINARY_OP_SUBTRACT_FLOAT ||
-                        binop == _BINARY_OP_MULTIPLY_FLOAT;
+                    bool rhs_ok = (rhs_v >= 0 && rhs_v != v) ||
+                                  rop == _LOAD_CONST_INLINE_BORROW;
+                    uint16_t binop = sbody[i_binop].opcode;
+                    uint16_t inplace_binop = 0;
+                    if (binop == _BINARY_OP_ADD_FLOAT || binop == _BINARY_OP_ADD_FLOAT_INPLACE) {
+                        inplace_binop = _BINARY_OP_ADD_FLOAT_INPLACE;
+                    }
+                    else if (binop == _BINARY_OP_SUBTRACT_FLOAT || binop == _BINARY_OP_SUBTRACT_FLOAT_INPLACE) {
+                        inplace_binop = _BINARY_OP_SUBTRACT_FLOAT_INPLACE;
+                    }
+                    else if (binop == _BINARY_OP_MULTIPLY_FLOAT || binop == _BINARY_OP_MULTIPLY_FLOAT_INPLACE) {
+                        inplace_binop = _BINARY_OP_MULTIPLY_FLOAT_INPLACE;
+                    }
                     bool pops_ok =
-                        (sbody[i + 3].opcode == _POP_TOP_NOP ||
-                         sbody[i + 3].opcode == _POP_TOP_FLOAT) &&
-                        sbody[i + 4].opcode == _POP_TOP_NOP;
-                    if (!rhs_ok || !binop_ok || !pops_ok) {
+                        (sbody[i_pop1].opcode == _POP_TOP_NOP ||
+                         sbody[i_pop1].opcode == _POP_TOP_FLOAT) &&
+                        (sbody[i_pop2].opcode == _POP_TOP_NOP ||
+                         sbody[i_pop2].opcode == _POP_TOP_FLOAT);
+                    if (!rhs_ok || inplace_binop == 0 || !pops_ok) {
                         continue;
                     }
-                    int k = i + 5;
-                    while (k + 3 < s_len &&
-                           ((sbody[k].opcode == _LOAD_FAST_BORROW &&
-                             (int)sbody[k].oparg != v) ||
-                            sbody[k].opcode == _LOAD_CONST_INLINE_BORROW) &&
-                           (sbody[k + 1].opcode == _BINARY_OP_ADD_FLOAT_INPLACE ||
-                            sbody[k + 1].opcode == _BINARY_OP_SUBTRACT_FLOAT_INPLACE ||
-                            sbody[k + 1].opcode == _BINARY_OP_MULTIPLY_FLOAT_INPLACE) &&
-                           (sbody[k + 2].opcode == _POP_TOP_NOP ||
-                            sbody[k + 2].opcode == _POP_TOP_FLOAT) &&
-                           sbody[k + 3].opcode == _POP_TOP_NOP)
-                    {
-                        k += 4;
+                    int k = NEXT_SBODY_IDX(i_pop2 + 1);
+                    while (k < s_len) {
+                        uint16_t krop = sbody[k].opcode;
+                        int krhs_v = -1;
+                        if (krop == _LOAD_FAST_BORROW) {
+                            krhs_v = (int)sbody[k].oparg;
+                        }
+                        else if (krop >= _LOAD_FAST_BORROW_0 && krop <= _LOAD_FAST_BORROW_7) {
+                            krhs_v = (int)(krop - _LOAD_FAST_BORROW_0);
+                        }
+                        int k_binop = NEXT_SBODY_IDX(k + 1);
+                        if (krhs_v >= 0 && krhs_v != v && k_binop < s_len &&
+                            (sbody[k_binop].opcode == _LOAD_ATTR_SLOT ||
+                             sbody[k_binop].opcode == _LOAD_ATTR_INSTANCE_VALUE))
+                        {
+                            int k_attr_pop = NEXT_SBODY_IDX(k_binop + 1);
+                            if (k_attr_pop < s_len && sbody[k_attr_pop].opcode == _POP_TOP_NOP) {
+                                k_binop = NEXT_SBODY_IDX(k_attr_pop + 1);
+                            }
+                        }
+                        int k_pop1 = NEXT_SBODY_IDX(k_binop + 1);
+                        int k_pop2 = NEXT_SBODY_IDX(k_pop1 + 1);
+                        if (k_pop2 >= s_len) {
+                            break;
+                        }
+                        if (((krhs_v >= 0 && krhs_v != v) ||
+                             krop == _LOAD_CONST_INLINE_BORROW) &&
+                            (sbody[k_binop].opcode == _BINARY_OP_ADD_FLOAT_INPLACE ||
+                             sbody[k_binop].opcode == _BINARY_OP_SUBTRACT_FLOAT_INPLACE ||
+                             sbody[k_binop].opcode == _BINARY_OP_MULTIPLY_FLOAT_INPLACE ||
+                             sbody[k_binop].opcode == _BINARY_OP_ADD_FLOAT ||
+                             sbody[k_binop].opcode == _BINARY_OP_SUBTRACT_FLOAT ||
+                             sbody[k_binop].opcode == _BINARY_OP_MULTIPLY_FLOAT) &&
+                            (sbody[k_pop1].opcode == _POP_TOP_NOP ||
+                             sbody[k_pop1].opcode == _POP_TOP_FLOAT) &&
+                            (sbody[k_pop2].opcode == _POP_TOP_NOP ||
+                             sbody[k_pop2].opcode == _POP_TOP_FLOAT))
+                        {
+                            k = NEXT_SBODY_IDX(k_pop2 + 1);
+                        }
+                        else {
+                            break;
+                        }
                     }
-                    if (k + 1 < s_len &&
-                        sbody[k].opcode == _SWAP_FAST &&
-                        (int)sbody[k].oparg == v &&
-                        sbody[k + 1].opcode == _POP_TOP_FLOAT)
-                    {
-                        sbody[i].opcode = _LOAD_FAST_AND_CLEAR;
-                        sbody[i + 4].opcode = _POP_TOP_FLOAT;
-                        sbody[k + 1].opcode = _POP_TOP_NOP;
+                    int k_pop = NEXT_SBODY_IDX(k + 1);
+                    if (k_pop < s_len) {
+                        uint16_t swop = sbody[k].opcode;
+                        int sw_v = (swop == _SWAP_FAST) ? (int)sbody[k].oparg :
+                                   (swop >= _SWAP_FAST_0 && swop <= _SWAP_FAST_7) ? (int)(swop - _SWAP_FAST_0) : -1;
+                        if (sw_v == v && sbody[k_pop].opcode == _POP_TOP_FLOAT) {
+                            sbody[i_binop].opcode = inplace_binop;
+                            sbody[i_pop2].opcode = _POP_TOP_NOP;
+                            int m = NEXT_SBODY_IDX(i_pop2 + 1);
+                            while (m < k) {
+                                int m_binop = NEXT_SBODY_IDX(m + 1);
+                                if (m_binop < k &&
+                                    (sbody[m_binop].opcode == _LOAD_ATTR_SLOT ||
+                                     sbody[m_binop].opcode == _LOAD_ATTR_INSTANCE_VALUE))
+                                {
+                                    int m_attr_pop = NEXT_SBODY_IDX(m_binop + 1);
+                                    m_binop = NEXT_SBODY_IDX(m_attr_pop + 1);
+                                }
+                                int m_pop1 = NEXT_SBODY_IDX(m_binop + 1);
+                                int m_pop2 = NEXT_SBODY_IDX(m_pop1 + 1);
+                                if (sbody[m_binop].opcode == _BINARY_OP_ADD_FLOAT) {
+                                    sbody[m_binop].opcode = _BINARY_OP_ADD_FLOAT_INPLACE;
+                                }
+                                else if (sbody[m_binop].opcode == _BINARY_OP_SUBTRACT_FLOAT) {
+                                    sbody[m_binop].opcode = _BINARY_OP_SUBTRACT_FLOAT_INPLACE;
+                                }
+                                else if (sbody[m_binop].opcode == _BINARY_OP_MULTIPLY_FLOAT) {
+                                    sbody[m_binop].opcode = _BINARY_OP_MULTIPLY_FLOAT_INPLACE;
+                                }
+                                sbody[m_pop2].opcode = _POP_TOP_NOP;
+                                m = NEXT_SBODY_IDX(m_pop2 + 1);
+                            }
+                            sbody[k].opcode = _POP_TOP_NOP;
+                            sbody[k].oparg = 0;
+                            sbody[k].operand0 = 0;
+                            sbody[k_pop].opcode = _NOP;
+                        }
                     }
                 }
                 else if (all_stores_int[v]) {
-                    bool rhs_ok =
-                        (sbody[i + 1].opcode == _LOAD_FAST_BORROW &&
-                         (int)sbody[i + 1].oparg != v) ||
-                        sbody[i + 1].opcode == _LOAD_CONST_INLINE_BORROW ||
-                        sbody[i + 1].opcode == _LOAD_SMALL_INT;
-                    uint16_t binop = sbody[i + 2].opcode;
+                    bool rhs_ok = (rhs_v >= 0 && rhs_v != v) ||
+                                   rop == _LOAD_CONST_INLINE_BORROW ||
+                                   rop == _LOAD_SMALL_INT;
+                    uint16_t binop = sbody[i_binop].opcode;
                     bool binop_ok =
                         binop == _BINARY_OP_ADD_INT ||
                         binop == _BINARY_OP_SUBTRACT_INT ||
                         binop == _BINARY_OP_MULTIPLY_INT;
                     bool pops_ok =
-                        (sbody[i + 3].opcode == _POP_TOP_NOP ||
-                         sbody[i + 3].opcode == _POP_TOP_INT) &&
-                        sbody[i + 4].opcode == _POP_TOP_NOP;
+                        (sbody[i_pop1].opcode == _POP_TOP_NOP ||
+                         sbody[i_pop1].opcode == _POP_TOP_INT) &&
+                        sbody[i_pop2].opcode == _POP_TOP_NOP;
                     if (!rhs_ok || !binop_ok || !pops_ok) {
                         continue;
                     }
-                    int k = i + 5;
-                    while (k + 3 < s_len &&
-                           ((sbody[k].opcode == _LOAD_FAST_BORROW &&
-                             (int)sbody[k].oparg != v) ||
-                            sbody[k].opcode == _LOAD_CONST_INLINE_BORROW ||
-                            sbody[k].opcode == _LOAD_SMALL_INT) &&
-                           (sbody[k + 1].opcode == _BINARY_OP_ADD_INT_INPLACE ||
-                            sbody[k + 1].opcode == _BINARY_OP_SUBTRACT_INT_INPLACE ||
-                            sbody[k + 1].opcode == _BINARY_OP_MULTIPLY_INT_INPLACE) &&
-                           (sbody[k + 2].opcode == _POP_TOP_NOP ||
-                            sbody[k + 2].opcode == _POP_TOP_INT) &&
-                           (sbody[k + 3].opcode == _POP_TOP_NOP ||
-                            sbody[k + 3].opcode == _POP_TOP_INT))
-                    {
-                        k += 4;
+                    int k = NEXT_SBODY_IDX(i_pop2 + 1);
+                    while (k < s_len) {
+                        int k_binop = NEXT_SBODY_IDX(k + 1);
+                        int k_pop1 = NEXT_SBODY_IDX(k_binop + 1);
+                        int k_pop2 = NEXT_SBODY_IDX(k_pop1 + 1);
+                        if (k_pop2 >= s_len) {
+                            break;
+                        }
+                        uint16_t krop = sbody[k].opcode;
+                        int krhs_v = -1;
+                        if (krop == _LOAD_FAST_BORROW) {
+                            krhs_v = (int)sbody[k].oparg;
+                        }
+                        else if (krop >= _LOAD_FAST_BORROW_0 && krop <= _LOAD_FAST_BORROW_7) {
+                            krhs_v = (int)(krop - _LOAD_FAST_BORROW_0);
+                        }
+                        if (((krhs_v >= 0 && krhs_v != v) ||
+                             krop == _LOAD_CONST_INLINE_BORROW ||
+                             krop == _LOAD_SMALL_INT) &&
+                            (sbody[k_binop].opcode == _BINARY_OP_ADD_INT_INPLACE ||
+                             sbody[k_binop].opcode == _BINARY_OP_SUBTRACT_INT_INPLACE ||
+                             sbody[k_binop].opcode == _BINARY_OP_MULTIPLY_INT_INPLACE) &&
+                            (sbody[k_pop1].opcode == _POP_TOP_NOP ||
+                             sbody[k_pop1].opcode == _POP_TOP_INT) &&
+                            (sbody[k_pop2].opcode == _POP_TOP_NOP ||
+                             sbody[k_pop2].opcode == _POP_TOP_INT))
+                        {
+                            k = NEXT_SBODY_IDX(k_pop2 + 1);
+                        }
+                        else {
+                            break;
+                        }
                     }
-                    if (k + 1 < s_len &&
-                        sbody[k].opcode == _SWAP_FAST &&
-                        (int)sbody[k].oparg == v &&
-                        sbody[k + 1].opcode == _POP_TOP_INT)
-                    {
-                        sbody[i].opcode = _LOAD_FAST_AND_CLEAR;
-                        sbody[i + 4].opcode = _POP_TOP_INT;
-                        sbody[k + 1].opcode = _POP_TOP_NOP;
+                    int k_pop = NEXT_SBODY_IDX(k + 1);
+                    if (k_pop < s_len) {
+                        uint16_t swop = sbody[k].opcode;
+                        int sw_v = (swop == _SWAP_FAST) ? (int)sbody[k].oparg :
+                                   (swop >= _SWAP_FAST_0 && swop <= _SWAP_FAST_7) ? (int)(swop - _SWAP_FAST_0) : -1;
+                        if (sw_v == v && sbody[k_pop].opcode == _POP_TOP_INT) {
+                            sbody[i].opcode = _LOAD_FAST_AND_CLEAR;
+                            sbody[i].oparg = v;
+                            sbody[i_pop2].opcode = _POP_TOP_INT;
+                            sbody[k_pop].opcode = _POP_TOP_NOP;
+                        }
                     }
                 }
             }
+            /* In-place float attribute accumulator in steady-state loop body:
+             * after Iteration 1 (Pre-Header) executes _BINARY_OP_{ADD,SUBTRACT,MULTIPLY}_FLOAT
+             * and stores the newly allocated, uniquely-owned PyFloatObject into
+             * (owner_var, offset), iterations 2..N can mutate that PyFloatObject's
+             * ob_fval in place via _BINARY_OP_*_FLOAT_INPLACE and drop the redundant
+             * _LOCK_OBJECT + _STORE_ATTR_* store-back. */
+            if (all_attr_stores_safe && num_attr_slots > 0) {
+                for (int i = 0; i < s_len; i++) {
+                    uint16_t lop = sbody[i].opcode;
+                    int v = -1;
+                    if (lop == _LOAD_FAST || lop == _LOAD_FAST_BORROW) {
+                        v = (int)sbody[i].oparg;
+                    }
+                    else if (lop >= _LOAD_FAST_0 && lop <= _LOAD_FAST_7) {
+                        v = (int)(lop - _LOAD_FAST_0);
+                    }
+                    else if (lop >= _LOAD_FAST_BORROW_0 && lop <= _LOAD_FAST_BORROW_7) {
+                        v = (int)(lop - _LOAD_FAST_BORROW_0);
+                    }
+                    if (v < 0 || v >= 64 || written[v]) {
+                        continue;
+                    }
+                    int i_attr = NEXT_SBODY_IDX(i + 1);
+                    int i_pop0 = NEXT_SBODY_IDX(i_attr + 1);
+                    int i_rhs = NEXT_SBODY_IDX(i_pop0 + 1);
+                    if (i_rhs >= s_len) {
+                        continue;
+                    }
+                    uint16_t aop = sbody[i_attr].opcode;
+                    if (aop != _LOAD_ATTR_INSTANCE_VALUE && aop != _LOAD_ATTR_SLOT) {
+                        continue;
+                    }
+                    bool is_slot = (aop == _LOAD_ATTR_SLOT);
+                    uint64_t offset = is_slot ? (sbody[i_attr].operand0 & 0x1FFF) : sbody[i_attr].operand0;
+                    int a_idx = -1;
+                    for (int a = 0; a < num_attr_slots; a++) {
+                        if (attr_slots[a].owner_var == v &&
+                            attr_slots[a].offset == offset &&
+                            attr_slots[a].is_slot == is_slot)
+                        {
+                            a_idx = a;
+                            break;
+                        }
+                    }
+                    if (a_idx < 0 ||
+                        !attr_slots[a_idx].all_stores_float ||
+                        !attr_slots[a_idx].entry_guarded ||
+                        attr_slots[a_idx].load_count < 1 ||
+                        attr_slots[a_idx].store_count != 1 ||
+                        sbody[i_pop0].opcode != _POP_TOP_NOP)
+                    {
+                        continue;
+                    }
+                    if (attr_slots[a_idx].load_count > 1 && i > 0) {
+                        int prev = i - 1;
+                        while (prev >= 0 &&
+                               (sbody[prev].opcode == _NOP ||
+                                sbody[prev].opcode == _SET_IP ||
+                                sbody[prev].opcode == _CHECK_VALIDITY ||
+                                sbody[prev].opcode == _GUARD_TYPE_VERSION ||
+                                sbody[prev].opcode == _CHECK_MANAGED_OBJECT_HAS_VALUES)) {
+                            prev--;
+                        }
+                        if (prev >= 0) {
+                            uint16_t pop = sbody[prev].opcode;
+                            if (pop != _POP_TOP_INT &&
+                                pop != _POP_TOP_FLOAT &&
+                                pop != _POP_TOP_NOP &&
+                                pop != _GUARD_NOT_EXHAUSTED_RANGE &&
+                                pop != _GUARD_NOT_EXHAUSTED_LIST &&
+                                pop != _GUARD_NOT_EXHAUSTED_TUPLE)
+                            {
+                                continue;
+                            }
+                        }
+                    }
+                    uint16_t rop = sbody[i_rhs].opcode;
+                    int rhs_v = -1;
+                    if (rop == _LOAD_FAST_BORROW) {
+                        rhs_v = (int)sbody[i_rhs].oparg;
+                    }
+                    else if (rop >= _LOAD_FAST_BORROW_0 && rop <= _LOAD_FAST_BORROW_7) {
+                        rhs_v = (int)(rop - _LOAD_FAST_BORROW_0);
+                    }
+                    bool rhs_ok = (rop == _LOAD_CONST_INLINE_BORROW) ||
+                                  (rhs_v >= 0 && rhs_v != v);
+                    int i_binop = NEXT_SBODY_IDX(i_rhs + 1);
+                    if (rhs_v >= 0 && !written[rhs_v] && i_binop < s_len &&
+                        (sbody[i_binop].opcode == _LOAD_ATTR_SLOT ||
+                         sbody[i_binop].opcode == _LOAD_ATTR_INSTANCE_VALUE))
+                    {
+                        bool rhs_slot = (sbody[i_binop].opcode == _LOAD_ATTR_SLOT);
+                        uint64_t rhs_off = rhs_slot ? (sbody[i_binop].operand0 & 0x1FFF) : sbody[i_binop].operand0;
+                        int i_rhs_pop = NEXT_SBODY_IDX(i_binop + 1);
+                        if (i_rhs_pop < s_len && sbody[i_rhs_pop].opcode == _POP_TOP_NOP &&
+                            (rhs_v != v || rhs_off != offset || rhs_slot != is_slot))
+                        {
+                            rhs_ok = true;
+                            i_binop = NEXT_SBODY_IDX(i_rhs_pop + 1);
+                        }
+                        else {
+                            rhs_ok = false;
+                        }
+                    }
+                    int i_pop1 = NEXT_SBODY_IDX(i_binop + 1);
+                    int i_pop2 = NEXT_SBODY_IDX(i_pop1 + 1);
+                    if (i_pop2 >= s_len) {
+                        continue;
+                    }
+                    uint16_t binop = sbody[i_binop].opcode;
+                    uint16_t inplace_binop = 0;
+                    if (binop == _BINARY_OP_ADD_FLOAT) {
+                        inplace_binop = _BINARY_OP_ADD_FLOAT_INPLACE;
+                    }
+                    else if (binop == _BINARY_OP_SUBTRACT_FLOAT) {
+                        inplace_binop = _BINARY_OP_SUBTRACT_FLOAT_INPLACE;
+                    }
+                    else if (binop == _BINARY_OP_MULTIPLY_FLOAT) {
+                        inplace_binop = _BINARY_OP_MULTIPLY_FLOAT_INPLACE;
+                    }
+                    bool pops_ok =
+                        (sbody[i_pop1].opcode == _POP_TOP_NOP ||
+                         sbody[i_pop1].opcode == _POP_TOP_FLOAT) &&
+                        sbody[i_pop2].opcode == _POP_TOP_FLOAT;
+                    if (!rhs_ok || inplace_binop == 0 || !pops_ok) {
+                        continue;
+                    }
+                    int k = NEXT_SBODY_IDX(i_pop2 + 1);
+                    while (k < s_len) {
+                        uint16_t krop = sbody[k].opcode;
+                        int krhs_v = -1;
+                        if (krop == _LOAD_FAST_BORROW) {
+                            krhs_v = (int)sbody[k].oparg;
+                        }
+                        else if (krop >= _LOAD_FAST_BORROW_0 && krop <= _LOAD_FAST_BORROW_7) {
+                            krhs_v = (int)(krop - _LOAD_FAST_BORROW_0);
+                        }
+                        bool krhs_ok = (krop == _LOAD_CONST_INLINE_BORROW) ||
+                                       (krhs_v >= 0 && krhs_v != v);
+                        int k_binop = NEXT_SBODY_IDX(k + 1);
+                        if (krhs_v >= 0 && !written[krhs_v] && k_binop < s_len &&
+                            (sbody[k_binop].opcode == _LOAD_ATTR_SLOT ||
+                             sbody[k_binop].opcode == _LOAD_ATTR_INSTANCE_VALUE))
+                        {
+                            bool k_slot = (sbody[k_binop].opcode == _LOAD_ATTR_SLOT);
+                            uint64_t k_off = k_slot ? (sbody[k_binop].operand0 & 0x1FFF) : sbody[k_binop].operand0;
+                            int k_rhs_pop = NEXT_SBODY_IDX(k_binop + 1);
+                            if (k_rhs_pop < s_len && sbody[k_rhs_pop].opcode == _POP_TOP_NOP &&
+                                (krhs_v != v || k_off != offset || k_slot != is_slot))
+                            {
+                                krhs_ok = true;
+                                k_binop = NEXT_SBODY_IDX(k_rhs_pop + 1);
+                            }
+                            else {
+                                krhs_ok = false;
+                            }
+                        }
+                        int k_pop1 = NEXT_SBODY_IDX(k_binop + 1);
+                        int k_pop2 = NEXT_SBODY_IDX(k_pop1 + 1);
+                        if (k_pop2 >= s_len) {
+                            break;
+                        }
+                        if (krhs_ok &&
+                            (sbody[k_binop].opcode == _BINARY_OP_ADD_FLOAT_INPLACE ||
+                             sbody[k_binop].opcode == _BINARY_OP_SUBTRACT_FLOAT_INPLACE ||
+                             sbody[k_binop].opcode == _BINARY_OP_MULTIPLY_FLOAT_INPLACE) &&
+                            (sbody[k_pop1].opcode == _POP_TOP_NOP ||
+                             sbody[k_pop1].opcode == _POP_TOP_FLOAT) &&
+                            sbody[k_pop2].opcode == _POP_TOP_NOP)
+                        {
+                            k = NEXT_SBODY_IDX(k_pop2 + 1);
+                        }
+                        else {
+                            break;
+                        }
+                    }
+                    if (k >= s_len) {
+                        continue;
+                    }
+                    uint16_t slop = sbody[k].opcode;
+                    int sv = -1;
+                    if (slop == _LOAD_FAST || slop == _LOAD_FAST_BORROW) {
+                        sv = (int)sbody[k].oparg;
+                    }
+                    else if (slop >= _LOAD_FAST_0 && slop <= _LOAD_FAST_7) {
+                        sv = (int)(slop - _LOAD_FAST_0);
+                    }
+                    else if (slop >= _LOAD_FAST_BORROW_0 && slop <= _LOAD_FAST_BORROW_7) {
+                        sv = (int)(slop - _LOAD_FAST_BORROW_0);
+                    }
+                    if (sv != v) {
+                        continue;
+                    }
+                    int m = NEXT_SBODY_IDX(k + 1);
+                    if (!is_slot && m < s_len && sbody[m].opcode == _LOCK_OBJECT) {
+                        m = NEXT_SBODY_IDX(m + 1);
+                    }
+                    uint16_t expected_store = is_slot ? _STORE_ATTR_SLOT : _STORE_ATTR_INSTANCE_VALUE;
+                    int m_pop = NEXT_SBODY_IDX(m + 1);
+                    if (m_pop < s_len &&
+                        sbody[m].opcode == expected_store &&
+                        (is_slot ? (sbody[m].operand0 & 0x1FFF) : sbody[m].operand0) == offset &&
+                        sbody[m_pop].opcode == _POP_TOP_NOP)
+                    {
+                        sbody[i_binop].opcode = inplace_binop;
+                        sbody[i_pop2].opcode = _POP_TOP_NOP;
+                        if (is_slot && (sbody[i_attr].operand0 >> 13) == 2) {
+                            sbody[i_attr].oparg = 254;
+                            sbody[k].opcode = _POP_TOP_NOP;
+                        }
+                        else {
+                            sbody[k].opcode = _POP_TOP_FLOAT;
+                        }
+                        sbody[k].oparg = 0;
+                        sbody[k].operand0 = 0;
+                        for (int c = k + 1; c <= m_pop; c++) {
+                            sbody[c].opcode = _NOP;
+                        }
+                    }
+                }
+            }
+            #undef NEXT_SBODY_IDX
             for (int i = 0; i < s_len; i++) {
-                output[out_idx++] = sbody[i];
+                if (sbody[i].opcode != _NOP) {
+                    output[out_idx++] = sbody[i];
+                }
             }
             output[out_idx++] = jump_inst;
             return remove_unneeded_uops(output, out_idx);
@@ -1654,8 +3270,8 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
     }
 
     /* Fallback: Hoist leading _ITER_CHECK_{RANGE,LIST,TUPLE} (and depth-0
-     * _CHECK_RECURSION_REMAINING across balanced inlined calls) before
-     * _MAKE_WARM without duplicating the loop body. */
+     * _CHECK_STACK_SPACE_OPERAND / _CHECK_RECURSION_REMAINING across balanced
+     * inlined calls) before _MAKE_WARM without duplicating the loop body. */
     int lead_set_ip_idx = -1;
     int lead_check_val_idx = -1;
     int iter_check_idx = -1;
@@ -1689,6 +3305,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
         bool safe_to_hoist_iter = true;
         int inline_depth = 0;
         int first_recursion_check_idx = -1;
+        bool hoist_stack_check[UOP_MAX_TRACE_LENGTH] = {0};
         bool can_hoist_recursion_check = true;
         for (int i = iter_check_idx + 1; i < length - 1; i++) {
             uint16_t op = output[i].opcode;
@@ -1714,6 +3331,19 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 safe_to_hoist_iter = false;
                 break;
             }
+            if (op == _CHECK_STACK_SPACE_OPERAND ||
+                op == _GUARD_GLOBALS_VERSION ||
+                op == _GUARD_BUILTINS_IS_CANONICAL ||
+                op == _CHECK_FUNCTION_VERSION_INLINE ||
+                op == _CHECK_PEP_523)
+            {
+                if (inline_depth == 0) {
+                    hoist_stack_check[i] = true;
+                }
+                else if (op == _CHECK_STACK_SPACE_OPERAND) {
+                    can_hoist_recursion_check = false;
+                }
+            }
             if (op == _CHECK_RECURSION_REMAINING) {
                 if (inline_depth == 0) {
                     if (first_recursion_check_idx < 0) {
@@ -1729,7 +3359,13 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 op != _CHECK_PERIODIC_IF_NOT_YIELD_FROM &&
                 op != _TIER2_RESUME_CHECK &&
                 op != _POP_TOP &&
-                op != _RETURN_VALUE)
+                op != _RETURN_VALUE &&
+                op != _MAKE_HEAP_SAFE &&
+                op != _STORE_ATTR_SLOT &&
+                op != _STORE_ATTR_INSTANCE_VALUE &&
+                op != _BINARY_OP_TRUEDIV_FLOAT &&
+                op != _BINARY_OP_TRUEDIV_FLOAT_INPLACE &&
+                op != _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT)
             {
                 can_hoist_recursion_check = false;
             }
@@ -1738,6 +3374,73 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
             safe_to_hoist_iter = false;
         }
         if (safe_to_hoist_iter) {
+            /* If hoisting _ITER_CHECK_RANGE, check if the loop induction variable's
+             * initial _POP_TOP right after _ITER_NEXT_RANGE can be specialized to
+             * _POP_TOP_INT by guarding localsplus[idx_var] in the preheader. */
+            if (output[iter_check_idx].opcode == _ITER_CHECK_RANGE &&
+                output[iter_check_idx].oparg == 0)
+            {
+                int scan = iter_check_idx + 1;
+                while (scan < length - 1 &&
+                       (output[scan].opcode == _NOP ||
+                        output[scan].opcode == _SET_IP ||
+                        output[scan].opcode == _CHECK_VALIDITY ||
+                        output[scan].opcode == _GUARD_NOT_EXHAUSTED_RANGE))
+                {
+                    scan++;
+                }
+                if (scan + 2 < length - 1 && output[scan].opcode == _ITER_NEXT_RANGE) {
+                    int sw_idx = scan + 1;
+                    while (sw_idx < length - 1 &&
+                           (output[sw_idx].opcode == _NOP ||
+                            output[sw_idx].opcode == _SET_IP ||
+                            output[sw_idx].opcode == _CHECK_VALIDITY))
+                    {
+                        sw_idx++;
+                    }
+                    int pop_idx = sw_idx + 1;
+                    while (pop_idx < length - 1 && output[pop_idx].opcode == _NOP) {
+                        pop_idx++;
+                    }
+                    if (pop_idx < length - 1 && output[pop_idx].opcode == _POP_TOP) {
+                        int sv = -1;
+                        uint16_t sop = output[sw_idx].opcode;
+                        if (sop == _SWAP_FAST) {
+                            sv = (int)output[sw_idx].oparg;
+                        }
+                        else if (sop >= _SWAP_FAST_0 && sop <= _SWAP_FAST_7) {
+                            sv = (int)(sop - _SWAP_FAST_0);
+                        }
+                        if (sv >= 0 && sv < 64) {
+                            bool other_writes = false;
+                            int d = 0;
+                            for (int k = 2; k < length - 1; k++) {
+                                uint16_t kop = output[k].opcode;
+                                if (kop == _PUSH_FRAME || kop == _CREATE_INIT_FRAME) {
+                                    d++;
+                                }
+                                else if (kop == _RETURN_VALUE) {
+                                    d--;
+                                }
+                                else if (d == 0 && k != sw_idx) {
+                                    if ((kop == _SWAP_FAST && (int)output[k].oparg == sv) ||
+                                        (kop >= _SWAP_FAST_0 && kop <= _SWAP_FAST_7 &&
+                                         (int)(kop - _SWAP_FAST_0) == sv) ||
+                                        (kop == _LOAD_FAST_AND_CLEAR && (int)output[k].oparg == sv))
+                                    {
+                                        other_writes = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!other_writes) {
+                                output[iter_check_idx].oparg = (uint16_t)(0x8000 | sv);
+                                output[pop_idx].opcode = _POP_TOP_INT;
+                            }
+                        }
+                    }
+                }
+            }
             _PyUOpInstruction temp[UOP_MAX_TRACE_LENGTH];
             int out_idx = 0;
             temp[out_idx++] = output[0]; /* _START_EXECUTOR */
@@ -1748,14 +3451,25 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 temp[out_idx++] = output[lead_check_val_idx];
             }
             temp[out_idx++] = output[iter_check_idx];
-            if (can_hoist_recursion_check && first_recursion_check_idx >= 0) {
-                _PyUOpInstruction rec_inst = output[first_recursion_check_idx];
-                rec_inst.target = output[iter_check_idx].target;
-                temp[out_idx++] = rec_inst;
+            if (can_hoist_recursion_check) {
+                for (int i = iter_check_idx + 1; i < length - 1; i++) {
+                    if (hoist_stack_check[i]) {
+                        _PyUOpInstruction stk_inst = output[i];
+                        stk_inst.target = output[iter_check_idx].target;
+                        temp[out_idx++] = stk_inst;
+                    }
+                }
+                if (first_recursion_check_idx >= 0) {
+                    _PyUOpInstruction rec_inst = output[first_recursion_check_idx];
+                    rec_inst.target = output[iter_check_idx].target;
+                    temp[out_idx++] = rec_inst;
+                }
             }
             temp[out_idx++] = output[1]; /* _MAKE_WARM */
             for (int i = 2; i < length; i++) {
-                if (i == iter_check_idx || output[i].opcode == _NOP) {
+                if (i == iter_check_idx || output[i].opcode == _NOP ||
+                    (can_hoist_recursion_check && hoist_stack_check[i]))
+                {
                     continue;
                 }
                 temp[out_idx++] = output[i];
@@ -1766,6 +3480,734 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
     }
 
     return length;
+}
+
+static void
+inline_leaf_strict_calls(_PyUOpInstruction *buffer, int length)
+{
+    for (int i = 0; i < length; i++) {
+        if (buffer[i].opcode != _INIT_CALL_PY_EXACT_ARGS) {
+            continue;
+        }
+        int nargs = (int)buffer[i].oparg;
+        if (nargs < 0 || nargs > 7) {
+            continue;
+        }
+        int s_idx = i + 1;
+        while (s_idx < length &&
+               (buffer[s_idx].opcode == _NOP ||
+                buffer[s_idx].opcode == _SET_IP ||
+                buffer[s_idx].opcode == _CHECK_VALIDITY))
+        {
+            s_idx++;
+        }
+        if (s_idx >= length || buffer[s_idx].opcode != _SAVE_RETURN_OFFSET) {
+            continue;
+        }
+        int p_idx = s_idx + 1;
+        while (p_idx < length &&
+               (buffer[p_idx].opcode == _NOP ||
+                buffer[p_idx].opcode == _SET_IP ||
+                buffer[p_idx].opcode == _CHECK_VALIDITY))
+        {
+            p_idx++;
+        }
+        if (p_idx >= length || buffer[p_idx].opcode != _PUSH_FRAME) {
+            continue;
+        }
+        uint32_t call_target = buffer[p_idx].target;
+
+        int arg_idx[8];
+        int check_stk_idx = -1;
+        int check_rec_idx = -1;
+        int scan = i - 1;
+        bool args_ok = true;
+        for (int a = nargs; a >= 1; a--) {
+            while (scan >= 0 &&
+                   (buffer[scan].opcode == _NOP ||
+                    buffer[scan].opcode == _SET_IP ||
+                    buffer[scan].opcode == _CHECK_VALIDITY ||
+                    buffer[scan].opcode == _CHECK_FUNCTION_VERSION_INLINE ||
+                    buffer[scan].opcode == _CHECK_STACK_SPACE_OPERAND ||
+                    buffer[scan].opcode == _CHECK_RECURSION_REMAINING))
+            {
+                if (buffer[scan].opcode == _CHECK_STACK_SPACE_OPERAND) {
+                    check_stk_idx = scan;
+                }
+                else if (buffer[scan].opcode == _CHECK_RECURSION_REMAINING) {
+                    check_rec_idx = scan;
+                }
+                scan--;
+            }
+            if (scan < 0) {
+                args_ok = false;
+                break;
+            }
+            uint16_t aop = buffer[scan].opcode;
+            if (aop == _LOAD_FAST_BORROW ||
+                (aop >= _LOAD_FAST_BORROW_0 && aop <= _LOAD_FAST_BORROW_7) ||
+                aop == _LOAD_CONST_INLINE_BORROW ||
+                aop == _LOAD_CONST_INLINE ||
+                aop == _LOAD_SMALL_INT)
+            {
+                arg_idx[a] = scan;
+                scan--;
+            }
+            else {
+                args_ok = false;
+                break;
+            }
+        }
+        if (!args_ok) {
+            continue;
+        }
+        while (scan >= 0 &&
+               (buffer[scan].opcode == _NOP ||
+                buffer[scan].opcode == _SET_IP ||
+                buffer[scan].opcode == _CHECK_VALIDITY ||
+                buffer[scan].opcode == _CHECK_FUNCTION_VERSION_INLINE ||
+                buffer[scan].opcode == _CHECK_STACK_SPACE_OPERAND ||
+                buffer[scan].opcode == _CHECK_RECURSION_REMAINING))
+        {
+            if (buffer[scan].opcode == _CHECK_STACK_SPACE_OPERAND) {
+                check_stk_idx = scan;
+            }
+            else if (buffer[scan].opcode == _CHECK_RECURSION_REMAINING) {
+                check_rec_idx = scan;
+            }
+            scan--;
+        }
+        if (scan < 0 || buffer[scan].opcode != _SWAP || buffer[scan].oparg != 2) {
+            continue;
+        }
+        int swap_idx = scan--;
+        while (scan >= 0 &&
+               (buffer[scan].opcode == _NOP ||
+                buffer[scan].opcode == _SET_IP ||
+                buffer[scan].opcode == _CHECK_VALIDITY ||
+                buffer[scan].opcode == _CHECK_FUNCTION_VERSION_INLINE ||
+                buffer[scan].opcode == _CHECK_STACK_SPACE_OPERAND ||
+                buffer[scan].opcode == _CHECK_RECURSION_REMAINING))
+        {
+            if (buffer[scan].opcode == _CHECK_STACK_SPACE_OPERAND) {
+                check_stk_idx = scan;
+            }
+            else if (buffer[scan].opcode == _CHECK_RECURSION_REMAINING) {
+                check_rec_idx = scan;
+            }
+            scan--;
+        }
+        if (scan < 0 ||
+            (buffer[scan].opcode != _LOAD_CONST_INLINE_BORROW &&
+             buffer[scan].opcode != _LOAD_CONST_INLINE))
+        {
+            continue;
+        }
+        int callable_idx = scan--;
+        while (scan >= 0 &&
+               (buffer[scan].opcode == _NOP ||
+                buffer[scan].opcode == _SET_IP ||
+                buffer[scan].opcode == _CHECK_VALIDITY ||
+                buffer[scan].opcode == _CHECK_FUNCTION_VERSION_INLINE ||
+                buffer[scan].opcode == _CHECK_STACK_SPACE_OPERAND ||
+                buffer[scan].opcode == _CHECK_RECURSION_REMAINING ||
+                buffer[scan].opcode == _GUARD_TYPE_VERSION))
+        {
+            if (buffer[scan].opcode == _CHECK_STACK_SPACE_OPERAND) {
+                check_stk_idx = scan;
+            }
+            else if (buffer[scan].opcode == _CHECK_RECURSION_REMAINING) {
+                check_rec_idx = scan;
+            }
+            scan--;
+        }
+        if (scan < 0) {
+            continue;
+        }
+        uint16_t self_op = buffer[scan].opcode;
+        if (self_op != _LOAD_FAST_BORROW &&
+            !(self_op >= _LOAD_FAST_BORROW_0 && self_op <= _LOAD_FAST_BORROW_7))
+        {
+            continue;
+        }
+        int self_idx = scan;
+
+        int ret_idx = -1;
+        int first_callee_idx = -1;
+        bool callee_ok = true;
+        for (int k = p_idx + 1; k < length; k++) {
+            uint16_t kop = buffer[k].opcode;
+            if (kop == _NOP || kop == _SET_IP || kop == _CHECK_VALIDITY ||
+                kop == _CHECK_RECURSION_REMAINING || kop == _TIER2_RESUME_CHECK)
+            {
+                continue;
+            }
+            if (kop == _RETURN_VALUE) {
+                ret_idx = k;
+                break;
+            }
+            if (first_callee_idx < 0) {
+                if (kop == _LOAD_FAST_BORROW_0 ||
+                    (kop == _LOAD_FAST_BORROW && buffer[k].oparg == 0))
+                {
+                    first_callee_idx = k;
+                    continue;
+                }
+                callee_ok = false;
+                break;
+            }
+            if (kop == _LOAD_FAST_BORROW ||
+                (kop >= _LOAD_FAST_BORROW_0 && kop <= _LOAD_FAST_BORROW_7))
+            {
+                int v = (kop == _LOAD_FAST_BORROW) ? (int)buffer[k].oparg :
+                        (int)(kop - _LOAD_FAST_BORROW_0);
+                if (v < 0 || v > nargs) {
+                    callee_ok = false;
+                    break;
+                }
+            }
+            else if (kop == _LOAD_CONST_INLINE_BORROW ||
+                     kop == _LOAD_CONST_INLINE ||
+                     kop == _LOAD_SMALL_INT ||
+                     (kop == _LOAD_ATTR_SLOT && (buffer[k].operand0 >> 13) != 0) ||
+                     kop == _LOAD_ATTR_SLOT_NO_POP ||
+                     (kop == _STORE_ATTR_SLOT && ((buffer[k].operand0 >> 13) != 0 || buffer[k].oparg == 255)) ||
+                     kop == _BINARY_OP_ADD_FLOAT ||
+                     kop == _BINARY_OP_ADD_FLOAT_INPLACE ||
+                     kop == _BINARY_OP_ADD_FLOAT_INPLACE_RIGHT ||
+                     kop == _BINARY_OP_SUBTRACT_FLOAT ||
+                     kop == _BINARY_OP_SUBTRACT_FLOAT_INPLACE ||
+                     kop == _BINARY_OP_SUBTRACT_FLOAT_INPLACE_RIGHT ||
+                     kop == _BINARY_OP_MULTIPLY_FLOAT ||
+                     kop == _BINARY_OP_MULTIPLY_FLOAT_INPLACE ||
+                     kop == _BINARY_OP_MULTIPLY_FLOAT_INPLACE_RIGHT ||
+                     kop == _BINARY_OP_TRUEDIV_FLOAT ||
+                     kop == _BINARY_OP_TRUEDIV_FLOAT_INPLACE ||
+                     kop == _BINARY_OP_TRUEDIV_FLOAT_INPLACE_RIGHT ||
+                     kop == _BINARY_OP_FMA_FLOAT_INPLACE ||
+                     kop == _BINARY_OP_BITWISE_INT ||
+                     kop == _BINARY_OP_ARITH_FLOAT_INT ||
+                     kop == _BINARY_OP_ADD_INT ||
+                     kop == _BINARY_OP_ADD_INT_INPLACE ||
+                     kop == _BINARY_OP_ADD_INT_INPLACE_RIGHT ||
+                     kop == _BINARY_OP_SUBTRACT_INT ||
+                     kop == _BINARY_OP_SUBTRACT_INT_INPLACE ||
+                     kop == _BINARY_OP_SUBTRACT_INT_INPLACE_RIGHT ||
+                     kop == _BINARY_OP_MULTIPLY_INT ||
+                     kop == _BINARY_OP_MULTIPLY_INT_INPLACE ||
+                     kop == _BINARY_OP_MULTIPLY_INT_INPLACE_RIGHT ||
+                     kop == _UNARY_NEGATIVE_FLOAT_INPLACE ||
+                     kop == _POP_TOP_NOP ||
+                     kop == _POP_TOP_FLOAT ||
+                     kop == _POP_TOP_INT)
+            {
+                /* Allowed non-escaping, guard-free instruction */
+            }
+            else {
+                callee_ok = false;
+                break;
+            }
+        }
+        if (!callee_ok || ret_idx < 0 || first_callee_idx < 0) {
+            continue;
+        }
+
+        _PyUOpInstruction saved_arg[8];
+        saved_arg[0] = buffer[self_idx];
+        for (int a = 1; a <= nargs; a++) {
+            saved_arg[a] = buffer[arg_idx[a]];
+            buffer[arg_idx[a]].opcode = _NOP;
+        }
+        buffer[callable_idx].opcode = _NOP;
+        buffer[swap_idx].opcode = _NOP;
+        if (check_stk_idx >= 0) {
+            buffer[check_stk_idx].opcode = _NOP;
+        }
+        if (check_rec_idx >= 0) {
+            buffer[check_rec_idx].opcode = _NOP;
+        }
+        buffer[i].opcode = _NOP;
+        buffer[s_idx].opcode = _NOP;
+        buffer[p_idx].opcode = _NOP;
+        buffer[first_callee_idx].opcode = _NOP;
+        buffer[ret_idx].opcode = _NOP;
+
+        for (int k = p_idx + 1; k < ret_idx; k++) {
+            uint16_t kop = buffer[k].opcode;
+            if (kop == _CHECK_RECURSION_REMAINING || kop == _SET_IP) {
+                buffer[k].opcode = _NOP;
+                continue;
+            }
+            if (k == first_callee_idx) {
+                continue;
+            }
+            if (kop == _LOAD_FAST_BORROW ||
+                (kop >= _LOAD_FAST_BORROW_0 && kop <= _LOAD_FAST_BORROW_7))
+            {
+                int v = (kop == _LOAD_FAST_BORROW) ? (int)buffer[k].oparg :
+                        (int)(kop - _LOAD_FAST_BORROW_0);
+                buffer[k] = saved_arg[v];
+            }
+            buffer[k].target = call_target;
+        }
+        i = ret_idx;
+    }
+}
+
+static void
+eliminate_non_escaping_struct_allocs(_PyUOpInstruction *buffer, int length)
+{
+    for (int i = 0; i < length; i++) {
+        if (buffer[i].opcode != _ALLOCATE_OBJECT) {
+            continue;
+        }
+        int init_idx = i + 1;
+        while (init_idx < length &&
+               (buffer[init_idx].opcode == _NOP ||
+                buffer[init_idx].opcode == _SET_IP ||
+                buffer[init_idx].opcode == _CHECK_VALIDITY))
+        {
+            init_idx++;
+        }
+        if (init_idx >= length || buffer[init_idx].opcode != _CREATE_INIT_FRAME) {
+            continue;
+        }
+        int nargs = (int)buffer[init_idx].oparg;
+        if (nargs < 1 || nargs > 7) {
+            continue;
+        }
+        int p_idx = init_idx + 1;
+        while (p_idx < length &&
+               (buffer[p_idx].opcode == _NOP ||
+                buffer[p_idx].opcode == _SET_IP ||
+                buffer[p_idx].opcode == _CHECK_VALIDITY))
+        {
+            p_idx++;
+        }
+        if (p_idx >= length || buffer[p_idx].opcode != _PUSH_FRAME) {
+            continue;
+        }
+
+        /* Parse __init__ body: must be a sequence of
+         * _LOAD_FAST_BORROW_<arg> + _LOAD_FAST_BORROW_0 (self) +
+         * _STORE_ATTR_SLOT (strict slot) + _POP_TOP_NOP
+         * followed by _LOAD_CONST_INLINE_BORROW(None) + _RETURN_VALUE +
+         * _POP_TOP_NOP + _MAKE_HEAP_SAFE + _RETURN_VALUE. */
+        uint64_t arg_slot_offset[8] = {0};
+        int k = p_idx + 1;
+        bool init_ok = true;
+        int stores_seen = 0;
+        int ret_idx = -1;
+        while (k < length) {
+            uint16_t kop = buffer[k].opcode;
+            if (kop == _NOP || kop == _SET_IP || kop == _CHECK_VALIDITY ||
+                kop == _CHECK_RECURSION_REMAINING || kop == _TIER2_RESUME_CHECK)
+            {
+                k++;
+                continue;
+            }
+            int av = -1;
+            if (kop == _LOAD_FAST_BORROW) {
+                av = (int)buffer[k].oparg;
+            }
+            else if (kop >= _LOAD_FAST_BORROW_1 && kop <= _LOAD_FAST_BORROW_7) {
+                av = (int)(kop - _LOAD_FAST_BORROW_0);
+            }
+            if (av >= 1 && av <= nargs && arg_slot_offset[av] == 0) {
+                int k1 = k + 1;
+                while (k1 < length &&
+                       (buffer[k1].opcode == _NOP ||
+                        buffer[k1].opcode == _SET_IP ||
+                        buffer[k1].opcode == _CHECK_VALIDITY))
+                {
+                    k1++;
+                }
+                if (k1 >= length ||
+                    (buffer[k1].opcode != _LOAD_FAST_BORROW_0 &&
+                     !(buffer[k1].opcode == _LOAD_FAST_BORROW && buffer[k1].oparg == 0)))
+                {
+                    init_ok = false;
+                    break;
+                }
+                int k2 = k1 + 1;
+                while (k2 < length &&
+                       (buffer[k2].opcode == _NOP ||
+                        buffer[k2].opcode == _SET_IP ||
+                        buffer[k2].opcode == _CHECK_VALIDITY))
+                {
+                    k2++;
+                }
+                if (k2 >= length || buffer[k2].opcode != _STORE_ATTR_SLOT ||
+                    ((buffer[k2].operand0 >> 13) == 0 && buffer[k2].oparg != 255))
+                {
+                    init_ok = false;
+                    break;
+                }
+                int k3 = k2 + 1;
+                while (k3 < length &&
+                       (buffer[k3].opcode == _NOP ||
+                        buffer[k3].opcode == _SET_IP ||
+                        buffer[k3].opcode == _CHECK_VALIDITY))
+                {
+                    k3++;
+                }
+                if (k3 >= length || buffer[k3].opcode != _POP_TOP_NOP) {
+                    init_ok = false;
+                    break;
+                }
+                arg_slot_offset[av] = buffer[k2].operand0 & 0x1FFF;
+                stores_seen++;
+                k = k3 + 1;
+                continue;
+            }
+            if (kop == _LOAD_CONST_INLINE_BORROW || kop == _LOAD_CONST_INLINE) {
+                int k1 = k + 1;
+                while (k1 < length &&
+                       (buffer[k1].opcode == _NOP ||
+                        buffer[k1].opcode == _SET_IP ||
+                        buffer[k1].opcode == _CHECK_VALIDITY))
+                {
+                    k1++;
+                }
+                int k2 = k1 + 1;
+                while (k2 < length &&
+                       (buffer[k2].opcode == _NOP ||
+                        buffer[k2].opcode == _SET_IP ||
+                        buffer[k2].opcode == _CHECK_VALIDITY))
+                {
+                    k2++;
+                }
+                int k3 = k2 + 1;
+                while (k3 < length &&
+                       (buffer[k3].opcode == _NOP ||
+                        buffer[k3].opcode == _SET_IP ||
+                        buffer[k3].opcode == _CHECK_VALIDITY))
+                {
+                    k3++;
+                }
+                int k4 = k3 + 1;
+                while (k4 < length &&
+                       (buffer[k4].opcode == _NOP ||
+                        buffer[k4].opcode == _SET_IP ||
+                        buffer[k4].opcode == _CHECK_VALIDITY))
+                {
+                    k4++;
+                }
+                if (k4 < length &&
+                    buffer[k1].opcode == _RETURN_VALUE &&
+                    buffer[k2].opcode == _POP_TOP_NOP &&
+                    buffer[k3].opcode == _MAKE_HEAP_SAFE &&
+                    buffer[k4].opcode == _RETURN_VALUE)
+                {
+                    ret_idx = k4;
+                    break;
+                }
+            }
+            init_ok = false;
+            break;
+        }
+        if (!init_ok || ret_idx < 0 || stores_seen != nargs) {
+            continue;
+        }
+
+        /* Must be immediately stored into a local variable via _SWAP_FAST + _POP_TOP */
+        int sw_idx = ret_idx + 1;
+        while (sw_idx < length &&
+               (buffer[sw_idx].opcode == _NOP ||
+                buffer[sw_idx].opcode == _SET_IP ||
+                buffer[sw_idx].opcode == _CHECK_VALIDITY))
+        {
+            sw_idx++;
+        }
+        if (sw_idx >= length) {
+            continue;
+        }
+        int item_var = -1;
+        if (buffer[sw_idx].opcode == _SWAP_FAST) {
+            item_var = (int)buffer[sw_idx].oparg;
+        }
+        else if (buffer[sw_idx].opcode >= _SWAP_FAST_0 &&
+                 buffer[sw_idx].opcode <= _SWAP_FAST_7)
+        {
+            item_var = (int)(buffer[sw_idx].opcode - _SWAP_FAST_0);
+        }
+        if (item_var < 0) {
+            continue;
+        }
+        int sw_pop = sw_idx + 1;
+        while (sw_pop < length &&
+               (buffer[sw_pop].opcode == _NOP || buffer[sw_pop].opcode == _SET_IP))
+        {
+            sw_pop++;
+        }
+        if (sw_pop >= length ||
+            (buffer[sw_pop].opcode != _POP_TOP &&
+             buffer[sw_pop].opcode != _POP_TOP_NOP))
+        {
+            continue;
+        }
+
+        /* Scan backwards from i (_ALLOCATE_OBJECT) to find _PUSH_NULL, callable load,
+         * and the argument expressions for 1..nargs.
+         * We support (nargs - 1) single-uop loads for arguments 1..(nargs - 1), and
+         * a pure multi-uop (or single-uop) expression for argument nargs. */
+        int push_null_idx = -1;
+        int scan = i - 1;
+        int depth = 0;
+        while (scan >= 0) {
+            uint16_t sop = buffer[scan].opcode;
+            if (sop == _PUSH_NULL && depth == nargs) {
+                push_null_idx = scan;
+                break;
+            }
+            if (sop == _LOAD_FAST_BORROW || sop == _LOAD_FAST ||
+                (sop >= _LOAD_FAST_BORROW_0 && sop <= _LOAD_FAST_BORROW_7) ||
+                (sop >= _LOAD_FAST_0 && sop <= _LOAD_FAST_7) ||
+                sop == _LOAD_CONST_INLINE_BORROW || sop == _LOAD_CONST_INLINE ||
+                sop == _LOAD_SMALL_INT)
+            {
+                depth++;
+            }
+            else if (sop == _BINARY_OP_ADD_INT || sop == _BINARY_OP_ADD_INT_INPLACE ||
+                     sop == _BINARY_OP_ADD_INT_INPLACE_RIGHT ||
+                     sop == _BINARY_OP_SUBTRACT_INT || sop == _BINARY_OP_SUBTRACT_INT_INPLACE ||
+                     sop == _BINARY_OP_SUBTRACT_INT_INPLACE_RIGHT ||
+                     sop == _BINARY_OP_MULTIPLY_INT || sop == _BINARY_OP_MULTIPLY_INT_INPLACE ||
+                     sop == _BINARY_OP_MULTIPLY_INT_INPLACE_RIGHT ||
+                     sop == _BINARY_OP_BITWISE_INT || sop == _BINARY_OP_EXTEND)
+            {
+                depth++;
+            }
+            else if (sop == _POP_TOP_INT || sop == _POP_TOP_FLOAT ||
+                     sop == _POP_TOP_NOP || sop == _POP_TOP)
+            {
+                depth--;
+            }
+            else if (sop == _NOP || sop == _SET_IP || sop == _CHECK_VALIDITY ||
+                     sop == _CHECK_RECURSION_REMAINING ||
+                     sop == _CHECK_STACK_SPACE_OPERAND ||
+                     sop == _CHECK_FUNCTION_VERSION_INLINE ||
+                     sop == _GUARD_TOS_INT || sop == _GUARD_NOS_INT ||
+                     sop == _GUARD_TOS_FLOAT || sop == _GUARD_NOS_FLOAT ||
+                     sop == _GUARD_BINARY_OP_EXTEND)
+            {
+                /* stack depth unchanged */
+            }
+            else {
+                break;
+            }
+            scan--;
+        }
+        if (push_null_idx <= 0) {
+            continue;
+        }
+        int call_load_idx = push_null_idx - 1;
+        while (call_load_idx >= 0 &&
+               (buffer[call_load_idx].opcode == _NOP ||
+                buffer[call_load_idx].opcode == _SET_IP ||
+                buffer[call_load_idx].opcode == _CHECK_VALIDITY ||
+                buffer[call_load_idx].opcode == _GUARD_GLOBALS_VERSION))
+        {
+            call_load_idx--;
+        }
+        if (call_load_idx < 0 ||
+            (buffer[call_load_idx].opcode != _LOAD_CONST_INLINE &&
+             buffer[call_load_idx].opcode != _LOAD_CONST_INLINE_BORROW))
+        {
+            continue;
+        }
+
+        /* Collect single-uop arguments 1..(nargs - 1) immediately after _PUSH_NULL */
+        int single_arg_idx[8];
+        int cur = push_null_idx + 1;
+        bool args_valid = true;
+        for (int a = 1; a < nargs; a++) {
+            while (cur < i &&
+                   (buffer[cur].opcode == _NOP ||
+                    buffer[cur].opcode == _SET_IP ||
+                    buffer[cur].opcode == _CHECK_VALIDITY))
+            {
+                cur++;
+            }
+            if (cur >= i) {
+                args_valid = false;
+                break;
+            }
+            uint16_t aop = buffer[cur].opcode;
+            if (aop == _LOAD_FAST_BORROW ||
+                (aop >= _LOAD_FAST_BORROW_0 && aop <= _LOAD_FAST_BORROW_7) ||
+                aop == _LOAD_CONST_INLINE_BORROW ||
+                aop == _LOAD_CONST_INLINE ||
+                aop == _LOAD_SMALL_INT)
+            {
+                single_arg_idx[a] = cur;
+                cur++;
+            }
+            else {
+                args_valid = false;
+                break;
+            }
+        }
+        if (!args_valid) {
+            continue;
+        }
+        /* Ensure arg nargs leaves an owned reference on the stack (ends with a binary op) */
+        bool last_arg_owned = false;
+        int check_rec_idx = -1;
+        int check_stk_idx = -1;
+        for (int m = cur; m < i; m++) {
+            uint16_t mop = buffer[m].opcode;
+            if (mop == _BINARY_OP_ADD_INT || mop == _BINARY_OP_ADD_INT_INPLACE ||
+                mop == _BINARY_OP_ADD_INT_INPLACE_RIGHT ||
+                mop == _BINARY_OP_SUBTRACT_INT || mop == _BINARY_OP_SUBTRACT_INT_INPLACE ||
+                mop == _BINARY_OP_SUBTRACT_INT_INPLACE_RIGHT ||
+                mop == _BINARY_OP_MULTIPLY_INT || mop == _BINARY_OP_MULTIPLY_INT_INPLACE ||
+                mop == _BINARY_OP_MULTIPLY_INT_INPLACE_RIGHT ||
+                mop == _BINARY_OP_BITWISE_INT)
+            {
+                last_arg_owned = true;
+            }
+            else if (mop == _CHECK_RECURSION_REMAINING) {
+                check_rec_idx = m;
+            }
+            else if (mop == _CHECK_STACK_SPACE_OPERAND) {
+                check_stk_idx = m;
+            }
+        }
+        if (!last_arg_owned) {
+            continue;
+        }
+
+        /* Verify that all subsequent uses of item_var in the trace are
+         * _LOAD_FAST_BORROW(item_var) + _LOAD_ATTR_SLOT + _POP_TOP_NOP,
+         * and that between sw_pop and the last use of item_var there are no side-exits. */
+        int use_load_idx[8];
+        int use_slot_idx[8];
+        int use_pop_idx[8];
+        int use_arg_num[8];
+        int num_uses = 0;
+        int last_use_idx = -1;
+        bool uses_valid = true;
+        for (int u = sw_pop + 1; u < length; u++) {
+            uint16_t uop = buffer[u].opcode;
+            int lv = -1;
+            if (uop == _LOAD_FAST || uop == _LOAD_FAST_BORROW ||
+                uop == _SWAP_FAST || uop == _LOAD_FAST_AND_CLEAR)
+            {
+                lv = (int)buffer[u].oparg;
+            }
+            else if (uop >= _LOAD_FAST_0 && uop <= _LOAD_FAST_7) {
+                lv = (int)(uop - _LOAD_FAST_0);
+            }
+            else if (uop >= _LOAD_FAST_BORROW_0 && uop <= _LOAD_FAST_BORROW_7) {
+                lv = (int)(uop - _LOAD_FAST_BORROW_0);
+            }
+            else if (uop >= _SWAP_FAST_0 && uop <= _SWAP_FAST_7) {
+                lv = (int)(uop - _SWAP_FAST_0);
+            }
+            if (lv != item_var) {
+                continue;
+            }
+            if (uop != _LOAD_FAST_BORROW &&
+                !(uop >= _LOAD_FAST_BORROW_0 && uop <= _LOAD_FAST_BORROW_7))
+            {
+                uses_valid = false;
+                break;
+            }
+            int s1 = u + 1;
+            while (s1 < length && (buffer[s1].opcode == _NOP || buffer[s1].opcode == _SET_IP)) {
+                s1++;
+            }
+            if (s1 >= length || buffer[s1].opcode != _LOAD_ATTR_SLOT) {
+                uses_valid = false;
+                break;
+            }
+            int s2 = s1 + 1;
+            while (s2 < length && (buffer[s2].opcode == _NOP || buffer[s2].opcode == _SET_IP)) {
+                s2++;
+            }
+            if (s2 >= length || buffer[s2].opcode != _POP_TOP_NOP || num_uses >= 8) {
+                uses_valid = false;
+                break;
+            }
+            uint64_t off = buffer[s1].operand0 & 0x1FFF;
+            int matched_arg = -1;
+            for (int a = 1; a <= nargs; a++) {
+                if (arg_slot_offset[a] == off) {
+                    matched_arg = a;
+                    break;
+                }
+            }
+            if (matched_arg < 1) {
+                uses_valid = false;
+                break;
+            }
+            use_load_idx[num_uses] = u;
+            use_slot_idx[num_uses] = s1;
+            use_pop_idx[num_uses] = s2;
+            use_arg_num[num_uses] = matched_arg;
+            num_uses++;
+            last_use_idx = s2;
+            u = s2;
+        }
+        if (!uses_valid || num_uses == 0) {
+            continue;
+        }
+        /* Check no side-exits between sw_pop and last_use_idx */
+        bool region_safe = true;
+        for (int m = sw_pop + 1; m <= last_use_idx; m++) {
+            uint16_t mop = buffer[m].opcode;
+            if (mop == _NOP || mop == _SET_IP || mop == _CHECK_VALIDITY ||
+                mop == _LOAD_FAST_BORROW ||
+                (mop >= _LOAD_FAST_BORROW_0 && mop <= _LOAD_FAST_BORROW_7) ||
+                mop == _LOAD_CONST_INLINE_BORROW || mop == _LOAD_CONST_INLINE ||
+                mop == _LOAD_SMALL_INT ||
+                mop == _LOAD_ATTR_SLOT || mop == _POP_TOP_NOP)
+            {
+                continue;
+            }
+            region_safe = false;
+            break;
+        }
+        if (!region_safe) {
+            continue;
+        }
+
+        /* Save single-uop argument instructions and NOP out allocation + __init__ */
+        _PyUOpInstruction saved_arg[8];
+        for (int a = 1; a < nargs; a++) {
+            saved_arg[a] = buffer[single_arg_idx[a]];
+            if (saved_arg[a].opcode == _LOAD_CONST_INLINE) {
+                saved_arg[a].opcode = _LOAD_CONST_INLINE_BORROW;
+            }
+            buffer[single_arg_idx[a]].opcode = _NOP;
+        }
+        buffer[call_load_idx].opcode = _NOP;
+        buffer[push_null_idx].opcode = _NOP;
+        if (check_rec_idx >= 0) {
+            buffer[check_rec_idx].opcode = _NOP;
+        }
+        if (check_stk_idx >= 0) {
+            buffer[check_stk_idx].opcode = _NOP;
+        }
+        for (int m = i; m <= ret_idx; m++) {
+            buffer[m].opcode = _NOP;
+        }
+
+        /* Replace each slot load on item_var with the corresponding scalar value */
+        for (int u = 0; u < num_uses; u++) {
+            int a = use_arg_num[u];
+            if (a < nargs) {
+                uint32_t tgt = buffer[use_load_idx[u]].target;
+                buffer[use_load_idx[u]] = saved_arg[a];
+                buffer[use_load_idx[u]].target = tgt;
+            }
+            /* If a == nargs, use_load_idx[u] is already _LOAD_FAST_BORROW(item_var)! */
+            buffer[use_slot_idx[u]].opcode = _NOP;
+            buffer[use_pop_idx[u]].opcode = _NOP;
+        }
+        i = last_use_idx;
+    }
 }
 
 //  0 - failure, no error raised, just fall back to Tier 1
@@ -1795,7 +4237,29 @@ _Py_uop_analyze_and_optimize(
     length = remove_unneeded_uops(output, length);
     assert(length > 0);
 
+    inline_leaf_strict_calls(output, length);
+    eliminate_non_escaping_struct_allocs(output, length);
+    length = remove_unneeded_uops(output, length);
+
+    bool has_strict_slots = false;
+    for (int i = 0; i < length; i++) {
+        if ((output[i].opcode == _LOAD_ATTR_SLOT ||
+             output[i].opcode == _STORE_ATTR_SLOT) &&
+            (output[i].operand0 >> 13) != 0)
+        {
+            has_strict_slots = true;
+            break;
+        }
+    }
+    if (has_strict_slots && length > 180) {
+        mark_inplace_float_attr_updates(output, length);
+        length = remove_unneeded_uops(output, length);
+    }
+
     length = hoist_loop_preheader_guards(output, length, curr_stacklen);
+
+    mark_inplace_float_attr_updates(output, length);
+    length = remove_unneeded_uops(output, length);
 
     OPT_STAT_INC(optimizer_successes);
     return length;

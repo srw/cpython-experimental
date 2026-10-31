@@ -20,6 +20,57 @@
         /* _LOAD_BYTECODE is not a viable micro-op for tier 2 */
 
         case _RESUME_CHECK: {
+            if ((oparg & RESUME_OPARG_LOCATION_MASK) == RESUME_AT_FUNC_START) {
+                PyCodeObject *co = get_current_code_object(ctx);
+                uint32_t sig = (co != NULL && ((uintptr_t)co->co_extra & 1)) ? (uint32_t)(uintptr_t)co->co_extra : 0;
+                if (sig > 0x1F) {
+                    int nparams = co->co_argcount + co->co_kwonlyargcount;
+                    if (nparams > 9) {
+                        nparams = 9;
+                    }
+                    bool all_proven = true;
+                    for (int i = 0; i < nparams; i++) {
+                        uint32_t tag = (sig >> (5 + i * 3)) & 0x7;
+                        if (tag == 0) {
+                            continue;
+                        }
+                        JitOptRef loc = GETLOCAL(i);
+                        PyTypeObject *expected_type = NULL;
+                        if (tag == 1) {
+                            expected_type = &PyLong_Type;
+                        }
+                        else if (tag == 2) {
+                            expected_type = &PyFloat_Type;
+                        }
+                        else if (tag == 3) {
+                            expected_type = &PyUnicode_Type;
+                        }
+                        else if (tag == 4) {
+                            expected_type = &PyBool_Type;
+                        }
+                        else if (tag == 5) {
+                            expected_type = &_PyNone_Type;
+                        }
+                        if (expected_type != NULL && !sym_matches_type(loc, expected_type)) {
+                            all_proven = false;
+                            PyTypeObject *known_type = sym_get_type(loc);
+                            if (known_type != NULL && known_type != expected_type) {
+                                ctx->done = true;
+                                break;
+                            }
+                            if (tag == 5) {
+                                sym_set_const(loc, Py_None);
+                            }
+                            else {
+                                sym_set_type(loc, expected_type);
+                            }
+                        }
+                    }
+                    if (all_proven && ctx->curr_frame_depth > 1) {
+                        this_instr->oparg |= 0x80;
+                    }
+                }
+            }
             break;
         }
 
@@ -1136,6 +1187,19 @@
             break;
         }
 
+        case _BINARY_OP_FMA_FLOAT_INPLACE: {
+            JitOptRef res;
+            JitOptRef l;
+            JitOptRef r;
+            res = sym_new_not_null(ctx);
+            l = sym_new_not_null(ctx);
+            r = sym_new_not_null(ctx);
+            stack_pointer[-3] = res;
+            stack_pointer[-2] = l;
+            stack_pointer[-1] = r;
+            break;
+        }
+
         case _BINARY_OP_TRUEDIV_FLOAT: {
             JitOptRef res;
             JitOptRef l;
@@ -1311,6 +1375,19 @@
                     sym_set_compact_int(right);
                 }
                 else {
+                    if ((d->lhs_type == &PyFloat_Type && d->rhs_type == &PyLong_Type &&
+                            sym_matches_type(left, &PyFloat_Type) && sym_is_compact_int(right) &&
+                            (oparg != NB_TRUE_DIVIDE && oparg != NB_INPLACE_TRUE_DIVIDE &&
+                                oparg != NB_FLOOR_DIVIDE && oparg != NB_INPLACE_FLOOR_DIVIDE &&
+                                oparg != NB_REMAINDER && oparg != NB_INPLACE_REMAINDER)) ||
+                        (d->lhs_type == &PyLong_Type && d->rhs_type == &PyFloat_Type &&
+                            sym_is_compact_int(left) && sym_matches_type(right, &PyFloat_Type) &&
+                            (oparg != NB_TRUE_DIVIDE && oparg != NB_INPLACE_TRUE_DIVIDE &&
+                                oparg != NB_FLOOR_DIVIDE && oparg != NB_INPLACE_FLOOR_DIVIDE &&
+                                oparg != NB_REMAINDER && oparg != NB_INPLACE_REMAINDER)))
+                    {
+                        ADD_OP(_NOP, 0, 0);
+                    }
                     sym_set_type(left, d->lhs_type);
                     sym_set_type(right, d->rhs_type);
                     if (d->lhs_type == &PyLong_Type) {
@@ -1335,26 +1412,97 @@
             PyObject *descr = (PyObject *)this_instr->operand0;
             _PyBinaryOpSpecializationDescr *d = (_PyBinaryOpSpecializationDescr *)descr;
             if (d != NULL && d->result_type != NULL) {
+                bool rhs_pos_const = false;
+                if (sym_is_const(ctx, right)) {
+                    PyObject *rc = sym_get_const(ctx, right);
+                    if (rc != NULL && _PyLong_CheckExactAndCompact(rc) &&
+                        _PyLong_CompactValue((PyLongObject *)rc) > 0)
+                    {
+                        rhs_pos_const = true;
+                    }
+                }
                 if (d->result_type == &PyLong_Type &&
                     sym_is_compact_int(left) && sym_is_compact_int(right) &&
                     (oparg == NB_AND || oparg == NB_OR || oparg == NB_XOR ||
-                        oparg == NB_RSHIFT || oparg == NB_FLOOR_DIVIDE || oparg == NB_REMAINDER ||
                         oparg == NB_INPLACE_AND || oparg == NB_INPLACE_OR || oparg == NB_INPLACE_XOR ||
-                        oparg == NB_INPLACE_RSHIFT || oparg == NB_INPLACE_FLOOR_DIVIDE ||
-                        oparg == NB_INPLACE_REMAINDER))
+                        ((oparg == NB_RSHIFT || oparg == NB_INPLACE_RSHIFT ||
+                                oparg == NB_FLOOR_DIVIDE || oparg == NB_INPLACE_FLOOR_DIVIDE ||
+                                oparg == NB_REMAINDER || oparg == NB_INPLACE_REMAINDER) && rhs_pos_const)))
+                {
+                    REPLACE_OP(this_instr, _BINARY_OP_BITWISE_INT, oparg, 0);
+                    res = PyJitRef_MakeUnique(sym_new_compact_int(ctx));
+                }
+                else if (d->result_type == &PyFloat_Type &&
+                     (oparg == NB_MULTIPLY || oparg == NB_INPLACE_MULTIPLY ||
+                      oparg == NB_ADD || oparg == NB_INPLACE_ADD ||
+                      oparg == NB_SUBTRACT || oparg == NB_INPLACE_SUBTRACT) &&
+                     ((sym_matches_type(left, &PyFloat_Type) && sym_is_compact_int(right)) ||
+                      (sym_is_compact_int(left) && sym_matches_type(right, &PyFloat_Type))))
+                {
+                    REPLACE_OP(this_instr, _BINARY_OP_ARITH_FLOAT_INT, oparg, 0);
+                    res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
+                }
+                else if (d->result_type == &PyLong_Type &&
+                     sym_is_compact_int(left) && sym_is_compact_int(right) &&
+                     (oparg == NB_RSHIFT || oparg == NB_FLOOR_DIVIDE || oparg == NB_REMAINDER ||
+                      oparg == NB_INPLACE_RSHIFT || oparg == NB_INPLACE_FLOOR_DIVIDE ||
+                      oparg == NB_INPLACE_REMAINDER))
                 {
                     res = sym_new_compact_int(ctx);
+                    if (d->result_unique) {
+                        res = PyJitRef_MakeUnique(res);
+                    }
                 }
                 else {
                     res = sym_new_type(ctx, d->result_type);
-                }
-                if (d->result_unique) {
-                    res = PyJitRef_MakeUnique(res);
+                    if (d->result_unique) {
+                        res = PyJitRef_MakeUnique(res);
+                    }
                 }
             }
             else {
                 res = sym_new_not_null(ctx);
             }
+            l = left;
+            r = right;
+            CHECK_STACK_BOUNDS(1);
+            stack_pointer[-2] = res;
+            stack_pointer[-1] = l;
+            stack_pointer[0] = r;
+            stack_pointer += 1;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            break;
+        }
+
+        case _BINARY_OP_BITWISE_INT: {
+            JitOptRef right;
+            JitOptRef left;
+            JitOptRef res;
+            JitOptRef l;
+            JitOptRef r;
+            right = stack_pointer[-1];
+            left = stack_pointer[-2];
+            res = PyJitRef_MakeUnique(sym_new_compact_int(ctx));
+            l = left;
+            r = right;
+            CHECK_STACK_BOUNDS(1);
+            stack_pointer[-2] = res;
+            stack_pointer[-1] = l;
+            stack_pointer[0] = r;
+            stack_pointer += 1;
+            ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            break;
+        }
+
+        case _BINARY_OP_ARITH_FLOAT_INT: {
+            JitOptRef right;
+            JitOptRef left;
+            JitOptRef res;
+            JitOptRef l;
+            JitOptRef r;
+            right = stack_pointer[-1];
+            left = stack_pointer[-2];
+            res = PyJitRef_MakeUnique(sym_new_type(ctx, &PyFloat_Type));
             l = left;
             r = right;
             CHECK_STACK_BOUNDS(1);
@@ -2011,7 +2159,44 @@
         case _MAKE_HEAP_SAFE: {
             JitOptRef value;
             value = stack_pointer[-1];
-            if (sym_is_immortal(PyJitRef_Unwrap(value))) {
+            PyCodeObject *co = get_current_code_object(ctx);
+            uint32_t strict_sig = (co != NULL && ((uintptr_t)co->co_extra & 1)) ? (uint32_t)(uintptr_t)co->co_extra : 0;
+            uint32_t strict_ret = (strict_sig >> 2) & 0x7;
+            bool ret_proven = (strict_ret == 0);
+            PyTypeObject *expected_type = NULL;
+            if (strict_ret == 1) {
+                expected_type = &PyLong_Type;
+            }
+            else if (strict_ret == 2) {
+                expected_type = &PyFloat_Type;
+            }
+            else if (strict_ret == 3) {
+                expected_type = &PyUnicode_Type;
+            }
+            else if (strict_ret == 4) {
+                expected_type = &PyBool_Type;
+            }
+            else if (strict_ret == 5) {
+                expected_type = &_PyNone_Type;
+            }
+            if (expected_type != NULL) {
+                if (sym_matches_type(value, expected_type)) {
+                    ret_proven = true;
+                }
+                else {
+                    PyTypeObject *known_type = sym_get_type(value);
+                    if (known_type != NULL && known_type != expected_type) {
+                        ctx->done = true;
+                    }
+                    else if (strict_ret == 5) {
+                        sym_set_const(value, Py_None);
+                    }
+                    else {
+                        sym_set_type(value, expected_type);
+                    }
+                }
+            }
+            if (ret_proven && ((!PyJitRef_IsBorrowed(value) && strict_sig != 0) || sym_is_immortal(PyJitRef_Unwrap(value)))) {
                 ADD_OP(_NOP, 0, 0);
             }
             value = PyJitRef_StripBorrowInfo(value);
@@ -2947,14 +3132,57 @@
             JitOptRef o;
             owner = stack_pointer[-1];
             uint16_t index = (uint16_t)this_instr->operand0;
+            this_instr->oparg = 0;
             attr = sym_new_not_null(ctx);
-            (void)index;
+            uint16_t strict_tag = index >> 13;
+            if (strict_tag == 1) {
+                attr = sym_new_compact_int(ctx);
+            }
+            else if (strict_tag == 2) {
+                attr = sym_new_type(ctx, &PyFloat_Type);
+            }
+            else if (strict_tag == 3) {
+                attr = sym_new_type(ctx, &PyUnicode_Type);
+            }
+            else if (strict_tag == 4) {
+                attr = sym_new_type(ctx, &PyBool_Type);
+            }
+            else {
+                PyTypeObject *tp = sym_get_type(owner);
+                if (tp != NULL && tp->tp_members != NULL) {
+                    Py_ssize_t raw_offset = (Py_ssize_t)(index & 0x1FFF);
+                    for (PyMemberDef *mp = tp->tp_members; mp->name != NULL; mp++) {
+                        if (mp->offset == raw_offset) {
+                            if (mp->flags & _Py_STRICT_SLOT_FLOAT) {
+                                attr = sym_new_type(ctx, &PyFloat_Type);
+                            }
+                            else if (mp->flags & _Py_STRICT_SLOT_INT) {
+                                attr = sym_new_compact_int(ctx);
+                            }
+                            else if (mp->flags & _Py_STRICT_SLOT_STR) {
+                                attr = sym_new_type(ctx, &PyUnicode_Type);
+                            }
+                            else if (mp->flags & _Py_STRICT_SLOT_BOOL) {
+                                attr = sym_new_type(ctx, &PyBool_Type);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
             o = owner;
             CHECK_STACK_BOUNDS(1);
             stack_pointer[-1] = attr;
             stack_pointer[0] = o;
             stack_pointer += 1;
             ASSERT_WITHIN_STACK_BOUNDS(__FILE__, __LINE__);
+            break;
+        }
+
+        case _LOAD_ATTR_SLOT_NO_POP: {
+            JitOptRef attr;
+            attr = sym_new_not_null(ctx);
+            stack_pointer[-1] = attr;
             break;
         }
 
@@ -3111,7 +3339,14 @@
             owner = stack_pointer[-1];
             value = stack_pointer[-2];
             uint16_t index = (uint16_t)this_instr->operand0;
-            (void)index;
+            uint16_t strict_tag = index >> 13;
+            if ((strict_tag == 1 && sym_matches_type(value, &PyLong_Type)) ||
+                (strict_tag == 2 && sym_matches_type(value, &PyFloat_Type)) ||
+                (strict_tag == 3 && sym_matches_type(value, &PyUnicode_Type)) ||
+                (strict_tag == 4 && sym_matches_type(value, &PyBool_Type)))
+            {
+                REPLACE_OP(this_instr, _STORE_ATTR_SLOT, 255, index & 0x1FFF);
+            }
             sym_set_unshared_local(value, false);
             o = owner;
             CHECK_STACK_BOUNDS(-1);
@@ -4066,6 +4301,10 @@
                 ADD_OP(_NOP, 0, 0);
             }
             else {
+                PyCodeObject *co = get_current_code_object(ctx);
+                if (co != NULL && ((uintptr_t)co->co_extra & 1)) {
+                    this_instr->oparg = 0;
+                }
                 sym_set_type(iter, &PyRangeIter_Type);
             }
             break;
@@ -4323,7 +4562,19 @@
                 ctx->done = true;
                 break;
             }
-            sym_set_const(callable, func);
+            if (sym_is_const(ctx, callable)) {
+                PyCodeObject *callee_co = (PyCodeObject *)PyFunction_GET_CODE(func);
+                PyCodeObject *caller_co = get_current_code_object(ctx);
+                if ((callee_co != NULL && ((uintptr_t)callee_co->co_extra & 1)) ||
+                    (caller_co != NULL && ((uintptr_t)caller_co->co_extra & 1)))
+                {
+                    ADD_OP(_CHECK_FUNCTION_VERSION_INLINE, 0, func_version);
+                    uop_buffer_last(&ctx->out_buffer)->operand1 = (uintptr_t)func;
+                }
+            }
+            else {
+                sym_set_const(callable, func);
+            }
             _Py_BloomFilter_Add(dependencies, func);
             break;
         }
@@ -4715,6 +4966,7 @@
             shim->stack_pointer[0] = self;
             shim->stack_pointer++;
             assert((int)(shim->stack_pointer - shim->stack) == 1);
+            ctx->frame->caller = true;
             ctx->frame = shim;
             ctx->curr_frame_depth++;
             assert((this_instr + 1)->opcode == _PUSH_FRAME);
@@ -5355,7 +5607,19 @@
                 ctx->done = true;
                 break;
             }
-            sym_set_const(callable, func);
+            if (sym_is_const(ctx, callable)) {
+                PyCodeObject *callee_co = (PyCodeObject *)PyFunction_GET_CODE(func);
+                PyCodeObject *caller_co = get_current_code_object(ctx);
+                if ((callee_co != NULL && ((uintptr_t)callee_co->co_extra & 1)) ||
+                    (caller_co != NULL && ((uintptr_t)caller_co->co_extra & 1)))
+                {
+                    ADD_OP(_CHECK_FUNCTION_VERSION_INLINE, 0, func_version);
+                    uop_buffer_last(&ctx->out_buffer)->operand1 = (uintptr_t)func;
+                }
+            }
+            else {
+                sym_set_const(callable, func);
+            }
             _Py_BloomFilter_Add(dependencies, func);
             break;
         }
@@ -5970,6 +6234,58 @@
         }
 
         case _TIER2_RESUME_CHECK: {
+            PyCodeObject *co = get_current_code_object(ctx);
+            uint32_t sig = (co != NULL && ((uintptr_t)co->co_extra & 1)) ? (uint32_t)(uintptr_t)co->co_extra : 0;
+            if (sig > 0x1F) {
+                int nparams = co->co_argcount + co->co_kwonlyargcount;
+                if (nparams > 9) {
+                    nparams = 9;
+                }
+                bool all_proven = true;
+                for (int i = 0; i < nparams; i++) {
+                    uint32_t tag = (sig >> (5 + i * 3)) & 0x7;
+                    if (tag == 0) {
+                        continue;
+                    }
+                    JitOptRef loc = GETLOCAL(i);
+                    PyTypeObject *expected_type = NULL;
+                    if (tag == 1) {
+                        expected_type = &PyLong_Type;
+                    }
+                    else if (tag == 2) {
+                        expected_type = &PyFloat_Type;
+                    }
+                    else if (tag == 3) {
+                        expected_type = &PyUnicode_Type;
+                    }
+                    else if (tag == 4) {
+                        expected_type = &PyBool_Type;
+                    }
+                    else if (tag == 5) {
+                        expected_type = &_PyNone_Type;
+                    }
+                    if (expected_type != NULL && !sym_matches_type(loc, expected_type)) {
+                        all_proven = false;
+                        PyTypeObject *known_type = sym_get_type(loc);
+                        if (known_type != NULL && known_type != expected_type) {
+                            ctx->done = true;
+                            break;
+                        }
+                        if (tag == 5) {
+                            sym_set_const(loc, Py_None);
+                        }
+                        else {
+                            sym_set_type(loc, expected_type);
+                        }
+                    }
+                }
+                if (all_proven) {
+                    this_instr->oparg |= 0x80;
+                }
+            }
+            else {
+                this_instr->oparg |= 0x80;
+            }
             break;
         }
 

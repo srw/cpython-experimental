@@ -8,6 +8,7 @@
 #include "pycore_dict.h"          // _PyDict_KeysSize()
 #include "pycore_function.h"      // _PyFunction_GetVersionForCurrentState()
 #include "pycore_interpframe.h"   // _PyInterpreterFrame
+#include "pycore_floatobject.h"   // _PyFloat_ExactDealloc()
 #include "pycore_long.h"          // _PyLong_IsNegative(), _PyLong_GetOne()
 #include "pycore_memoryobject.h"  // _PyMemoryView_FromBufferProc()
 #include "pycore_modsupport.h"    // _PyArg_NoKwnames()
@@ -2674,6 +2675,28 @@ clear_slots(PyTypeObject *type, PyObject *self)
     PyMemberDef *mp;
 
     n = Py_SIZE(type);
+    if (n <= 0) {
+        return;
+    }
+    if (type->tp_itemsize == 0 && type->tp_base == &PyBaseObject_Type) {
+        PyObject **slot_ptr = (PyObject **)((char *)self + sizeof(PyObject));
+        for (i = 0; i < n; i++) {
+            PyObject *obj = slot_ptr[i];
+            if (obj != NULL) {
+                slot_ptr[i] = NULL;
+                if (PyFloat_CheckExact(obj)) {
+                    _Py_DECREF_SPECIALIZED(obj, _PyFloat_ExactDealloc);
+                }
+                else if (PyLong_CheckExact(obj)) {
+                    _Py_DECREF_SPECIALIZED(obj, _PyLong_ExactDealloc);
+                }
+                else {
+                    Py_DECREF(obj);
+                }
+            }
+        }
+        return;
+    }
     mp = _PyHeapType_GET_MEMBERS((PyHeapTypeObject *)type);
     for (i = 0; i < n; i++, mp++) {
         if (mp->type == Py_T_OBJECT_EX && !(mp->flags & Py_READONLY)) {
@@ -4762,9 +4785,10 @@ type_new_descriptors(const type_new_ctx *ctx, PyTypeObject *type, PyObject *dict
                          ctx->base->tp_name);
             return -1;
         }
+        PyObject *strict_types = PyDict_GetItemString(dict, "__strict_slot_types__");
         for (Py_ssize_t i = 0; i < nslot; i++, mp++) {
-            mp->name = PyUnicode_AsUTF8(
-                PyTuple_GET_ITEM(et->ht_slots, i));
+            PyObject *slot_name_obj = PyTuple_GET_ITEM(et->ht_slots, i);
+            mp->name = PyUnicode_AsUTF8(slot_name_obj);
             if (mp->name == NULL) {
                 return -1;
             }
@@ -4772,6 +4796,21 @@ type_new_descriptors(const type_new_ctx *ctx, PyTypeObject *type, PyObject *dict
             mp->offset = slotoffset;
             if (after_items) {
                 mp->flags |= _Py_AFTER_ITEMS;
+            }
+            if (strict_types != NULL && PyDict_Check(strict_types)) {
+                PyObject *st = PyDict_GetItemWithError(strict_types, slot_name_obj);
+                if (st == (PyObject *)&PyLong_Type) {
+                    mp->flags |= _Py_STRICT_SLOT_INT;
+                }
+                else if (st == (PyObject *)&PyFloat_Type) {
+                    mp->flags |= _Py_STRICT_SLOT_FLOAT;
+                }
+                else if (st == (PyObject *)&PyUnicode_Type) {
+                    mp->flags |= _Py_STRICT_SLOT_STR;
+                }
+                else if (st == (PyObject *)&PyBool_Type) {
+                    mp->flags |= _Py_STRICT_SLOT_BOOL;
+                }
             }
 
             /* __dict__ and __weakref__ are already filtered out */
@@ -5068,6 +5107,11 @@ type_new_impl(type_new_ctx *ctx)
 
     if (type_new_init_subclass(type, ctx->kwds) < 0) {
         goto error;
+    }
+
+    PyObject *strict_freeze = PyDict_GetItemString(type->tp_dict, "__strict_freeze__");
+    if (strict_freeze != NULL && PyObject_IsTrue(strict_freeze) > 0) {
+        type->tp_flags |= Py_TPFLAGS_IMMUTABLETYPE;
     }
 
     assert(_PyType_CheckConsistency(type));

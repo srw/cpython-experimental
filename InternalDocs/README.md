@@ -45,6 +45,8 @@ Program Execution
 
 - [The JIT](jit.md)
 
+- [Free-Threaded Tier 2 / JIT, `@strict` / `@struct`, and Auto-Parallel Runtime Architecture](nogil_jit_architecture.md)
+
 - [Garbage Collector Design](garbage_collector.md)
 
 - [Exception Handling](exception_handling.md)

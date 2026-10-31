@@ -167,6 +167,9 @@ dummy_func(
         }
 
         op(_CHECK_PERIODIC_IF_NOT_YIELD_FROM, (--)) {
+            if ((oparg & RESUME_OPARG_LOCATION_MASK) == RESUME_AT_FUNC_START) {
+                ERROR_IF(_PyEval_StrictParamsErrCheck(tstate, frame));
+            }
             if ((oparg & RESUME_OPARG_LOCATION_MASK) < RESUME_AFTER_YIELD_FROM) {
                 int err = check_periodics(tstate);
                 ERROR_IF(err != 0);
@@ -241,6 +244,9 @@ dummy_func(
             DEOPT_IF(frame->tlbc_index !=
                      ((_PyThreadStateImpl *)tstate)->tlbc_index);
             #endif
+            if ((oparg & (RESUME_OPARG_LOCATION_MASK | 0x80)) == RESUME_AT_FUNC_START) {
+                DEOPT_IF(_PyEval_StrictParamsCheck(frame));
+            }
         }
 
         macro(RESUME_CHECK_JIT) =
@@ -369,13 +375,14 @@ dummy_func(
         }
 
         op(_POP_TOP_INT, (value --)) {
-            assert(PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
+            assert(PyStackRef_IsNull(value) || PyStackRef_IsTaggedInt(value) ||
+                   PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
             PyStackRef_CLOSE_SPECIALIZED(value, _PyLong_ExactDealloc);
         }
 
         op(_POP_TOP_FLOAT, (value --)) {
             assert(PyFloat_CheckExact(PyStackRef_AsPyObjectBorrow(value)));
-            PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc);
+            PyStackRef_CLOSE_SPECIALIZED(value, _PyFloat_ExactDealloc_Fast);
         }
 
         op(_POP_TOP_UNICODE, (value --)) {
@@ -826,7 +833,8 @@ dummy_func(
                 ((PyFloatObject *)left_o)->ob_fval *
                 ((PyFloatObject *)right_o)->ob_fval;
             if (PyStackRef_RefcountOnObject(left) &&
-                _PyObject_IsUniquelyReferenced(left_o))
+                (oparg == 255 ? _PyObject_IsInplaceFloatTarget(left_o)
+                              : _PyObject_IsUniquelyReferenced(left_o)))
             {
                 ((PyFloatObject *)left_o)->ob_fval = dres;
                 res = left;
@@ -864,7 +872,8 @@ dummy_func(
                 ((PyFloatObject *)left_o)->ob_fval +
                 ((PyFloatObject *)right_o)->ob_fval;
             if (PyStackRef_RefcountOnObject(left) &&
-                _PyObject_IsUniquelyReferenced(left_o))
+                (oparg == 255 ? _PyObject_IsInplaceFloatTarget(left_o)
+                              : _PyObject_IsUniquelyReferenced(left_o)))
             {
                 ((PyFloatObject *)left_o)->ob_fval = dres;
                 res = left;
@@ -902,7 +911,8 @@ dummy_func(
                 ((PyFloatObject *)left_o)->ob_fval -
                 ((PyFloatObject *)right_o)->ob_fval;
             if (PyStackRef_RefcountOnObject(left) &&
-                _PyObject_IsUniquelyReferenced(left_o))
+                (oparg == 255 ? _PyObject_IsInplaceFloatTarget(left_o)
+                              : _PyObject_IsUniquelyReferenced(left_o)))
             {
                 ((PyFloatObject *)left_o)->ob_fval = dres;
                 res = left;
@@ -987,6 +997,52 @@ dummy_func(
             l = left;
             r = PyStackRef_NULL;
             INPUTS_DEAD();
+        }
+
+        tier2 op(_BINARY_OP_FMA_FLOAT_INPLACE, (acc, left, right -- res, l, r)) {
+            PyObject *acc_o = PyStackRef_AsPyObjectBorrow(acc);
+            PyObject *left_o = PyStackRef_AsPyObjectBorrow(left);
+            PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);
+            assert(PyFloat_CheckExact(acc_o));
+            assert(PyFloat_CheckExact(left_o));
+            assert(PyFloat_CheckExact(right_o));
+            if ((oparg & 4) ||
+                (PyStackRef_RefcountOnObject(acc) &&
+                 ((oparg & 2) ? _PyObject_IsInplaceFloatTarget(acc_o)
+                              : _PyObject_IsUniquelyReferenced(acc_o))))
+            {
+                STAT_INC(BINARY_OP, hit);
+                STAT_INC(BINARY_OP, hit);
+                double prod = ((PyFloatObject *)left_o)->ob_fval * ((PyFloatObject *)right_o)->ob_fval;
+                if (oparg & 1) {
+                    ((PyFloatObject *)acc_o)->ob_fval -= prod;
+                }
+                else {
+                    ((PyFloatObject *)acc_o)->ob_fval += prod;
+                }
+                res = acc;
+                l = left;
+                r = right;
+                INPUTS_DEAD();
+            }
+            else {
+                STAT_INC(BINARY_OP, hit);
+                STAT_INC(BINARY_OP, hit);
+                double prod = ((PyFloatObject *)left_o)->ob_fval * ((PyFloatObject *)right_o)->ob_fval;
+                double dres = (oparg & 1)
+                    ? (((PyFloatObject *)acc_o)->ob_fval - prod)
+                    : (((PyFloatObject *)acc_o)->ob_fval + prod);
+                PyObject *d = _PyFloat_FromDouble_Fast(dres);
+                if (d == NULL) {
+                    ERROR_NO_POP();
+                }
+                l = left;
+                r = right;
+                DEAD(left);
+                DEAD(right);
+                PyStackRef_CLOSE_SPECIALIZED(acc, _PyFloat_ExactDealloc_Fast);
+                res = PyStackRef_FromPyObjectSteal(d);
+            }
         }
 
         // Float true division --- not specialized at tier 1, emitted by the
@@ -1136,23 +1192,36 @@ dummy_func(
 
             STAT_INC(BINARY_OP, hit);
 
-            PyObject *res_o = d->action(left_o, right_o);
-            if (res_o == NULL) {
+            res = _PyEval_BinaryOpExtendFast(d, &left, &right, left_o, right_o, oparg);
+            if (PyStackRef_IsNull(res)) {
                 ERROR_NO_POP();
             }
-            assert(d->result_type == NULL || Py_TYPE(res_o) == d->result_type);
-            assert(!d->result_unique || Py_REFCNT(res_o) == 1 || _Py_IsImmortal(res_o));
-            // The JIT and tier 2 optimizer assume that float results from
-            // binary operations are always uniquely referenced (refcount == 1).
-            // If this assertion fails, update the optimizer to stop marking
-            // float results as unique in optimizer_bytecodes.c.
-            assert(!PyFloat_CheckExact(res_o) || Py_REFCNT(res_o) == 1);
-
-            res = PyStackRef_FromPyObjectSteal(res_o);
             l = left;
             r = right;
             DEAD(left);
             DEAD(right);
+        }
+
+        tier2 op(_BINARY_OP_BITWISE_INT, (left, right -- res, l, r)) {
+            PyObject *left_o = PyStackRef_AsPyObjectBorrow(left);
+            PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);
+            STAT_INC(BINARY_OP, hit);
+            res = _PyCompactLong_BitwiseInPlace(&left, &right, (PyLongObject *)left_o, (PyLongObject *)right_o, oparg);
+            DEAD(left);
+            DEAD(right);
+            l = left;
+            r = right;
+        }
+
+        tier2 op(_BINARY_OP_ARITH_FLOAT_INT, (left, right -- res, l, r)) {
+            PyObject *left_o = PyStackRef_AsPyObjectBorrow(left);
+            PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);
+            STAT_INC(BINARY_OP, hit);
+            res = _PyFloat_MixedArithInPlace(&left, &right, left_o, right_o, oparg);
+            DEAD(left);
+            DEAD(right);
+            l = left;
+            r = right;
         }
 
         macro(BINARY_OP_EXTEND) =
@@ -1556,7 +1625,15 @@ dummy_func(
             INPUTS_DEAD();
             ls = list_st;
             ss = sub_st;
-            Py_DECREF(old_value);
+            if (PyFloat_CheckExact(old_value)) {
+                _Py_DECREF_SPECIALIZED(old_value, _PyFloat_ExactDealloc_Fast);
+            }
+            else if (PyLong_CheckExact(old_value)) {
+                _Py_DECREF_SPECIALIZED(old_value, _PyLong_ExactDealloc);
+            }
+            else {
+                Py_DECREF(old_value);
+            }
         }
 
         macro(STORE_SUBSCR_DICT) =
@@ -1673,6 +1750,7 @@ dummy_func(
         }
 
         op(_MAKE_HEAP_SAFE, (value -- value)) {
+            ERROR_IF(_PyEval_StrictReturnCheck(tstate, frame, value));
             value = PyStackRef_MakeHeapSafe(value);
         }
 
@@ -3122,23 +3200,19 @@ dummy_func(
 
         op(_LOAD_ATTR_SLOT, (index/1, owner -- attr, o)) {
             PyObject *owner_o = PyStackRef_AsPyObjectBorrow(owner);
-
-            PyObject **addr = (PyObject **)((char *)owner_o + index);
-            PyObject *attr_o = FT_ATOMIC_LOAD_PTR(*addr);
-            EXIT_IF(attr_o == NULL);
-            #ifdef Py_GIL_DISABLED
-            if (IS_UNSHARED_LOCAL_OBJECT(owner_o)) {
-                attr = PyStackRef_FromPyObjectNew(attr_o);
-            }
-            else {
-                int increfed = _Py_TryIncrefCompareStackRef(addr, attr_o, &attr);
-                EXIT_IF(!increfed);
-            }
-            #else
-            attr = PyStackRef_FromPyObjectNew(attr_o);
-            #endif
+            int ok = _PyEval_LoadAttrSlotFast(owner_o, index, oparg, &attr);
+            EXIT_IF(!ok);
             STAT_INC(LOAD_ATTR, hit);
             o = owner;
+            DEAD(owner);
+        }
+
+        tier2 op(_LOAD_ATTR_SLOT_NO_POP, (index/1, owner -- attr)) {
+            PyObject *owner_o = PyStackRef_AsPyObjectBorrow(owner);
+            PyObject *attr_o = *(PyObject **)((char *)owner_o + index);
+            EXIT_IF(attr_o == NULL);
+            STAT_INC(LOAD_ATTR, hit);
+            attr = PyStackRef_FromPyObjectBorrow(attr_o);
             DEAD(owner);
         }
 
@@ -3288,7 +3362,17 @@ dummy_func(
             #endif
             o = owner;
             DEAD(owner);
-            Py_XDECREF(old_value);
+            if (old_value != NULL) {
+                if (PyFloat_CheckExact(old_value)) {
+                    _Py_DECREF_SPECIALIZED(old_value, _PyFloat_ExactDealloc_Fast);
+                }
+                else if (PyLong_CheckExact(old_value)) {
+                    _Py_DECREF_SPECIALIZED(old_value, _PyLong_ExactDealloc);
+                }
+                else {
+                    Py_DECREF(old_value);
+                }
+            }
         }
 
         op(_LOCK_OBJECT, (value -- value)) {
@@ -3343,7 +3427,17 @@ dummy_func(
             STAT_INC(STORE_ATTR, hit);
             o = owner;
             DEAD(owner);
-            Py_XDECREF(old_value);
+            if (old_value != NULL) {
+                if (PyFloat_CheckExact(old_value)) {
+                    _Py_DECREF_SPECIALIZED(old_value, _PyFloat_ExactDealloc_Fast);
+                }
+                else if (PyLong_CheckExact(old_value)) {
+                    _Py_DECREF_SPECIALIZED(old_value, _PyLong_ExactDealloc);
+                }
+                else {
+                    Py_DECREF(old_value);
+                }
+            }
         }
 
         macro(STORE_ATTR_WITH_HINT) =
@@ -3355,23 +3449,48 @@ dummy_func(
 
         op(_STORE_ATTR_SLOT, (index/1, value, owner -- o)) {
             PyObject *owner_o = PyStackRef_AsPyObjectBorrow(owner);
-            char *addr = (char *)owner_o + index;
-            PyObject *old_value;
-            if (IS_UNSHARED_LOCAL_OBJECT(owner_o)) {
+            PyObject *val_o = PyStackRef_AsPyObjectBorrow(value);
+            uint16_t strict_tag = index >> 13;
+            if (strict_tag != 0) {
+                DEOPT_IF((strict_tag == 1 && (!PyLong_CheckExact(val_o) || PyBool_Check(val_o))) ||
+                         (strict_tag == 2 && !PyFloat_CheckExact(val_o)) ||
+                         (strict_tag == 3 && !PyUnicode_CheckExact(val_o)) ||
+                         (strict_tag == 4 && !PyBool_Check(val_o)));
+            }
+            char *addr = (char *)owner_o + (index & 0x1FFF);
+            PyObject *old_value = *(PyObject **)addr;
+            if (old_value == val_o) {
                 STAT_INC(STORE_ATTR, hit);
-                old_value = *(PyObject **)addr;
-                *(PyObject **)addr = PyStackRef_AsPyObjectSteal(value);
+                INPUTS_DEAD();
+                o = owner;
+                PyStackRef_CLOSE(value);
             }
             else {
-                DEOPT_IF(!LOCK_SHARED_OBJECT(owner_o));
-                STAT_INC(STORE_ATTR, hit);
-                old_value = *(PyObject **)addr;
-                FT_ATOMIC_STORE_PTR_RELEASE(*(PyObject **)addr, PyStackRef_AsPyObjectSteal(value));
-                UNLOCK_SHARED_OBJECT(owner_o);
+                if (IS_UNSHARED_LOCAL_OBJECT(owner_o)) {
+                    STAT_INC(STORE_ATTR, hit);
+                    *(PyObject **)addr = PyStackRef_AsPyObjectSteal(value);
+                }
+                else {
+                    DEOPT_IF(!LOCK_SHARED_OBJECT(owner_o));
+                    STAT_INC(STORE_ATTR, hit);
+                    old_value = *(PyObject **)addr;
+                    FT_ATOMIC_STORE_PTR_RELEASE(*(PyObject **)addr, PyStackRef_AsPyObjectSteal(value));
+                    UNLOCK_SHARED_OBJECT(owner_o);
+                }
+                INPUTS_DEAD();
+                o = owner;
+                if (old_value != NULL) {
+                    if (PyFloat_CheckExact(old_value)) {
+                        _Py_DECREF_SPECIALIZED(old_value, _PyFloat_ExactDealloc_Fast);
+                    }
+                    else if (PyLong_CheckExact(old_value)) {
+                        _Py_DECREF_SPECIALIZED(old_value, _PyLong_ExactDealloc);
+                    }
+                    else {
+                        Py_DECREF(old_value);
+                    }
+                }
             }
-            INPUTS_DEAD();
-            o = owner;
-            Py_XDECREF(old_value);
         }
 
         macro(STORE_ATTR_SLOT) =
@@ -4278,6 +4397,14 @@ dummy_func(
 #ifdef Py_GIL_DISABLED
             EXIT_IF(!_PyObject_IsUniquelyReferenced((PyObject *)r));
 #endif
+            #if TIER_TWO
+            if (oparg & 0x8000) {
+                _PyStackRef idx_local = frame->localsplus[oparg & 0x7FFF];
+                if (!PyStackRef_IsNull(idx_local) && !PyStackRef_IsTaggedInt(idx_local)) {
+                    EXIT_IF(!PyLong_CheckExact(PyStackRef_AsPyObjectBorrow(idx_local)));
+                }
+            }
+            #endif
         }
 
         replaced op(_ITER_JUMP_RANGE, (iter, null_or_index -- iter, null_or_index)) {
@@ -4987,7 +5114,9 @@ dummy_func(
             PyCodeObject *code = (PyCodeObject *)init_func->func_code;
             EXIT_IF(!_PyThreadState_HasStackSpace(tstate, code->co_framesize + _Py_InitCleanup.co_framesize));
             STAT_INC(CALL, hit);
-            PyObject *self_o = PyType_GenericAlloc(tp, 0);
+            PyObject *self_o = (tp->tp_dictoffset == 0 && (tp->tp_flags & Py_TPFLAGS_IMMUTABLETYPE))
+                ? _PyType_AllocNoTrack(tp, 0)
+                : PyType_GenericAlloc(tp, 0);
             if (self_o == NULL) {
                 ERROR_NO_POP();
             }
@@ -6569,7 +6698,10 @@ dummy_func(
 
         tier2 op(_HANDLE_PENDING_AND_DEOPT, (--)) {
             SYNC_SP();
-            int err = _Py_HandlePending(tstate);
+            int err = _PyEval_StrictParamsErrCheck(tstate, frame) || _Py_HandlePending(tstate);
+            if (err && frame->owner != FRAME_OWNED_BY_INTERPRETER) {
+                frame->instr_ptr = _PyFrame_GetBytecode(frame) + CURRENT_TARGET();
+            }
             GOTO_TIER_ONE(err ? NULL : _PyFrame_GetBytecode(frame) + CURRENT_TARGET());
             Py_UNREACHABLE();
         }
@@ -6595,9 +6727,9 @@ dummy_func(
             uintptr_t iversion = FT_ATOMIC_LOAD_UINTPTR_ACQUIRE(_PyFrame_GetCode(frame)->_co_instrumentation_version);
             uintptr_t eval_breaker = _Py_atomic_load_uintptr_relaxed(&tstate->eval_breaker);
 #ifdef Py_GIL_DISABLED
-            HANDLE_PENDING_AND_DEOPT_IF(eval_breaker != iversion || !_Py_atomic_load_uint8((uint8_t *)&current_executor->vm_data.valid));
+            HANDLE_PENDING_AND_DEOPT_IF(eval_breaker != iversion || !_Py_atomic_load_uint8((uint8_t *)&current_executor->vm_data.valid) || (!(oparg & 0x80) && _PyEval_StrictParamsCheck(frame)));
 #else
-            HANDLE_PENDING_AND_DEOPT_IF(eval_breaker != iversion);
+            HANDLE_PENDING_AND_DEOPT_IF(eval_breaker != iversion || (!(oparg & 0x80) && _PyEval_StrictParamsCheck(frame)));
 #endif
         }
 

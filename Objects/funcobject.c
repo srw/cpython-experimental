@@ -224,6 +224,9 @@ PyFunction_NewWithQualName(PyObject *code, PyObject *globals, PyObject *qualname
     op->func_typeparams = NULL;
     op->vectorcall = _PyFunction_Vectorcall;
     op->func_version = FUNC_VERSION_UNSET;
+    if (code_obj->co_version != 0) {
+        _PyFunction_SetVersion(op, code_obj->co_version);
+    }
     if (((code_obj->co_flags & CO_NESTED) == 0) ||
         (code_obj->co_flags & CO_METHOD)) {
         // Use deferred reference counting for top-level functions, but not
@@ -1052,6 +1055,35 @@ _Py_set_function_type_params(PyThreadState *Py_UNUSED(ignored), PyObject *func,
     return Py_NewRef(func);
 }
 
+static PyObject *
+func_get_strict_sig(PyObject *self, void *Py_UNUSED(ignored))
+{
+    PyFunctionObject *op = _PyFunction_CAST(self);
+    PyCodeObject *co = (PyCodeObject *)op->func_code;
+    uintptr_t extra = (uintptr_t)co->co_extra;
+    uint32_t sig = (extra & 1) ? (uint32_t)extra : 0;
+    return PyLong_FromUnsignedLong(sig);
+}
+
+static int
+func_set_strict_sig(PyObject *self, PyObject *value, void *Py_UNUSED(ignored))
+{
+    if (value == NULL || !PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "__strict_sig__ must be an int");
+        return -1;
+    }
+    unsigned long sig = PyLong_AsUnsignedLong(value);
+    if (sig == (unsigned long)-1 && PyErr_Occurred()) {
+        return -1;
+    }
+    PyFunctionObject *op = _PyFunction_CAST(self);
+    PyCodeObject *co = (PyCodeObject *)op->func_code;
+    if (co->co_extra == NULL || ((uintptr_t)co->co_extra & 1) != 0) {
+        co->co_extra = (void *)(uintptr_t)sig;
+    }
+    return 0;
+}
+
 static PyGetSetDef func_getsetlist[] = {
     {"__code__", func_get_code, func_set_code},
     {"__defaults__", func_get_defaults, func_set_defaults},
@@ -1063,6 +1095,7 @@ static PyGetSetDef func_getsetlist[] = {
     {"__module__", func_get_module, func_set_module},
     {"__name__", func_get_name, func_set_name},
     {"__qualname__", func_get_qualname, func_set_qualname},
+    {"__strict_sig__", func_get_strict_sig, func_set_strict_sig},
     FUNCTION___TYPE_PARAMS___GETSETDEF
     {NULL} /* Sentinel */
 };

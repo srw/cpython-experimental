@@ -612,15 +612,27 @@ gen_try_set_executing(PyGenObject *gen)
 }
 
 // Macro for inplace float binary ops (tier 2 only).
-// Mutates the uniquely-referenced TARGET operand in place.
+// Mutates the uniquely-referenced (or single-slot attribute) TARGET operand in place.
 // TARGET must be either left or right.
+static inline int
+_PyObject_IsInplaceFloatTarget(PyObject *ob)
+{
+#if !defined(Py_GIL_DISABLED)
+    return Py_REFCNT(ob) <= 2;
+#else
+    return (_Py_IsOwnedByCurrentThread(ob) &&
+            _Py_atomic_load_uint32_relaxed(&ob->ob_ref_local) <= 2 &&
+            _Py_atomic_load_ssize_relaxed(&ob->ob_ref_shared) == 0);
+#endif
+}
+
 #define FLOAT_INPLACE_OP(left, right, TARGET, OP)                        \
     do {                                                                 \
         PyObject *left_o = PyStackRef_AsPyObjectBorrow(left);            \
         PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);          \
         assert(PyFloat_CheckExact(left_o));                              \
         assert(PyFloat_CheckExact(right_o));                             \
-        assert(_PyObject_IsUniquelyReferenced(                           \
+        assert(_PyObject_IsInplaceFloatTarget(                           \
             PyStackRef_AsPyObjectBorrow(TARGET)));                       \
         STAT_INC(BINARY_OP, hit);                                        \
         double _dres =                                                   \
@@ -639,7 +651,7 @@ gen_try_set_executing(PyGenObject *gen)
         PyObject *right_o = PyStackRef_AsPyObjectBorrow(right);          \
         assert(PyFloat_CheckExact(left_o));                              \
         assert(PyFloat_CheckExact(right_o));                             \
-        assert(_PyObject_IsUniquelyReferenced(                           \
+        assert(_PyObject_IsInplaceFloatTarget(                           \
             PyStackRef_AsPyObjectBorrow(TARGET)));                       \
         STAT_INC(BINARY_OP, hit);                                        \
         double _divisor = ((PyFloatObject *)right_o)->ob_fval;           \
@@ -708,6 +720,7 @@ gen_try_set_executing(PyGenObject *gen)
     Py_TYPE(ITER)->_tp_iteritem((ITER), (INDEX))
 
 #include "pycore_freelist.h"
+#include "pycore_range.h"
 
 static inline Py_ALWAYS_INLINE PyObject *
 _PyFloat_FromDouble_Fast(double fval)
@@ -720,18 +733,33 @@ _PyFloat_FromDouble_Fast(double fval)
     return PyFloat_FromDouble(fval);
 }
 
+static inline Py_ALWAYS_INLINE void
+_PyFloat_ExactDealloc_Fast(PyObject *obj)
+{
+    assert(PyFloat_CheckExact(obj));
+    _Py_FREELIST_FREE(floats, obj, PyObject_Free);
+}
+
 static inline Py_ALWAYS_INLINE _PyStackRef
-_PyLong_FromLong_StackRef(long x)
+_PyLong_FromLong_RangeIter(_PyRangeIterObject *r, long x)
 {
     if (_PY_IS_SMALL_INT(x)) {
         return PyStackRef_FromPyObjectBorrow(
             (PyObject *)&_PyLong_SMALL_INTS[_PY_NSMALLNEGINTS + x]);
     }
-    if (((twodigits)x + PyLong_MASK) < ((twodigits)PyLong_MASK + PyLong_BASE)) {
+    if (__builtin_expect(((twodigits)x + PyLong_MASK) < ((twodigits)PyLong_MASK + PyLong_BASE), 1)) {
+        int slot = (int)(r->len & 1);
+        PyLongObject *cached = (PyLongObject *)r->cached_item[slot];
+        if (__builtin_expect(cached != NULL && _PyObject_IsUniquelyReferenced((PyObject *)cached), 1)) {
+            _PyLong_SetSignAndDigitCount(cached, x < 0 ? -1 : 1, 1);
+            cached->long_value.ob_digit[0] = (digit)(x < 0 ? -(twodigits)x : (twodigits)x);
+            return PyStackRef_FromPyObjectNew((PyObject *)cached);
+        }
         PyLongObject *v = _Py_FREELIST_POP(PyLongObject, ints);
         if (__builtin_expect(v != NULL, 1)) {
             _PyLong_SetSignAndDigitCount(v, x < 0 ? -1 : 1, 1);
             v->long_value.ob_digit[0] = (digit)(x < 0 ? -(twodigits)x : (twodigits)x);
+            Py_XSETREF(r->cached_item[slot], Py_NewRef((PyObject *)v));
             return PyStackRef_FromPyObjectStealMortal((PyObject *)v);
         }
     }
@@ -741,6 +769,7 @@ _PyLong_FromLong_StackRef(long x)
     }
     return PyStackRef_FromPyObjectSteal(res);
 }
+#define _PyLong_FromLong_StackRef(x) _PyLong_FromLong_RangeIter(r, (x))
 
 static inline Py_ALWAYS_INLINE stwodigits
 _PyLong_AsSTwoDigits_Fast(const PyLongObject *op)
@@ -945,7 +974,246 @@ _PyEval_BinaryOpExtendGuardFast(_PyBinaryOpSpecializationDescr *d,
     return d->guard(left_o, right_o);
 }
 
+static inline Py_ALWAYS_INLINE int
+_PyEval_LoadAttrSlotFast(PyObject *owner_o, uint16_t index, int oparg, _PyStackRef *attr_out)
+{
+    PyObject **addr = (PyObject **)((char *)owner_o + (index & 0x1FFF));
+    PyObject *attr_o = FT_ATOMIC_LOAD_PTR_ACQUIRE(*addr);
+    if (__builtin_expect(attr_o == NULL, 0)) {
+        return 0;
+    }
+    if (oparg == 254) {
+        *attr_out = PyStackRef_FromPyObjectBorrow(attr_o);
+        return 1;
+    }
+    if (oparg == 255) {
+        assert(PyFloat_CheckExact(attr_o));
+        if (!_PyObject_IsUniquelyReferenced(attr_o)) {
+            PyObject *copy = _PyFloat_FromDouble_Fast(((PyFloatObject *)attr_o)->ob_fval);
+            if (__builtin_expect(copy == NULL, 0)) {
+                PyErr_Clear();
+                return 0;
+            }
+            FT_ATOMIC_STORE_PTR_RELEASE(*addr, copy);
+            _Py_DECREF_SPECIALIZED(attr_o, _PyFloat_ExactDealloc_Fast);
+            attr_o = copy;
+        }
+        *attr_out = PyStackRef_FromPyObjectBorrow(attr_o);
+        return 1;
+    }
+#ifdef Py_GIL_DISABLED
+    if (IS_UNSHARED_LOCAL_OBJECT(owner_o)) {
+        *attr_out = PyStackRef_FromPyObjectNew(attr_o);
+        return 1;
+    }
+    return _Py_TryIncrefCompareStackRef(addr, attr_o, attr_out);
+#else
+    *attr_out = PyStackRef_FromPyObjectNew(attr_o);
+    return 1;
+#endif
+}
+
 #include "opcode.h"
+
+static inline Py_ALWAYS_INLINE _PyStackRef
+_PyCompactLong_BitwiseInPlace(_PyStackRef *pleft, _PyStackRef *pright,
+                              PyLongObject *a, PyLongObject *b, int oparg)
+{
+    if (_PyLong_BothAreCompact(a, b)) {
+        if (oparg == NB_AND || oparg == NB_INPLACE_AND) {
+            return _PyLong_FromSTwoDigitsInPlace2(
+                pleft, pright, a, b,
+                (stwodigits)(_PyLong_CompactValue(a) & _PyLong_CompactValue(b)));
+        }
+        if (oparg == NB_OR || oparg == NB_INPLACE_OR) {
+            return _PyLong_FromSTwoDigitsInPlace2(
+                pleft, pright, a, b,
+                (stwodigits)(_PyLong_CompactValue(a) | _PyLong_CompactValue(b)));
+        }
+        if (oparg == NB_XOR || oparg == NB_INPLACE_XOR) {
+            return _PyLong_FromSTwoDigitsInPlace2(
+                pleft, pright, a, b,
+                (stwodigits)(_PyLong_CompactValue(a) ^ _PyLong_CompactValue(b)));
+        }
+        if (oparg == NB_RSHIFT || oparg == NB_INPLACE_RSHIFT) {
+            Py_ssize_t rval = _PyLong_CompactValue(b);
+            if (__builtin_expect((size_t)rval < PyLong_SHIFT, 1)) {
+                return _PyLong_FromSTwoDigitsInPlace2(
+                    pleft, pright, a, b,
+                    (stwodigits)(_PyLong_CompactValue(a) >> rval));
+            }
+            return _PyLong_FromSTwoDigitsInPlace2(
+                pleft, pright, a, b,
+                _PyLong_CompactValue(a) < 0 ? -1 : 0);
+        }
+        if (oparg == NB_FLOOR_DIVIDE || oparg == NB_INPLACE_FLOOR_DIVIDE) {
+            stwodigits lhs_val = (stwodigits)_PyLong_CompactValue(a);
+            stwodigits rhs_val = (stwodigits)_PyLong_CompactValue(b);
+            stwodigits q = lhs_val / rhs_val;
+            stwodigits r = lhs_val % rhs_val;
+            if (r != 0 && ((lhs_val ^ rhs_val) < 0)) {
+                q--;
+            }
+            return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, q);
+        }
+        if (oparg == NB_REMAINDER || oparg == NB_INPLACE_REMAINDER) {
+            stwodigits lhs_val = (stwodigits)_PyLong_CompactValue(a);
+            stwodigits rhs_val = (stwodigits)_PyLong_CompactValue(b);
+            stwodigits rval = lhs_val % rhs_val;
+            if (rval != 0 && ((lhs_val ^ rhs_val) < 0)) {
+                rval += rhs_val;
+            }
+            return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, rval);
+        }
+    }
+    stwodigits lhs_val = _PyLong_AsSTwoDigits_Fast(a);
+    stwodigits rhs_val = _PyLong_AsSTwoDigits_Fast(b);
+    if (oparg == NB_AND || oparg == NB_INPLACE_AND) {
+        return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, lhs_val & rhs_val);
+    }
+    if (oparg == NB_OR || oparg == NB_INPLACE_OR) {
+        return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, lhs_val | rhs_val);
+    }
+    if (oparg == NB_XOR || oparg == NB_INPLACE_XOR) {
+        return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, lhs_val ^ rhs_val);
+    }
+    if (oparg == NB_RSHIFT || oparg == NB_INPLACE_RSHIFT) {
+        if (__builtin_expect((uint64_t)rhs_val < 2 * PyLong_SHIFT, 1)) {
+            return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, lhs_val >> rhs_val);
+        }
+        return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, lhs_val < 0 ? -1 : 0);
+    }
+    if (oparg == NB_FLOOR_DIVIDE || oparg == NB_INPLACE_FLOOR_DIVIDE) {
+        stwodigits q = lhs_val / rhs_val;
+        stwodigits r = lhs_val % rhs_val;
+        if (r != 0 && ((lhs_val ^ rhs_val) < 0)) {
+            q--;
+        }
+        return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, q);
+    }
+    stwodigits rval = lhs_val % rhs_val;
+    if (rval != 0 && ((lhs_val ^ rhs_val) < 0)) {
+        rval += rhs_val;
+    }
+    return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, rval);
+}
+
+static inline Py_ALWAYS_INLINE _PyStackRef
+_PyFloat_MixedArithInPlace(_PyStackRef *pleft, _PyStackRef *pright,
+                           PyObject *left_o, PyObject *right_o, int oparg)
+{
+    if (PyFloat_CheckExact(left_o)) {
+        double lval = ((PyFloatObject *)left_o)->ob_fval;
+        double rval = (double)_PyLong_AsSTwoDigits_Fast((PyLongObject *)right_o);
+        double dres = (oparg == NB_MULTIPLY || oparg == NB_INPLACE_MULTIPLY) ? (lval * rval) :
+                      (oparg == NB_ADD || oparg == NB_INPLACE_ADD) ? (lval + rval) : (lval - rval);
+        if (PyStackRef_RefcountOnObject(*pleft) &&
+            _PyObject_IsUniquelyReferenced(left_o))
+        {
+            ((PyFloatObject *)left_o)->ob_fval = dres;
+            _PyStackRef res = *pleft;
+            *pleft = PyStackRef_FromPyObjectBorrow(left_o);
+            return res;
+        }
+        PyObject *f = _PyFloat_FromDouble_Fast(dres);
+        return PyStackRef_FromPyObjectSteal(f);
+    }
+    else {
+        double lval = (double)_PyLong_AsSTwoDigits_Fast((PyLongObject *)left_o);
+        double rval = ((PyFloatObject *)right_o)->ob_fval;
+        double dres = (oparg == NB_MULTIPLY || oparg == NB_INPLACE_MULTIPLY) ? (lval * rval) :
+                      (oparg == NB_ADD || oparg == NB_INPLACE_ADD) ? (lval + rval) : (lval - rval);
+        if (PyStackRef_RefcountOnObject(*pright) &&
+            _PyObject_IsUniquelyReferenced(right_o))
+        {
+            ((PyFloatObject *)right_o)->ob_fval = dres;
+            _PyStackRef res = *pright;
+            *pright = PyStackRef_FromPyObjectBorrow(right_o);
+            return res;
+        }
+        PyObject *f = _PyFloat_FromDouble_Fast(dres);
+        return PyStackRef_FromPyObjectSteal(f);
+    }
+}
+
+static inline Py_ALWAYS_INLINE _PyStackRef
+_PyEval_BinaryOpExtendFast(_PyBinaryOpSpecializationDescr *d,
+                           _PyStackRef *pleft, _PyStackRef *pright,
+                           PyObject *left_o, PyObject *right_o, int oparg)
+{
+    if (PyLong_CheckExact(left_o) && PyLong_CheckExact(right_o) &&
+        (((PyLongObject *)left_o)->long_value.lv_tag < (3 << _PyLong_NON_SIZE_BITS)) &&
+        (((PyLongObject *)right_o)->long_value.lv_tag < (3 << _PyLong_NON_SIZE_BITS)))
+    {
+        PyLongObject *a = (PyLongObject *)left_o;
+        PyLongObject *b = (PyLongObject *)right_o;
+        if (oparg == NB_AND || oparg == NB_INPLACE_AND ||
+            oparg == NB_OR || oparg == NB_INPLACE_OR ||
+            oparg == NB_XOR || oparg == NB_INPLACE_XOR)
+        {
+            return _PyCompactLong_BitwiseInPlace(pleft, pright, a, b, oparg);
+        }
+        if (oparg == NB_RSHIFT || oparg == NB_INPLACE_RSHIFT) {
+            stwodigits rval = _PyLong_AsSTwoDigits_Fast(b);
+            if (__builtin_expect(rval >= 0 && rval < 2 * PyLong_SHIFT, 1)) {
+                return _PyCompactLong_BitwiseInPlace(pleft, pright, a, b, oparg);
+            }
+        }
+        if ((oparg == NB_REMAINDER || oparg == NB_INPLACE_REMAINDER) &&
+            !_PyLong_IsZero(b))
+        {
+            return _PyCompactLong_BitwiseInPlace(pleft, pright, a, b, oparg);
+        }
+    }
+    else if ((oparg == NB_MULTIPLY || oparg == NB_INPLACE_MULTIPLY) &&
+             PyLong_CheckExact(left_o) && _PyLong_IsCompact((PyLongObject *)left_o) &&
+             PyFloat_CheckExact(right_o))
+    {
+        double dres = (double)_PyLong_CompactValue((PyLongObject *)left_o) *
+                      ((PyFloatObject *)right_o)->ob_fval;
+        if (PyStackRef_RefcountOnObject(*pright) &&
+            _PyObject_IsUniquelyReferenced(right_o))
+        {
+            ((PyFloatObject *)right_o)->ob_fval = dres;
+            _PyStackRef res = *pright;
+            *pright = PyStackRef_FromPyObjectBorrow(right_o);
+            return res;
+        }
+        PyObject *f = _PyFloat_FromDouble_Fast(dres);
+        if (f == NULL) {
+            return PyStackRef_NULL;
+        }
+        return PyStackRef_FromPyObjectSteal(f);
+    }
+    else if ((oparg == NB_MULTIPLY || oparg == NB_INPLACE_MULTIPLY) &&
+             PyFloat_CheckExact(left_o) &&
+             PyLong_CheckExact(right_o) && _PyLong_IsCompact((PyLongObject *)right_o))
+    {
+        double dres = ((PyFloatObject *)left_o)->ob_fval *
+                      (double)_PyLong_CompactValue((PyLongObject *)right_o);
+        if (PyStackRef_RefcountOnObject(*pleft) &&
+            _PyObject_IsUniquelyReferenced(left_o))
+        {
+            ((PyFloatObject *)left_o)->ob_fval = dres;
+            _PyStackRef res = *pleft;
+            *pleft = PyStackRef_FromPyObjectBorrow(left_o);
+            return res;
+        }
+        PyObject *f = _PyFloat_FromDouble_Fast(dres);
+        if (f == NULL) {
+            return PyStackRef_NULL;
+        }
+        return PyStackRef_FromPyObjectSteal(f);
+    }
+    PyObject *res_o = d->action(left_o, right_o);
+    if (res_o == NULL) {
+        return PyStackRef_NULL;
+    }
+    assert(d->result_type == NULL || Py_TYPE(res_o) == d->result_type);
+    assert(!d->result_unique || Py_REFCNT(res_o) == 1 || _Py_IsImmortal(res_o));
+    assert(!PyFloat_CheckExact(res_o) || Py_REFCNT(res_o) == 1);
+    return PyStackRef_FromPyObjectSteal(res_o);
+}
 
 static inline Py_ALWAYS_INLINE _PyStackRef
 _PyEval_BinaryOpInPlace(_PyStackRef *plhs, _PyStackRef *prhs,
@@ -1015,4 +1283,115 @@ _PyEval_FrameClearAndPopFast(PyThreadState *tstate, _PyInterpreterFrame *dying)
         return;
     }
     _PyEval_FrameClearAndPop(tstate, dying);
+}
+
+static inline Py_ALWAYS_INLINE uint32_t
+_PyCode_GetStrictSig(PyCodeObject *co)
+{
+    uintptr_t extra = (uintptr_t)co->co_extra;
+    return (extra & 1) ? (uint32_t)extra : 0;
+}
+
+static inline Py_ALWAYS_INLINE int
+_PyEval_StrictTagCheck(_PyStackRef ref, uint32_t tag)
+{
+    PyObject *obj = PyStackRef_AsPyObjectBorrow(ref);
+    switch (tag) {
+        case 1: return Py_TYPE(obj) != &PyLong_Type;
+        case 2: return Py_TYPE(obj) != &PyFloat_Type;
+        case 3: return Py_TYPE(obj) != &PyUnicode_Type;
+        case 4: return Py_TYPE(obj) != &PyBool_Type;
+        case 5: return obj != Py_None;
+        default: return 0;
+    }
+}
+
+static inline const char *
+_PyEval_StrictTagName(uint32_t tag)
+{
+    switch (tag) {
+        case 1: return "int";
+        case 2: return "float";
+        case 3: return "str";
+        case 4: return "bool";
+        case 5: return "None";
+        default: return "object";
+    }
+}
+
+static inline Py_ALWAYS_INLINE int
+_PyEval_StrictParamsCheck(_PyInterpreterFrame *frame)
+{
+    uint32_t sig = _PyCode_GetStrictSig(_PyFrame_GetCode(frame));
+    if (__builtin_expect(sig > 0x1F, 0)) {
+        uint32_t param_tags = sig >> 5;
+        _PyStackRef *locals = frame->localsplus;
+        int i = 0;
+        while (param_tags != 0) {
+            uint32_t tag = param_tags & 0x7;
+            if (tag != 0 && __builtin_expect(_PyEval_StrictTagCheck(locals[i], tag), 0)) {
+                return 1;
+            }
+            param_tags >>= 3;
+            i++;
+        }
+    }
+    return 0;
+}
+
+static inline void
+_PyEval_FormatStrictParamError(PyThreadState *tstate, _PyInterpreterFrame *frame, uint32_t sig)
+{
+    PyCodeObject *co = _PyFrame_GetCode(frame);
+    uint32_t param_tags = sig >> 5;
+    _PyStackRef *locals = frame->localsplus;
+    int i = 0;
+    while (param_tags != 0) {
+        uint32_t tag = param_tags & 0x7;
+        if (tag != 0 && _PyEval_StrictTagCheck(locals[i], tag)) {
+            PyObject *val = PyStackRef_AsPyObjectBorrow(locals[i]);
+            PyObject *pname = PyTuple_GET_ITEM(co->co_localsplusnames, i);
+            _PyErr_Format(tstate, PyExc_TypeError,
+                          "@strict type violation in %U(): argument '%U' expected %s, got %s (%R)",
+                          co->co_qualname, pname, _PyEval_StrictTagName(tag),
+                          Py_TYPE(val)->tp_name, val);
+            return;
+        }
+        param_tags >>= 3;
+        i++;
+    }
+}
+
+static inline Py_ALWAYS_INLINE int
+_PyEval_StrictParamsErrCheck(PyThreadState *tstate, _PyInterpreterFrame *frame)
+{
+    uint32_t sig = _PyCode_GetStrictSig(_PyFrame_GetCode(frame));
+    if (__builtin_expect(sig > 0x1F, 0)) {
+        if (__builtin_expect(_PyEval_StrictParamsCheck(frame), 0)) {
+            tstate->current_frame = frame;
+            _PyEval_FormatStrictParamError(tstate, frame, sig);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static inline Py_ALWAYS_INLINE int
+_PyEval_StrictReturnCheck(PyThreadState *tstate, _PyInterpreterFrame *frame, _PyStackRef retval)
+{
+    uint32_t sig = _PyCode_GetStrictSig(_PyFrame_GetCode(frame));
+    if (__builtin_expect((sig & 0x1C) != 0, 0)) {
+        uint32_t tag = (sig >> 2) & 0x7;
+        if (__builtin_expect(_PyEval_StrictTagCheck(retval, tag), 0)) {
+            tstate->current_frame = frame;
+            PyCodeObject *co = _PyFrame_GetCode(frame);
+            PyObject *val = PyStackRef_AsPyObjectBorrow(retval);
+            _PyErr_Format(tstate, PyExc_TypeError,
+                          "@strict type violation in %U(): return value expected %s, got %s (%R)",
+                          co->co_qualname, _PyEval_StrictTagName(tag),
+                          Py_TYPE(val)->tp_name, val);
+            return 1;
+        }
+    }
+    return 0;
 }
