@@ -954,8 +954,6 @@ static void
 rangeiter_dealloc(PyObject *self)
 {
     _PyRangeIterObject *r = (_PyRangeIterObject *)self;
-    Py_CLEAR(r->cached_item[0]);
-    Py_CLEAR(r->cached_item[1]);
     _Py_FREELIST_FREE(range_iters, r, PyObject_Free);
 }
 
@@ -1044,8 +1042,6 @@ fast_range_iter(long start, long stop, long step, long len)
     it->start = start;
     it->step = step;
     it->len = len;
-    it->cached_item[0] = NULL;
-    it->cached_item[1] = NULL;
     return (PyObject *)it;
 }
 

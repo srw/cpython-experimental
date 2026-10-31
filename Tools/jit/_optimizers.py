@@ -323,6 +323,8 @@ class Optimizer:
         assert inst.is_branch()
         if inst.kind == InstructionKind.SHORT_BRANCH and self._is_far_target(target):
             return None
+        if not self._supports_external_relocations and self._is_external_symbol(target):
+            return None
         inverted_reloc = self._branches.get(inst.name)
         if inverted_reloc is None:
             return None
@@ -338,6 +340,13 @@ class Optimizer:
 
     def _is_far_target(self, label: str) -> bool:
         return not label.startswith(self.label_prefix)
+
+    def _is_external_symbol(self, label: str) -> bool:
+        return (
+            not label.startswith(self.label_prefix)
+            and not label.startswith(f"{self.symbol_prefix}_JIT_")
+            and label not in self.globals
+        )
 
     def _blocks(self) -> typing.Generator[_Block, None, None]:
         block: _Block | None = self._root
@@ -459,10 +468,12 @@ class Optimizer:
             ):
                 assert target.target is not None
                 assert target.target.label is not None
-                if block.instructions[
-                    -1
-                ].kind == InstructionKind.SHORT_BRANCH and self._is_far_target(
-                    target.target.label
+                if (
+                    block.instructions[-1].kind == InstructionKind.SHORT_BRANCH
+                    and self._is_far_target(target.target.label)
+                ) or (
+                    not self._supports_external_relocations
+                    and self._is_external_symbol(target.target.label)
                 ):
                     continue
                 block.target = target.target

@@ -13,7 +13,6 @@ typedef struct {
     long start;
     long step;
     long len;
-    PyObject *cached_item[2];
 } _PyRangeIterObject;
 
 #ifdef __cplusplus

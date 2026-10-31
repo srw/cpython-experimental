@@ -741,25 +741,17 @@ _PyFloat_ExactDealloc_Fast(PyObject *obj)
 }
 
 static inline Py_ALWAYS_INLINE _PyStackRef
-_PyLong_FromLong_RangeIter(_PyRangeIterObject *r, long x)
+_PyLong_FromLong_StackRef(long x)
 {
     if (_PY_IS_SMALL_INT(x)) {
         return PyStackRef_FromPyObjectBorrow(
             (PyObject *)&_PyLong_SMALL_INTS[_PY_NSMALLNEGINTS + x]);
     }
     if (__builtin_expect(((twodigits)x + PyLong_MASK) < ((twodigits)PyLong_MASK + PyLong_BASE), 1)) {
-        int slot = (int)(r->len & 1);
-        PyLongObject *cached = (PyLongObject *)r->cached_item[slot];
-        if (__builtin_expect(cached != NULL && _PyObject_IsUniquelyReferenced((PyObject *)cached), 1)) {
-            _PyLong_SetSignAndDigitCount(cached, x < 0 ? -1 : 1, 1);
-            cached->long_value.ob_digit[0] = (digit)(x < 0 ? -(twodigits)x : (twodigits)x);
-            return PyStackRef_FromPyObjectNew((PyObject *)cached);
-        }
         PyLongObject *v = _Py_FREELIST_POP(PyLongObject, ints);
         if (__builtin_expect(v != NULL, 1)) {
             _PyLong_SetSignAndDigitCount(v, x < 0 ? -1 : 1, 1);
             v->long_value.ob_digit[0] = (digit)(x < 0 ? -(twodigits)x : (twodigits)x);
-            Py_XSETREF(r->cached_item[slot], Py_NewRef((PyObject *)v));
             return PyStackRef_FromPyObjectStealMortal((PyObject *)v);
         }
     }
@@ -769,7 +761,6 @@ _PyLong_FromLong_RangeIter(_PyRangeIterObject *r, long x)
     }
     return PyStackRef_FromPyObjectSteal(res);
 }
-#define _PyLong_FromLong_StackRef(x) _PyLong_FromLong_RangeIter(r, (x))
 
 static inline Py_ALWAYS_INLINE _PyStackRef
 _PyLong_FromLong_RangeLocal(long x)
