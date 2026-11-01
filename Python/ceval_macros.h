@@ -994,10 +994,14 @@ _PyCompactLong_AddInPlace(
             pleft, pright, a, b, x, _PyCompactLong_Add);
     }
 #if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
-    stwodigits x = _PyLong_AsSTwoDigits_Fast(a) + _PyLong_AsSTwoDigits_Fast(b);
-    const stwodigits max_2digit = ((stwodigits)1 << (2 * PyLong_SHIFT)) - 1;
-    if (__builtin_expect(x >= -max_2digit && x <= max_2digit, 1)) {
-        return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, x);
+    if (__builtin_expect((a->long_value.lv_tag < (3 << _PyLong_NON_SIZE_BITS)) &&
+                         (b->long_value.lv_tag < (3 << _PyLong_NON_SIZE_BITS)), 1))
+    {
+        stwodigits x = _PyLong_AsSTwoDigits_Fast(a) + _PyLong_AsSTwoDigits_Fast(b);
+        const stwodigits max_2digit = ((stwodigits)1 << (2 * PyLong_SHIFT)) - 1;
+        if (__builtin_expect(x >= -max_2digit && x <= max_2digit, 1)) {
+            return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, x);
+        }
     }
 #endif
     return PyStackRef_NULL;
@@ -1014,10 +1018,14 @@ _PyCompactLong_SubtractInPlace(
             pleft, pright, a, b, x, _PyCompactLong_Subtract);
     }
 #if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
-    stwodigits x = _PyLong_AsSTwoDigits_Fast(a) - _PyLong_AsSTwoDigits_Fast(b);
-    const stwodigits max_2digit = ((stwodigits)1 << (2 * PyLong_SHIFT)) - 1;
-    if (__builtin_expect(x >= -max_2digit && x <= max_2digit, 1)) {
-        return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, x);
+    if (__builtin_expect((a->long_value.lv_tag < (3 << _PyLong_NON_SIZE_BITS)) &&
+                         (b->long_value.lv_tag < (3 << _PyLong_NON_SIZE_BITS)), 1))
+    {
+        stwodigits x = _PyLong_AsSTwoDigits_Fast(a) - _PyLong_AsSTwoDigits_Fast(b);
+        const stwodigits max_2digit = ((stwodigits)1 << (2 * PyLong_SHIFT)) - 1;
+        if (__builtin_expect(x >= -max_2digit && x <= max_2digit, 1)) {
+            return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, x);
+        }
     }
 #endif
     return PyStackRef_NULL;
@@ -1034,11 +1042,15 @@ _PyCompactLong_MultiplyInPlace(
             pleft, pright, a, b, x, _PyCompactLong_Multiply);
     }
 #if PYLONG_BITS_IN_DIGIT == 30 && defined(__SIZEOF_INT128__)
-    __int128 prod = (__int128)_PyLong_AsSTwoDigits_Fast(a) *
-                    (__int128)_PyLong_AsSTwoDigits_Fast(b);
-    const stwodigits max_2digit = ((stwodigits)1 << (2 * PyLong_SHIFT)) - 1;
-    if (__builtin_expect(prod >= -max_2digit && prod <= max_2digit, 1)) {
-        return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, (stwodigits)prod);
+    if (__builtin_expect((a->long_value.lv_tag < (3 << _PyLong_NON_SIZE_BITS)) &&
+                         (b->long_value.lv_tag < (3 << _PyLong_NON_SIZE_BITS)), 1))
+    {
+        __int128 prod = (__int128)_PyLong_AsSTwoDigits_Fast(a) *
+                        (__int128)_PyLong_AsSTwoDigits_Fast(b);
+        const stwodigits max_2digit = ((stwodigits)1 << (2 * PyLong_SHIFT)) - 1;
+        if (__builtin_expect(prod >= -max_2digit && prod <= max_2digit, 1)) {
+            return _PyLong_FromSTwoDigitsInPlace2(pleft, pright, a, b, (stwodigits)prod);
+        }
     }
 #endif
     return PyStackRef_NULL;
@@ -1382,6 +1394,8 @@ _PyEval_StrictTagCheck(_PyStackRef ref, uint32_t tag)
         case 3: return Py_TYPE(obj) != &PyUnicode_Type;
         case 4: return Py_TYPE(obj) != &PyBool_Type;
         case 5: return obj != Py_None;
+        case 6: return Py_TYPE(obj) != &PyList_Type;
+        case 7: return Py_TYPE(obj) != &PyDict_Type;
         default: return 0;
     }
 }
@@ -1395,6 +1409,8 @@ _PyEval_StrictTagName(uint32_t tag)
         case 3: return "str";
         case 4: return "bool";
         case 5: return "None";
+        case 6: return "list";
+        case 7: return "dict";
         default: return "object";
     }
 }

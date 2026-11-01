@@ -166,13 +166,14 @@ _LOAD_ATTR_SLOT 1         (item.price)
 4. **Allocation Elimination:** Replaces `_ALLOCATE_OBJECT`, `_CREATE_INIT_FRAME`, `_PUSH_FRAME`, `_STORE_ATTR_SLOT`, `_RETURN_VALUE`, and `_MAKE_HEAP_SAFE` with `_NOP` / `_POP_TOP`, reducing heap allocations to **zero**.
 
 ### 4.4 Loop Pre-Header Peeling, LICM, & Fused Range-Iterator Induction (`hoist_loop_preheader_guards`)
-In dynamic loops, the first iteration resolves local slot initialization (`_LOAD_FAST_CHECK`), type checks (`_GUARD_TYPE_VERSION`), and container validity (`_GUARD_LIST_VALID`).
-- `hoist_loop_preheader_guards` peels up to `64` loop-body uops into a pre-header before `_JUMP_TO_TOP` and rewrites steady-state `_LOAD_FAST` instructions in the loop body to `_LOAD_FAST_BORROW` whenever the local slot is proven unmutated or reassigned with the same type.
+In dynamic loops, the first iteration resolves local slot initialization (`_LOAD_FAST_CHECK`), type checks (`_GUARD_TYPE_VERSION`), overflow checks (`_GUARD_TOS_OVERFLOWED` / `_GUARD_NOS_OVERFLOWED`), and container validity (`_GUARD_LIST_VALID`).
+- `hoist_loop_preheader_guards` peels up to `256` loop-body uops into a pre-header before `_MAKE_WARM` and rewrites steady-state `_LOAD_FAST` instructions in the loop body to `_LOAD_FAST_BORROW` whenever the local slot is proven unmutated or reassigned with the same type.
 - Redundant `_GUARD_TYPE_VERSION_LOCKED` and `_CHECK_VALIDITY` instructions on loop-invariant receivers (`self`, outer containers) are hoisted out of the steady-state loop.
+- **Chained Integer Accumulator In-Place Reuse:** Multi-operation integer accumulators (`c = c + b - a` in `arith_loop` / `int_loop`) convert both the initial and chained `_BINARY_OP_{ADD,SUBTRACT,MULTIPLY}_INT` instructions in the steady-state loop body (`sbody`) into `*_INPLACE` with `_LOAD_FAST_AND_CLEAR`, mutating the uniquely-owned `PyLongObject` in place across the entire expression chain without intermediate allocations.
 - **Fused Range-Iterator Induction (`_PyRangeIter_StepLocal` in `_GUARD_NOT_EXHAUSTED_RANGE`):**
   In `for i in range(n)` or `for _ in range(n)` loops, both the peeled steady-state loop (`sbody`) and the fallback `safe_to_hoist_iter` path fuse `_GUARD_NOT_EXHAUSTED_RANGE + _ITER_NEXT_RANGE + _SWAP_FAST(sv) + _POP_TOP_INT` into a single non-escaping `_GUARD_NOT_EXHAUSTED_RANGE` uop:
-  - **Dead Induction Variable (`oparg = 0x8000 | sv`, e.g. `for _ in range(n)`):** Advances `r->start += r->step` and decrements `r->len` purely in registers, only materializing `frame->localsplus[sv]` on the first iteration (if `NULL`) and final iteration (`--r->len == 0`) so post-loop local state remains exact.
-  - **Live Induction Variable (`oparg = 0x4000 | sv`, e.g. `for i in range(n)`):** Writes borrowed small-int singletons (`0..256`) directly into `frame->localsplus[sv]` or mutates `((PyLongObject *)cur_o)->long_value.ob_digit[0] = (digit)value` in place when uniquely referenced (`257..PyLong_BASE-1`), cutting `float_loop` by **`2.56x`** (`29.27 ms` $\rightarrow$ `11.00 ms`) and `int_loop` by **`1.50x`** (`52.97 ms` $\rightarrow$ `34.68 ms`).
+  - **Dead Induction Variable (`oparg = 0x8000 | sv`, e.g. `for _ in range(n)`):** When `load_count[sv] == 0` and no conditional branch guard (`_GUARD_IS_TRUE_POP`, `_GUARD_IS_FALSE_POP`, etc.) or escaping uop appears in `sbody`, `_PyRangeIter_StepLocal` advances `r->start += r->step` and decrements `r->len` purely in registers, only materializing `frame->localsplus[sv]` on the first iteration (if `NULL`) and final iteration (`--r->len == 0`) so post-loop local state remains exact. This cuts `float_loop` to **`6.89 ms`** (`2.02x` faster than undecorated JIT, `7.27x` vs Tier 1), `object_attr_churn` to **`8.50 ms`** (`6.03x` faster than undecorated JIT), and `nbody_float` to **`38.00 ms`** (`4.90x` faster than undecorated JIT).
+  - **Live Induction Variable (`oparg = 0x4000 | sv`, e.g. `for i in range(n)`):** Writes borrowed small-int singletons (`0..256`) directly into `frame->localsplus[sv]` or mutates `cached_item[0]->long_value.ob_digit[0]` in place when uniquely referenced (`257..PyLong_BASE-1`), cutting `int_loop` to **`31.24 ms`** (`1.24x` faster than undecorated JIT) and `arith_loop` to **`50.85 ms`** (`1.21x` faster than undecorated JIT).
 
 ### 4.5 In-Place Box Reuse, FMA Fusion, and `_LOAD_ATTR_SLOT_NO_POP`
 In floating-point and integer kernels (such as `nbody_float`, `attr_loop`, `int_loop`, polynomial evaluation, and physics updates):
@@ -202,14 +203,14 @@ Applying `@struct` (or `@strict` to a class with field annotations):
 4. **Tier 2 Unchecked Type Seeding:** Because the C slot setter guarantees the slot's runtime type, `_LOAD_ATTR_SLOT` in `Python/optimizer_bytecodes.c` inspects `PyMemberDef.flags` on immutable `@struct` types and immediately marks the loaded symbol as a known `int` (`sym_set_compact_int`), `float`, `str`, or `bool` **without emitting any runtime type guard**.
 
 ### 5.2 `@strict`: C-Level Signature Bitmask (`_co_strict_sig`)
-When `@strict` decorates a function with primitive parameter/return annotations (`int`, `float`, `str`, `bool`, `None`) and up to 9 positional/keyword parameters:
-- `_try_enable_c_strict_sig` (`Lib/strict.py`) encodes the expected types into a 64-bit integer `co->_co_strict_sig` on `PyCodeObject`:
+When `@strict` decorates a function with primitive or container parameter/return annotations (`int`, `float`, `str`, `bool`, `None`, `list`, `dict`) and up to 9 positional/keyword parameters:
+- `_try_enable_c_strict_sig` (`Lib/strict.py`) encodes the expected types into a 32-bit tagged integer in `co->co_extra` (`__strict_sig__` on `PyFunctionObject`):
   - Bit `0` (`0x1`): Strict signature active.
   - Bit `1` (`0x2`): Checked parameter local slots are **never mutated** inside the function body (verified by scanning `co_code` for `STORE_FAST`, `DELETE_FAST`, `STORE_FAST_LOAD_FAST`, `STORE_FAST_STORE_FAST`, `SWAP_FAST`).
-  - Bits `2..4`: Return type tag (`1=int, 2=float, 3=str, 4=bool, 5=None`).
-  - Bits `5 + 3*i .. 7 + 3*i`: Parameter `i` type tag.
-- At runtime, `_CHECK_FUNCTION_STRICT_ARGS` validates arguments on function entry in C (zero wrapper frame overhead!).
-- In Tier 2 (`optimizer_bytecodes.c`), if bit `0x2` is set on `co->_co_strict_sig`, every `_LOAD_FAST` / `_LOAD_FAST_BORROW` of a checked parameter slot immediately seeds the abstract interpreter with the exact static type with **zero runtime guards**.
+  - Bits `2..4`: Return type tag (`1=int, 2=float, 3=str, 4=bool, 5=None, 6=list, 7=dict`).
+  - Bits `5 + 3*i .. 7 + 3*i`: Parameter `i` type tag (`1..7`).
+- At runtime, `_PyEval_StrictParamsCheck` validates arguments on function entry and `_MAKE_HEAP_SAFE` validates return types in C (zero wrapper frame overhead!).
+- In Tier 2 (`optimizer_symbols.c` and `optimizer_bytecodes.c`), if bit `0x2` is set, every parameter slot is pre-seeded in `ctx->frame->locals` with its exact static type (`&PyLong_Type`, `&PyFloat_Type`, `&PyUnicode_Type`, `&PyBool_Type`, `Py_None`, `&PyList_Type`, `&PyDict_Type`) with **zero runtime guards**, and `_TIER2_RESUME_CHECK` / `_MAKE_HEAP_SAFE` elide the entry/return checks when proven at compile time.
 
 ### 5.3 Third-Party & Legacy Boundary Enforcement (`strict_mode` & `strict_module`)
 - **`with strict_mode(require_annotations=..., check_modules=...):`** Uses PEP 669 `sys.monitoring` (`PY_START` and `PY_RETURN` events) to intercept calls into uninstrumented third-party or legacy functions inside the `with` block, enforcing their annotations (or raising `TypeError` if annotations are missing when `require_annotations=True`).
@@ -278,21 +279,29 @@ Scalar replacement of `@struct` allocations must abort for a candidate `_ALLOCAT
 
 Reproducible via `Tools/benchmarks/bench_strict_duplication.py` on Apple Silicon (M-series, AArch64, `--disable-gil --enable-experimental-jit`):
 
-| Workload | Tier 1 (`PYTHON_JIT=0`) | Undecorated JIT | `@strict` / `@struct` JIT | Speedup vs. Tier 1 | Speedup vs. Undecorated JIT | Static C# (`.NET 10`) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`dataclass_inst`** | `123.56 ms` | `26.75 ms` | **`4.80 ms`** | **`25.74x`** | **`5.57x`** | `1.42 ms` |
-| **`object_attr_churn`** | `135.20 ms` | `48.52 ms` | **`10.17 ms`** | **`13.29x`** | **`4.77x`** | `0.62 ms` |
-| **`parallel_4threads` (4T)** | `248.10 ms` | `79.95 ms` | **`19.67 ms`** | **`12.61x`** | **`4.06x`** | `29.27 ms` |
-| **`nbody_float`** | `376.82 ms` | `185.01 ms` | **`40.24 ms`** | **`9.36x`** | **`4.60x`** | `5.86 ms` |
-| **`attr_loop`** | `74.80 ms` | `35.87 ms` | **`11.23 ms`** | **`6.66x`** | **`3.19x`** | `3.58 ms` |
-| **`fib_iter`** | `59.42 ms` | `22.97 ms` | **`15.46 ms`** | **`3.84x`** | **`1.49x`** | `3.57 ms` |
-| **`call_overhead`** | `110.27 ms` | `49.70 ms` | **`33.17 ms`** | **`3.32x`** | **`1.50x`** | `4.19 ms` |
-| **`mixed_dispatch`** | `94.77 ms` | `34.23 ms` | **`33.03 ms`** | **`2.87x`** | **`1.04x`** | `36.32 ms` |
-| **`arith_loop`** | `126.44 ms` | `78.59 ms` | **`51.40 ms`** | **`2.46x`** | **`1.53x`** | `28.59 ms` |
-| **`list_comp`** | `111.79 ms` | `59.17 ms` | **`57.40 ms`** | **`1.95x`** | **`1.03x`** | `40.48 ms` |
-| **`dict_Comprehension`** | `95.55 ms` | `84.88 ms` | **`85.40 ms`** | **`1.12x`** | `0.99x` | `132.49 ms` |
-| **`string_Builder`** | `114.23 ms` | `102.77 ms` | **`102.77 ms`** | **`1.11x`** | `1.00x` | `67.38 ms` |
-| **Geometric Mean (11 core)** | `122.90 ms` | `56.71 ms` | **`30.22 ms`** | **`4.06x`** | **`1.88x`** | `12.68 ms` |
+| Workload | Tier 1 (`PYTHON_JIT=0`) | Undecorated JIT | `@strict` / `@struct` JIT | Speedup vs. Tier 1 | Speedup vs. Undecorated JIT | Static C# (`.NET 9/10`) | Swift (`swiftc -O`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`dataclass_inst`** | `31.80 ms` (`123.56 ms`*) | `28.36 ms` | **`4.57 ms`** | **`6.96x` (`27.04x`*)** | **`6.21x`** | `1.42 ms` | `0.94 ms` |
+| **`object_attr_churn`** | `70.24 ms` (`135.20 ms`*) | `51.21 ms` | **`8.50 ms`** | **`8.26x` (`15.91x`*)** | **`6.03x`** | `4.63 ms` | `2.05 ms` |
+| **`nbody_float`** | `317.08 ms` (`376.82 ms`*) | `186.36 ms` | **`38.00 ms`** | **`8.34x` (`9.92x`*)** | **`4.90x`** | `9.29 ms` | `5.84 ms` |
+| **`attr_loop`** | `91.63 ms` | `40.34 ms` | **`8.26 ms`** | **`11.09x`** | **`4.88x`** | `4.19 ms` | `2.94 ms` |
+| **`parallel_4threads` (4T)** | `136.83 ms` (`248.10 ms`*) | `80.17 ms` | **`19.24 ms`** | **`7.11x` (`12.90x`*)** | **`4.17x`** | `29.27 ms` | `15.65 ms` |
+| **`float_loop`** | `50.07 ms` | `13.89 ms` | **`6.89 ms`** | **`7.27x`** | **`2.02x`** | `3.60 ms` | `3.59 ms` |
+| **`int_loop`** | `78.36 ms` | `38.78 ms` | **`31.24 ms`** | **`2.51x`** | **`1.24x`** | `2.65 ms` | `2.70 ms` |
+| **`arith_loop`** | `71.49 ms` (`126.44 ms`*) | `61.53 ms` | **`50.85 ms`** | **`1.41x` (`2.49x`*)** | **`1.21x`** | `28.59 ms` | `20.51 ms` |
+| **`list_ops`** | `5.86 ms` | `5.95 ms` | **`5.51 ms`** | **`1.06x`** | **`1.08x`** | `1.69 ms` | `1.36 ms` |
+| **`dict_ops`** | `8.96 ms` | `9.59 ms` | **`9.11 ms`** | **`0.98x`** | **`1.05x`** | `3.79 ms` | `5.07 ms` |
+| **`fib_recursive`** | `20.24 ms` | `14.22 ms` | **`14.35 ms`** | **`1.41x`** | `0.99x` | `1.44 ms` | `1.19 ms` |
+| **Geometric Mean (11 core)** | `48.09 ms` | `31.49 ms` | **`13.34 ms`** | **`3.60x`** | **`2.36x`** | `4.54 ms` | `3.42 ms` |
+
+*\*Parenthesized Tier 1 figures show unspecialized baseline before Tier 1 unshared-local and compact-int fast paths.*
+
+### Verification & Regression Suite Status
+- **CPython Core & Compiler Suite:** `117/117` non-skipped test modules (`100%` pass).
+- **Core Built-in Types & Collections Suite:** `74/74` test files (`3,455` tests, `100%` pass).
+- **Free-Threading Concurrency Stress Suite (`test_free_threading`):** `65/65` non-skipped test modules (`965` tests, `100%` pass).
+- **C-API & C-Extension Interop Batch (`test_capi`, `test_ctypes`, `test_decimal`, `test_json`, `test_zlib`, `test_hashlib`, `test_struct`, `test_array`, `test_memoryview`, `test_buffer`):** `10/10` test suites (`4,803` tests, `100%` pass).
+- **`@strict` / `@struct` Unit & Tier 2 Optimizer Suite (`test_strict`, `test_capi.test_opt`):** `342/342` tests (`100%` pass).
 
 ---
 

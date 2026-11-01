@@ -39,24 +39,24 @@ Key Architectural Highlights
 2. **Partial Escape Analysis / Scalar Replacement (** ``eliminate_non_escaping_struct_allocs`` **):**
    Eliminates non-escaping ``@struct`` heap allocations inside hot loops by inlining ``__init__``,
    forwarding field writes directly to downstream ``_LOAD_ATTR_SLOT`` consumers on the abstract stack,
-   and removing ``_ALLOCATE_OBJECT`` / ``_CREATE_INIT_FRAME`` / ``_MAKE_HEAP_SAFE`` (**5.01x** faster
-   on ``dataclass_inst``, **25.74x** faster than Tier 1).
+   and removing ``_ALLOCATE_OBJECT`` / ``_CREATE_INIT_FRAME`` / ``_MAKE_HEAP_SAFE`` (**6.21x** faster
+   than undecorated JIT on ``dataclass_inst`` at **4.57 ms**, and **27.04x** faster than unoptimized Tier 1).
 3. **Perceus-Style Reference-Unique In-Place Reuse & FMA Fusion:**
    Exploits PEP 703 biased reference counting (``_Py_IsOwnedByCurrentThread(op) && ob_ref_local == 1 && ob_ref_shared == 0``)
    to mutate ``PyFloatObject`` and 60-bit compact ``PyLongObject`` boxes in place across arithmetic chains,
-   slot updates (``_STORE_ATTR_SLOT_FLOAT_INPLACE``, ``_LOAD_ATTR_SLOT_NO_POP``), hardware Fused Multiply-Add
-   (``_BINARY_OP_FMA_FLOAT_INPLACE``), 60-bit compact-int bitwise/divmod (``_BINARY_OP_BITWISE_INT``),
+   chained integer accumulators (``c = c + b - a``), slot updates (``_STORE_ATTR_SLOT_FLOAT_INPLACE``, ``_LOAD_ATTR_SLOT_NO_POP``),
+   hardware Fused Multiply-Add (``_BINARY_OP_FMA_FLOAT_INPLACE``), 60-bit compact-int bitwise/divmod (``_BINARY_OP_BITWISE_INT``),
    and mixed float-int arithmetic (``_BINARY_OP_ARITH_FLOAT_INT``).
 4. **Basic Block Versioning & Fused Range-Iterator Induction (** ``hoist_loop_preheader_guards`` **&** ``_PyRangeIter_StepLocal`` **):**
-   Peels up to 64 micro-ops of the first loop iteration into a trace pre-header to prove steady-state local
-   types and non-nullness (``_LOAD_FAST`` -> ``_LOAD_FAST_BORROW``), hoists invariant type/container guards,
+   Peels up to 256 micro-ops of the first loop iteration into a trace pre-header to prove steady-state local
+   types and non-nullness (``_LOAD_FAST`` -> ``_LOAD_FAST_BORROW``), hoists invariant type/container/overflow guards,
    and fuses ``_GUARD_NOT_EXHAUSTED_RANGE + _ITER_NEXT_RANGE + _SWAP_FAST + _POP_TOP_INT`` into a single
-   non-escaping uop (cutting ``float_loop`` by **2.56x** to ``11.00 ms`` and ``int_loop`` by **1.50x** to ``34.68 ms``).
+   non-escaping uop (cutting ``float_loop`` to **6.89 ms**, ``object_attr_churn`` to **8.50 ms** / **6.03x**, and ``int_loop`` to **31.24 ms** / **1.24x**).
 5. **Opt-In Sound Gradual Typing (** ``@strict`` **,** ``@struct`` **,** ``strict_mode`` **,** ``strict_module`` **):**
-   Enforces primitive and slot type annotations in C via ``_Py_STRICT_SLOT_*`` flags on ``PyMemberDef``
-   and 64-bit ``_co_strict_sig`` bitmasks on ``PyCodeObject`` (``_CHECK_FUNCTION_STRICT_ARGS``), sealing
-   classes with ``Py_TPFLAGS_IMMUTABLETYPE`` and seeding Tier 2 with guard-free static types while catching
-   type violations across third-party boundaries via ``sys.monitoring``.
+   Enforces primitive and container type annotations (``int``, ``float``, ``str``, ``bool``, ``None``, ``list``, ``dict``)
+   and slot types in C via ``_Py_STRICT_SLOT_*`` flags on ``PyMemberDef`` and 64-bit ``_co_strict_sig`` bitmasks
+   on ``PyCodeObject`` (zero wrapper frames), sealing classes with ``Py_TPFLAGS_IMMUTABLETYPE`` and seeding Tier 2
+   with guard-free static types while catching type violations across third-party boundaries via ``sys.monitoring``.
 
 Quickstart: Building & Benchmarking
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -68,8 +68,8 @@ Quickstart: Building & Benchmarking
     ../configure --disable-gil --enable-experimental-jit
     make -j10
 
-    # Run the Tier 2 / JIT optimizer regression suite (335 tests)
-    ./python.exe -m test test_capi -m test_opt
+    # Run the @strict/@struct unit suite and Tier 2 / JIT optimizer regression suite (341 tests)
+    ./python.exe -m test test_strict test_capi.test_opt -j8
 
     # Run the 11 paired workloads + 8 negative boundary enforcement tests
     ./python.exe ../Tools/benchmarks/bench_strict_duplication.py
@@ -80,18 +80,21 @@ Benchmark Summary (Apple Silicon AArch64, ``--disable-gil --enable-experimental-
 ========================  =======================  ===============  =========================  ==================  ======================
 Workload                  Tier 1 (``PYTHON_JIT=0``)  Undecorated JIT  ``@strict`` / ``@struct``  Speedup vs. Tier 1  Speedup vs. Undec. JIT
 ========================  =======================  ===============  =========================  ==================  ======================
-``dataclass_inst``        123.56 ms                26.75 ms         **4.80 ms**                **25.74x**          **5.57x**
-``object_attr_churn``     135.20 ms                48.52 ms         **10.17 ms**               **13.29x**          **4.77x**
-``parallel_4threads``     248.10 ms                79.95 ms         **19.67 ms**               **12.61x**          **4.06x**
-``nbody_float``           376.82 ms                185.01 ms        **40.24 ms**               **9.36x**           **4.60x**
-``attr_loop``             74.80 ms                 35.87 ms         **11.23 ms**               **6.66x**           **3.19x**
-``fib_iter``              59.42 ms                 22.97 ms         **15.46 ms**               **3.84x**           **1.49x**
-``call_overhead``         110.27 ms                49.70 ms         **33.17 ms**               **3.32x**           **1.50x**
-``mixed_dispatch``        94.77 ms                 34.23 ms         **33.03 ms**               **2.87x**           **1.04x**
-``arith_loop``            126.44 ms                78.59 ms         **51.40 ms**               **2.46x**           **1.53x**
-``list_comp``             111.79 ms                59.17 ms         **57.40 ms**               **1.95x**           **1.03x**
-**Geometric Mean (11)**   **122.90 ms**            **56.71 ms**     **30.22 ms**               **4.06x**           **1.88x**
+``dataclass_inst``        31.80 ms (123.56 ms*)    28.36 ms         **4.57 ms**                **6.96x (27.04x*)** **6.21x**
+``object_attr_churn``     70.24 ms (135.20 ms*)    51.21 ms         **8.50 ms**                **8.26x (15.91x*)** **6.03x**
+``nbody_float``           317.08 ms (376.82 ms*)   186.36 ms        **38.00 ms**               **8.34x (9.92x*)**  **4.90x**
+``attr_loop``             91.63 ms                 40.34 ms         **8.26 ms**                **11.09x**          **4.88x**
+``parallel_4threads``     136.83 ms (248.10 ms*)   80.17 ms         **19.24 ms**               **7.11x (12.90x*)** **4.17x**
+``float_loop``            50.07 ms                 13.89 ms         **6.89 ms**                **7.27x**           **2.02x**
+``int_loop``              78.36 ms                 38.78 ms         **31.24 ms**               **2.51x**           **1.24x**
+``arith_loop``            71.49 ms (126.44 ms*)    61.53 ms         **50.85 ms**               **1.41x (2.49x*)**  **1.21x**
+``list_ops``              5.86 ms                  5.95 ms          **5.51 ms**                **1.06x**           **1.08x**
+``dict_ops``              8.96 ms                  9.59 ms          **9.11 ms**                **0.98x**           **1.05x**
+``fib_recursive``         20.24 ms                 14.22 ms         **14.35 ms**               **1.41x**           **0.99x**
+**Geometric Mean (11)**   **48.09 ms**             **31.49 ms**     **13.34 ms**               **3.60x**           **2.36x**
 ========================  =======================  ===============  =========================  ==================  ======================
+
+*\*Parenthesized Tier 1 figures show unspecialized baseline before Tier 1 unshared-local and compact-int fast paths.*
 
 Selected Literature References
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

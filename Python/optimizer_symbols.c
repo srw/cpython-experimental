@@ -1537,6 +1537,12 @@ _Py_uop_frame_new(
             else if (tag == 5) {
                 frame->locals[i] = _Py_uop_sym_new_const(ctx, Py_None);
             }
+            else if (tag == 6) {
+                frame->locals[i] = _Py_uop_sym_new_type(ctx, &PyList_Type);
+            }
+            else if (tag == 7) {
+                frame->locals[i] = _Py_uop_sym_new_type(ctx, &PyDict_Type);
+            }
             else {
                 frame->locals[i] = _Py_uop_sym_new_unknown(ctx);
             }

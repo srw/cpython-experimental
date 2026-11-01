@@ -120,6 +120,12 @@ dummy_func(void) {
         else if (strict_ret == 5) {
             expected_type = &_PyNone_Type;
         }
+        else if (strict_ret == 6) {
+            expected_type = &PyList_Type;
+        }
+        else if (strict_ret == 7) {
+            expected_type = &PyDict_Type;
+        }
         if (expected_type != NULL) {
             if (sym_matches_type(value, expected_type)) {
                 ret_proven = true;
@@ -176,6 +182,12 @@ dummy_func(void) {
                     else if (tag == 5) {
                         expected_type = &_PyNone_Type;
                     }
+                    else if (tag == 6) {
+                        expected_type = &PyList_Type;
+                    }
+                    else if (tag == 7) {
+                        expected_type = &PyDict_Type;
+                    }
                     if (expected_type != NULL && !sym_matches_type(loc, expected_type)) {
                         all_proven = false;
                         PyTypeObject *known_type = sym_get_type(loc);
@@ -228,6 +240,12 @@ dummy_func(void) {
                 }
                 else if (tag == 5) {
                     expected_type = &_PyNone_Type;
+                }
+                else if (tag == 6) {
+                    expected_type = &PyList_Type;
+                }
+                else if (tag == 7) {
+                    expected_type = &PyDict_Type;
                 }
                 if (expected_type != NULL && !sym_matches_type(loc, expected_type)) {
                     all_proven = false;

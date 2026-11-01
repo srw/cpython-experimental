@@ -73,6 +73,29 @@ def range_dict_store(n: int) -> int:
     return total
 
 
+@strict
+def sum_list_strict(items: list) -> int:
+    total = 0
+    for x in items:
+        total += x
+    return total
+
+
+@strict
+def lookup_dict_strict(d: dict, key: str) -> int:
+    return d[key]
+
+
+@strict
+def make_list_strict(x: int, y: int) -> list:
+    return [x, y]
+
+
+@strict
+def make_dict_strict(k: str, v: int) -> dict:
+    return {k: v}
+
+
 class StrictTests(unittest.TestCase):
 
     def test_strict_function_valid_and_invalid_args(self):
@@ -97,6 +120,37 @@ class StrictTests(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             bad_return(5)
+
+    def test_strict_container_tags_zero_wrapper(self):
+        # Verify list (tag 6) and dict (tag 7) use C-level __strict_sig__ without wrapper
+        self.assertIsNotNone(getattr(sum_list_strict, "__strict_sig__", None))
+        self.assertIs(sum_list_strict.__strict_unwrapped__, sum_list_strict)
+        self.assertIsNotNone(getattr(lookup_dict_strict, "__strict_sig__", None))
+        self.assertIsNotNone(getattr(make_list_strict, "__strict_sig__", None))
+        self.assertIsNotNone(getattr(make_dict_strict, "__strict_sig__", None))
+
+        self.assertEqual(sum_list_strict([1, 2, 3, 4]), 10)
+        self.assertEqual(lookup_dict_strict({"a": 42}, "a"), 42)
+        self.assertEqual(make_list_strict(7, 8), [7, 8])
+        self.assertEqual(make_dict_strict("k", 99), {"k": 99})
+
+        with self.assertRaises(TypeError):
+            sum_list_strict((1, 2, 3))
+        with self.assertRaises(TypeError):
+            lookup_dict_strict([1, 2], "a")
+
+        @strict
+        def bad_list_return(x: int) -> list:
+            return (x,)
+
+        @strict
+        def bad_dict_return(x: int) -> dict:
+            return [x]
+
+        with self.assertRaises(TypeError):
+            bad_list_return(1)
+        with self.assertRaises(TypeError):
+            bad_dict_return(1)
 
     def test_struct_slots_and_c_descriptor_enforcement(self):
         p = Point3D(1.0, 2.0, 3.0)

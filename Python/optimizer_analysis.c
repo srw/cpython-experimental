@@ -1741,6 +1741,8 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                 break;
             case _GUARD_TOS_INT:
             case _GUARD_NOS_INT:
+            case _GUARD_TOS_OVERFLOWED:
+            case _GUARD_NOS_OVERFLOWED:
             case _GUARD_TOS_FLOAT:
             case _GUARD_NOS_FLOAT:
             case _GUARD_TOS_LIST:
@@ -2087,8 +2089,10 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     break;
                 }
                 case _GUARD_TOS_INT:
-                case _GUARD_NOS_INT: {
-                    int idx = (op == _GUARD_TOS_INT) ? (sp - 1) : (sp - 2);
+                case _GUARD_NOS_INT:
+                case _GUARD_TOS_OVERFLOWED:
+                case _GUARD_NOS_OVERFLOWED: {
+                    int idx = (op == _GUARD_TOS_INT || op == _GUARD_TOS_OVERFLOWED) ? (sp - 1) : (sp - 2);
                     if (idx < 0) { body_valid = false; break; }
                     if (stk_type[idx] == VAL_INT) {
                         guard_kind[i] = 2;
@@ -3021,8 +3025,11 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                         if (((krhs_v >= 0 && krhs_v != v) ||
                              krop == _LOAD_CONST_INLINE_BORROW ||
                              krop == _LOAD_SMALL_INT) &&
-                            (sbody[k_binop].opcode == _BINARY_OP_ADD_INT_INPLACE ||
+                            (sbody[k_binop].opcode == _BINARY_OP_ADD_INT ||
+                             sbody[k_binop].opcode == _BINARY_OP_ADD_INT_INPLACE ||
+                             sbody[k_binop].opcode == _BINARY_OP_SUBTRACT_INT ||
                              sbody[k_binop].opcode == _BINARY_OP_SUBTRACT_INT_INPLACE ||
+                             sbody[k_binop].opcode == _BINARY_OP_MULTIPLY_INT ||
                              sbody[k_binop].opcode == _BINARY_OP_MULTIPLY_INT_INPLACE) &&
                             (sbody[k_pop1].opcode == _POP_TOP_NOP ||
                              sbody[k_pop1].opcode == _POP_TOP_INT) &&
@@ -3045,6 +3052,23 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                             sbody[i].oparg = v;
                             sbody[i_binop].opcode = inplace_binop;
                             sbody[i_pop2].opcode = _POP_TOP_INT;
+                            int m = NEXT_SBODY_IDX(i_pop2 + 1);
+                            while (m < k) {
+                                int m_binop = NEXT_SBODY_IDX(m + 1);
+                                int m_pop1 = NEXT_SBODY_IDX(m_binop + 1);
+                                int m_pop2 = NEXT_SBODY_IDX(m_pop1 + 1);
+                                if (sbody[m_binop].opcode == _BINARY_OP_ADD_INT) {
+                                    sbody[m_binop].opcode = _BINARY_OP_ADD_INT_INPLACE;
+                                }
+                                else if (sbody[m_binop].opcode == _BINARY_OP_SUBTRACT_INT) {
+                                    sbody[m_binop].opcode = _BINARY_OP_SUBTRACT_INT_INPLACE;
+                                }
+                                else if (sbody[m_binop].opcode == _BINARY_OP_MULTIPLY_INT) {
+                                    sbody[m_binop].opcode = _BINARY_OP_MULTIPLY_INT_INPLACE;
+                                }
+                                sbody[m_pop2].opcode = _POP_TOP_INT;
+                                m = NEXT_SBODY_IDX(m_pop2 + 1);
+                            }
                             sbody[k_pop].opcode = _POP_TOP_NOP;
                         }
                     }
@@ -3339,7 +3363,14 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                                     {
                                         continue;
                                     }
-                                    if (_PyUop_Flags[cop] & (HAS_DEOPT_FLAG | HAS_EXIT_FLAG | HAS_ERROR_FLAG | HAS_ESCAPES_FLAG)) {
+                                    if (cop == _GUARD_IS_TRUE_POP ||
+                                        cop == _GUARD_IS_FALSE_POP ||
+                                        cop == _GUARD_IS_NONE_POP ||
+                                        cop == _GUARD_IS_NOT_NONE_POP ||
+                                        cop == _GUARD_BIT_IS_SET_POP ||
+                                        cop == _GUARD_BIT_IS_UNSET_POP ||
+                                        (_PyUop_Flags[cop] & HAS_ESCAPES_FLAG))
+                                    {
                                         can_elide_sv = false;
                                         break;
                                     }

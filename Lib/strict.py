@@ -125,6 +125,8 @@ _PRIMITIVE_STRICT_TAGS = {
     bool: 4,
     None: 5,
     type(None): 5,
+    list: 6,
+    dict: 7,
 }
 
 
