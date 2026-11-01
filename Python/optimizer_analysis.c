@@ -1705,6 +1705,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
     int type_guard_count = 0;
     int pop_top_count = 0;
     bool has_iter_check = false;
+    bool has_strict_range_iter = false;
     bool has_compare_op = false;
     bool has_arith_binop = false;
     bool has_comp_append = false;
@@ -1725,6 +1726,11 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
         non_nop_count++;
         switch (op) {
             case _ITER_CHECK_RANGE:
+                if (output[i].oparg == 0) {
+                    has_strict_range_iter = true;
+                }
+                has_iter_check = true;
+                break;
             case _ITER_CHECK_LIST:
             case _ITER_CHECK_TUPLE:
                 has_iter_check = true;
@@ -3299,8 +3305,18 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                     }
                 }
             }
-            {
-                int i_gne = NEXT_SBODY_IDX(0);
+            if (has_strict_range_iter) {
+                int i_gne = 0;
+                while (i_gne < s_len &&
+                       (sbody[i_gne].opcode == _NOP ||
+                        sbody[i_gne].opcode == _SET_IP ||
+                        sbody[i_gne].opcode == _CHECK_VALIDITY ||
+                        sbody[i_gne].opcode == _CHECK_PERIODIC ||
+                        sbody[i_gne].opcode == _CHECK_PERIODIC_IF_NOT_YIELD_FROM ||
+                        sbody[i_gne].opcode == _TIER2_RESUME_CHECK))
+                {
+                    i_gne++;
+                }
                 if (i_gne < s_len && sbody[i_gne].opcode == _GUARD_NOT_EXHAUSTED_RANGE) {
                     int i_inr = NEXT_SBODY_IDX(i_gne + 1);
                     int i_swf = NEXT_SBODY_IDX(i_inr + 1);
@@ -3498,6 +3514,7 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                             bool other_writes = false;
                             bool sv_loaded = false;
                             bool has_branch_guard = false;
+                            bool has_container_store = false;
                             int d = 0;
                             for (int k = 2; k < length - 1; k++) {
                                 uint16_t kop = output[k].opcode;
@@ -3532,12 +3549,18 @@ hoist_loop_preheader_guards(_PyUOpInstruction *output, int length, int curr_stac
                                     {
                                         has_branch_guard = true;
                                     }
+                                    if (kop == _STORE_SUBSCR_DICT ||
+                                        kop == _LIST_APPEND ||
+                                        kop == _SET_ADD)
+                                    {
+                                        has_container_store = true;
+                                    }
                                 }
                             }
                             if (!other_writes) {
                                 output[iter_check_idx].oparg = (uint16_t)(0x8000 | sv);
-                                if (gne_idx >= 0) {
-                                    bool can_elide = (!sv_loaded && !has_branch_guard);
+                                bool can_elide = (!sv_loaded && !has_branch_guard);
+                                if (gne_idx >= 0 && (can_elide || !has_container_store)) {
                                     output[gne_idx].oparg = (uint16_t)((can_elide ? 0x8000 : 0x4000) | sv);
                                     for (int c = gne_idx + 1; c <= pop_idx; c++) {
                                         output[c].opcode = _NOP;
